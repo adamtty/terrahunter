@@ -7,9 +7,12 @@ text that came from the folder has control characters removed before it reaches 
 
 from __future__ import annotations
 
+import contextlib
 import os
 import re
+import signal
 import stat
+import threading
 from pathlib import Path
 
 MAX_FILE_BYTES = 5 * 1024 * 1024  # a Terraform file bigger than this is skipped, not parsed
@@ -101,3 +104,43 @@ def tf_files(root: Path, recursive: bool = True, budget: list[int] | None = None
                 skipped.append(f"more than {MAX_FILES} Terraform files; the rest were skipped")
                 return found, skipped
     return found, skipped
+
+
+def downloaded_modules(root: Path) -> Path:
+    """Where `init` / `get` put the modules a configuration uses."""
+    return Path(root) / ".terraform" / "modules"
+
+
+class ParseTimeout(BaseException):  # BaseException, so a broad `except Exception` can't swallow it
+    """Parsing one file took longer than its time limit."""
+
+
+def parse_limit() -> float:
+    """Seconds one Terraform file may take to parse ($TH_PARSE_TIMEOUT, default 60)."""
+    try:
+        v = float(os.environ.get("TH_PARSE_TIMEOUT", "60"))
+    except ValueError:
+        v = 60.0
+    return v if v > 0 else 60.0
+
+
+PARSE_BUDGET = 600.0  # seconds for all the files of one parse together
+
+
+@contextlib.contextmanager
+def time_limit(seconds: float):
+    """Raise ParseTimeout in this thread after `seconds` (SIGALRM; a no-op off the main thread or without it)."""
+    if not hasattr(signal, "setitimer") or threading.current_thread() is not threading.main_thread():
+        yield
+        return
+
+    def fire(signum, frame):
+        raise ParseTimeout
+
+    old = signal.signal(signal.SIGALRM, fire)
+    signal.setitimer(signal.ITIMER_REAL, max(seconds, 0.001))
+    try:
+        yield
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, old)

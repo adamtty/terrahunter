@@ -14,7 +14,8 @@
 
 > [!WARNING]
 > **terrahunter is being rebuilt from the ground up.** This repository started again from scratch on
-> 23 October 2026. The pipeline below lands one stage at a time; so far it finds the root modules in a folder.
+> 23 October 2026. The pipeline below lands one stage at a time; so far it finds the root modules in a folder and
+> tells you what they need that it can't see yet.
 
 ## The idea
 
@@ -46,7 +47,7 @@ one hop at a time, with what's wrong at every step.
 | Stage | |
 |---|---|
 | 1. Folder in | **built**: `terrahunter <folder>` finds the root modules, says why each is one, and lets you pick (`--root`, `--all-roots`) |
-| 2. What's missing | planned |
+| 2. What's missing | **built**: lists every module and remote state a root needs (followed through nested modules), matches remote state to the stack that writes it, offers to download modules, and takes other repositories with `--with` |
 | 3. Connections and diagram | planned |
 | 4. Vulnerabilities | planned |
 | 5. Attack paths | planned |

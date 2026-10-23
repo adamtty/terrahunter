@@ -1,4 +1,4 @@
-"""The command line: `terrahunter <folder>`. Stage 1 (the folder in) is built; the later stages follow."""
+"""The command line: `terrahunter <folder>`. Stages 1 (the folder in) and 2 (what's missing) are built."""
 
 from __future__ import annotations
 
@@ -7,10 +7,10 @@ import os
 import sys
 from pathlib import Path
 
-from terrahunter import __version__, roots, sandbox
+from terrahunter import __version__, deps, roots, sandbox
 
 EXIT_OK, EXIT_INCOMPLETE, EXIT_ERROR = 0, 2, 3
-NEXT = "the next stages (what's missing, the diagram, attack paths) aren't built yet: this run stops at the folder"
+NEXT = "the next stages (the diagram, vulnerabilities, attack paths) aren't built yet: this run stops here"
 
 
 class TerrahunterError(Exception):
@@ -30,6 +30,20 @@ def build_parser() -> argparse.ArgumentParser:
         "--root", help="the root module to analyse, relative to the folder (default: ask, or the only one)"
     )
     pick.add_argument("--all-roots", action="store_true", help="analyse every root module found")
+    ap.add_argument(
+        "--with",
+        dest="with_folders",
+        action="append",
+        default=[],
+        metavar="PATH",
+        help="another folder the analysis may read (another repository: modules it calls, stacks whose state it "
+        "reads); repeatable",
+    )
+    ap.add_argument(
+        "--fetch-modules",
+        action="store_true",
+        help="download remote modules that haven't been yet (tofu/terraform get: modules only), without asking",
+    )
     return ap
 
 
@@ -86,6 +100,55 @@ def select(d: roots.Discovery, root: str | None, all_roots: bool) -> list[roots.
     )
 
 
+STATUS = {  # how each status reads in the report
+    "present": "✓",
+    "matched": "✓",
+    "download": "↓",
+    "outside": "?",
+    "missing": "✗",
+    "unmatched": "?",
+    "unresolved": "?",
+}
+
+
+def show_needs(s: deps.Survey) -> None:
+    mods, states = s.of("module"), s.of("remote-state")
+    ok_m, ok_s = s.of("module", "present"), s.of("remote-state", "matched")
+    print(f"\nWhat {sandbox.one_line(s.root)} needs:")
+    print(f"  modules       {len(ok_m)} of {len(mods)} available" if mods else "  modules       none")
+    print(f"  remote state  {len(ok_s)} of {len(states)} matched to a stack" if states else "  remote state  none")
+    for n in s.of("remote-state", "matched"):
+        print(
+            f"    ✓ {sandbox.one_line(n.name)} reads {sandbox.one_line(n.detail)} ({sandbox.one_line(n.source, 120)})"
+        )
+    if s.open:
+        print("  Not available yet (shown as unknown later, unless you add them):")
+        for n in s.open:
+            where = f"  [{sandbox.one_line(n.via)}]" if n.via else ""
+            src = f" {sandbox.one_line(n.source, 100)}" if n.source else ""
+            print(f"    {STATUS[n.status]} {sandbox.one_line(n.name)}{src}{where}")
+            print(f"        {sandbox.one_line(n.detail, 200)}  ({sandbox.one_line(n.where, 120)})")
+    for note in s.notes:
+        print(f"  ! {sandbox.one_line(note, 300)}")
+
+
+def resolve(folder: Path, root: str, withs: list[Path], fetch: bool) -> deps.Survey:
+    """Survey a root, and fetch its downloadable modules if the user wants them; → the survey after that."""
+    s = deps.survey(folder, root, withs)
+    downloadable = s.of("module", "download")
+    if downloadable and not fetch and _interactive():
+        print(
+            f"\n{len(downloadable)} remote module(s) can be downloaded (tofu/terraform get: modules only, no "
+            "providers or backend; it uses this machine's git and registry credentials)."
+        )
+        fetch = input("Download them now? Only for Terraform you trust [y/N] ").strip().lower() in ("y", "yes")
+    if downloadable and fetch:
+        ok, note = deps.fetch((folder / root).resolve())
+        print(f"  {'✓' if ok else '✗'} {sandbox.one_line(note, 300)}")
+        s = deps.survey(folder, root, withs)
+    return s
+
+
 def main(argv: list[str] | None = None) -> None:
     try:
         sys.exit(_main(argv))
@@ -104,6 +167,15 @@ def _main(argv: list[str] | None) -> int:
     d = roots.discover(a.folder)
     _show(d)
     chosen = select(d, a.root, a.all_roots)
-    print(f"Analysing: {', '.join(sandbox.one_line(c.path) for c in chosen)}")
-    print(f"({NEXT})")
-    return EXIT_INCOMPLETE if d.notes else EXIT_OK
+    withs = []
+    for w in a.with_folders:
+        if not Path(w).is_dir():
+            raise TerrahunterError(f"--with {w}: not a directory")
+        withs.append(Path(w))
+    complete = not d.notes
+    for c in chosen:
+        s = resolve(d.folder, c.path, withs, a.fetch_modules)
+        show_needs(s)
+        complete &= not s.open and not s.notes
+    print(f"\n({NEXT})")
+    return EXIT_OK if complete else EXIT_INCOMPLETE

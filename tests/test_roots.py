@@ -142,7 +142,7 @@ def test_cli_end_to_end(tmp_path, capsys):
         cli.main([str(tmp_path)])
     assert e.value.code == 0
     out = capsys.readouterr().out
-    assert "deploy/prd  (backend s3, provider aws)" in out and "Analysing: deploy/prd" in out
+    assert "deploy/prd  (backend s3, provider aws)" in out and "What deploy/prd needs:" in out
 
 
 def test_folder_names_cannot_inject_terminal_escapes(tmp_path, capsys):
