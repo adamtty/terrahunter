@@ -1,13 +1,15 @@
-"""The command line: `terrahunter <folder>`. Stages 1 (the folder in) and 2 (what's missing) are built."""
+"""The command line: `terrahunter <folder>`. Stages 1 (the folder in), 2 (what's missing) and 3a (the connection
+graph) are built."""
 
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 from pathlib import Path
 
-from terrahunter import __version__, deps, roots, sandbox
+from terrahunter import __version__, deps, graph, roots, sandbox
 
 EXIT_OK, EXIT_INCOMPLETE, EXIT_ERROR = 0, 2, 3
 NEXT = "the next stages (the diagram, vulnerabilities, attack paths) aren't built yet: this run stops here"
@@ -43,6 +45,9 @@ def build_parser() -> argparse.ArgumentParser:
         "--fetch-modules",
         action="store_true",
         help="download remote modules that haven't been yet (tofu/terraform get: modules only), without asking",
+    )
+    ap.add_argument(
+        "--graph-json", metavar="PATH", help="write the connection graph (resources, connections, unknowns)"
     )
     return ap
 
@@ -149,6 +154,30 @@ def resolve(folder: Path, root: str, withs: list[Path], fetch: bool) -> deps.Sur
     return s
 
 
+def show_graph(g: graph.Graph) -> None:
+    n, c, u = len(g.resources), len(g.edges), len(g.unknown)
+    mods = len(g.modules) - 1
+    print(
+        f"\nConnections in {sandbox.one_line(g.root)}: {n} resource{'s' if n != 1 else ''}, "
+        f"{c} connection{'s' if c != 1 else ''}"
+        + (f" across {mods} module{'s' if mods != 1 else ''}" if mods else "")
+        + (f", {u} unknown (not available: see above)" if u else "")
+    )
+    for note in g.notes:
+        print(f"  ! {sandbox.one_line(note, 300)}")
+
+
+def write_private(path: str, text: str) -> None:
+    """Write an output file, refusing a symlink at the path (a planted link can't redirect the write)."""
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    try:
+        fd = os.open(path, flags, 0o644)
+    except OSError as e:
+        raise TerrahunterError(f"can't write {path}: {e.strerror}") from e
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.write(text)
+
+
 def main(argv: list[str] | None = None) -> None:
     try:
         sys.exit(_main(argv))
@@ -173,9 +202,18 @@ def _main(argv: list[str] | None) -> int:
             raise TerrahunterError(f"--with {w}: not a directory")
         withs.append(Path(w))
     complete = not d.notes
+    graphs = []
     for c in chosen:
         s = resolve(d.folder, c.path, withs, a.fetch_modules)
         show_needs(s)
-        complete &= not s.open and not s.notes
+        g = graph.build(d.folder, c.path, withs)
+        show_graph(g)
+        graphs.append(g)
+        complete &= not s.open and not s.notes and not g.notes
+    if a.graph_json:
+        write_private(
+            a.graph_json, json.dumps({"folder": str(d.folder), "graphs": [g.to_dict() for g in graphs]}, indent=1)
+        )
+        print(f"\nwrote {sandbox.one_line(a.graph_json)}")
     print(f"\n({NEXT})")
     return EXIT_OK if complete else EXIT_INCOMPLETE

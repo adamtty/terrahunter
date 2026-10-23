@@ -74,8 +74,13 @@ def _key(k) -> str:
 
 
 def parse_dir(d: Path, notes: list[str], label: str) -> list[tuple[str, dict]]:
-    """Every configuration file directly in d → [(file name, parsed document)]. JSON files are read as JSON (their
-    strings get quotes added, so both look the same to the rest); files that won't parse become notes."""
+    """Every configuration file directly in d → [(file name, parsed document)]."""
+    return [(name, doc) for name, doc, _ in load_dir(d, notes, label)]
+
+
+def load_dir(d: Path, notes: list[str], label: str) -> list[tuple[str, dict, str]]:
+    """Every configuration file directly in d → [(file name, parsed document, text)]. JSON files are read as JSON
+    (their strings get quotes added, so both look the same to the rest); files that won't parse become notes."""
     out = []
     files, skipped = sandbox.tf_files(d, recursive=False)
     notes += [f"{label}/{s}" for s in skipped]
@@ -98,7 +103,7 @@ def parse_dir(d: Path, notes: list[str], label: str) -> list[tuple[str, dict]]:
             notes.append(f"{label}/{p.name}: couldn't be parsed ({sandbox.one_line(type(e).__name__)})")
             continue
         if isinstance(doc, dict):
-            out.append((p.name, doc))
+            out.append((p.name, doc, text))
     return out
 
 
@@ -231,6 +236,30 @@ def _downloads(root_dir: Path) -> dict[str, Path]:
     return out
 
 
+def locate_module(
+    d: Path, src: str, key: str, folder: Path, allowed: list[Path], downloads: dict[str, Path]
+) -> tuple[str, Path | None, str]:
+    """Where a module call's code is. d: the calling directory; src: its literal source; key: its modules.json key
+    (`a.b`). → (present | outside | missing | download, the directory when present, a note on what to do)."""
+    if src.startswith(("./", "../")) or src in (".", ".."):
+        # the real path: a symlinked directory pointing outside the folder must count as outside
+        target = (d / src).resolve()
+        if not _inside_any(target, allowed):
+            rel = Path(os.path.relpath(target, folder)).as_posix()
+            return "outside", None, f"{rel} is outside the folder: add that repository with --with <path>"
+        if not _has_config(target):
+            return "missing", None, "that directory doesn't exist or has no Terraform files"
+        return "present", target, ""
+    got = downloads.get(key)
+    if got is not None:
+        return "present", got, "downloaded"
+    host = _registry_host(src)
+    hint = "not downloaded yet: `get` fetches it"
+    if host:
+        hint += f" (private registry {host}: set TF_TOKEN_{host.replace('.', '_').replace('-', '__')})"
+    return "download", None, hint
+
+
 def survey(folder: Path, root: str, with_folders: list[Path] | None = None) -> Survey:
     folder = folder.resolve()
     allowed = [folder] + [w.resolve() for w in with_folders or []]
@@ -272,51 +301,14 @@ def survey(folder: Path, root: str, with_folders: list[Path] | None = None) -> S
                         )
                     )
                     continue
-                if src.startswith(("./", "../")) or src in (".", ".."):
-                    # the real path: a symlinked directory pointing outside the folder must count as outside
-                    target = (d / src).resolve()
-                    if not _inside_any(target, allowed):
-                        s.needs.append(
-                            Need(
-                                "module",
-                                full,
-                                src,
-                                where,
-                                "outside",
-                                f"{Path(os.path.relpath(target, folder)).as_posix()} is outside the folder: "
-                                "add that repository with --with <path>",
-                                via,
-                            )
-                        )
-                    elif not _has_config(target):
-                        s.needs.append(
-                            Need(
-                                "module",
-                                full,
-                                src,
-                                where,
-                                "missing",
-                                "that directory doesn't exist or has no Terraform files",
-                                via,
-                            )
-                        )
-                    else:
-                        s.needs.append(Need("module", full, src, where, "present", label(target), via))
-                        if depth < MAX_MODULE_DEPTH:
-                            walk(target, path + (name,), depth + 1)
-                    continue
-                key = ".".join(path + (name,))
-                got = downloads.get(key)
-                if got is not None:
-                    s.needs.append(Need("module", full, src, where, "present", "downloaded", via))
+                status, target, note = locate_module(d, src, ".".join(path + (name,)), folder, allowed, downloads)
+                if status == "present":
+                    shown = label(target) if note != "downloaded" else "downloaded"
+                    s.needs.append(Need("module", full, src, where, "present", shown, via))
                     if depth < MAX_MODULE_DEPTH:
-                        walk(got, path + (name,), depth + 1)
-                    continue
-                host = _registry_host(src)
-                hint = "not downloaded yet: `get` fetches it"
-                if host:
-                    hint += f" (private registry {host}: set TF_TOKEN_{host.replace('.', '_').replace('-', '__')})"
-                s.needs.append(Need("module", full, src, where, "download", hint, via))
+                        walk(target, path + (name,), depth + 1)
+                else:
+                    s.needs.append(Need("module", full, src, where, status, note, via))
             for dtype in ("terraform_remote_state", "tfe_outputs"):
                 for name, body in _data(doc, dtype):
                     full = f"data.{dtype}.{name}"
