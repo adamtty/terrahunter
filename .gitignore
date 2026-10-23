@@ -1,0 +1,19 @@
+# generated output: written where you run the tool, never into the repo
+terrahunter-report.md
+terrahunter-diagram.html
+*.sarif
+/report.json
+
+.venv/
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+dist/
+.terraform/
+*.tfplan
+tf.plan
+.DS_Store
+.env
+.env.*
