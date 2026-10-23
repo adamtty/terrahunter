@@ -14,7 +14,7 @@
 
 > [!WARNING]
 > **terrahunter is being rebuilt from the ground up.** This repository started again from scratch on
-> 23 October 2026. It doesn't analyse anything yet; the pipeline below lands one stage at a time.
+> 23 October 2026. The pipeline below lands one stage at a time; so far it finds the root modules in a folder.
 
 ## The idea
 
@@ -45,7 +45,7 @@ one hop at a time, with what's wrong at every step.
 
 | Stage | |
 |---|---|
-| 1. Folder in | planned |
+| 1. Folder in | **built**: `terrahunter <folder>` finds the root modules, says why each is one, and lets you pick (`--root`, `--all-roots`) |
 | 2. What's missing | planned |
 | 3. Connections and diagram | planned |
 | 4. Vulnerabilities | planned |
