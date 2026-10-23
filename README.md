@@ -15,7 +15,8 @@
 > [!WARNING]
 > **terrahunter is being rebuilt from the ground up.** This repository started again from scratch on
 > 23 October 2026. The pipeline below lands one stage at a time; so far it finds the root modules in a folder, tells
-> you what they need that it can't see yet, draws the infrastructure as a diagram, and pins scanner findings to it.
+> you what they need that it can't see yet, draws the infrastructure as a diagram, pins scanner findings to it, and
+> maps the attack paths from the internet inwards (AWS so far).
 
 ## The idea
 
@@ -50,8 +51,8 @@ one hop at a time, with what's wrong at every step.
 | 2. What's missing | **built**: lists every module and remote state a root needs (followed through nested modules), matches remote state to the stack that writes it, offers to download modules, and takes other repositories with `--with` |
 | 3. Connections and diagram | **built**: the connection graph (every resource in the root and its modules, every reference between them, through variables, locals and module outputs; `--graph-json`), and `terrahunter-diagram.html` on every run: an architecture diagram in 2D or 3D, plumbing folded into badges, unavailable modules drawn as dashed holes |
 | 4. Vulnerabilities | **built**: runs [trivy](https://trivy.dev) and [checkov](https://www.checkov.io) (when installed; `--no-scan` skips them) on a contained copy of the root and every module it calls, and pins each finding to the resource it's about, in every instance of a module, so it shows on the diagram's components |
-| 5. Attack paths | planned |
-| 6. Results and walkthrough | planned |
+| 5. Attack paths | **built** (AWS): finds what the internet reaches (internet-facing load balancers, instances with a public IP behind an open security group, public databases and buckets, unauthenticated function URLs, long-lived access keys), follows the traffic inwards, says how each workload could be taken over (SSH open, IMDSv1 behind a web port, the app itself), what it runs as, and which data stores that identity's policies reach; on the diagram, click a path and step through it hop by hop |
+| 6. Results and walkthrough | **partly built**: the walkthrough is in the diagram (zone out the rest, zoom, step hop by hop with what's wrong at each); a report to share and a fix list are next |
 
 ## Requirements
 

@@ -342,7 +342,9 @@ function showStep() {
         return `<li class="${sens ? 'bad' : ''}">${esc(nameOf(id))} <span class="file">${esc(byId[id] ? byId[id].tname : '')}</span> — <b>${esc(e ? e.label : '?')}</b> access${sens ? ' · ⚠ sensitive' : ''}</li>`; }).join('') + '</ul>';
   } else {
     const id = st.ids[0], comp = byId[id];
-    const bad = comp ? comp.badges.filter(b => b.risk).map(b => b.text) : [];
+    // what's wrong here: the risky badges, then the worst scanner findings on it
+    const bad = comp ? comp.badges.filter(b => b.risk).map(b => b.text).concat((comp.findings || [])
+      .filter(f => f.severity === 'CRITICAL' || f.severity === 'HIGH').slice(0, 4).map(f => `${f.severity.toLowerCase()}: ${f.title || f.id}`)) : [];
     const other = comp ? comp.badges.filter(b => !b.risk).map(b => b.text) : [];
     const hops = hopsAbout(c, id);
     const nxt = W[STEP + 1]; const e = nxt && !nxt.final ? edgeBetween(id, nxt.ids[0]) : null;
@@ -374,7 +376,8 @@ function zoomTo(ids) { const bs = ids.map(boxOf).filter(Boolean); if (!bs.length
   requestAnimationFrame(tick); }
 
 const list = document.getElementById('chains');
-if (!G.chains.length) list.innerHTML = '<span class="meta">Attack paths, and walking through them hop by hop, arrive in stage 5. For now: the architecture, its connections and what each component exposes. Click a component.</span>';
+if (!G.chains.length) list.innerHTML = G.walked ? '<span class="meta">No path from the internet reaches data or a workload an attacker could take over. Click a component to see what it exposes.</span>'
+  : '<span class="meta">Attack paths weren\'t mapped on this run. Click a component to see what it exposes.</span>';
 G.chains.forEach((c, i) => {
   const d = document.createElement('div'); d.className = 'chain' + (c.drawn ? '' : ' off');
   d.innerHTML = `<span class="sev ${esc(c.severity)}">${esc(c.severity)}</span><span class="meta">${esc(c.kind)} · ${esc(c.confidence)}</span><div class="entry">${esc(c.entry)}</div>` + (c.drawn ? '' : '<div class="meta">not on the diagram (provider block)</div>');

@@ -1,5 +1,5 @@
 """The command line: `terrahunter <folder>`. Stages 1 (the folder in), 2 (what's missing), 3 (the connection graph
-and the diagram) and 4 (vulnerabilities) are built."""
+and the diagram), 4 (vulnerabilities) and 5 (attack paths) are built."""
 
 from __future__ import annotations
 
@@ -9,10 +9,10 @@ import os
 import sys
 from pathlib import Path
 
-from terrahunter import __version__, arch, deps, diagram, graph, roots, sandbox, scanners
+from terrahunter import __version__, arch, chains, deps, diagram, graph, roots, sandbox, scanners
 
 EXIT_OK, EXIT_INCOMPLETE, EXIT_ERROR = 0, 2, 3
-NEXT = "the next stages (attack paths, and walking through them) aren't built yet"
+NEXT = "open the diagram and click an attack path to walk through it, hop by hop"
 
 
 class TerrahunterError(Exception):
@@ -202,6 +202,22 @@ def show_scan(s: scanners.Scan, top: int = 10) -> None:
         print(f"  ! {sandbox.one_line(note, 300)}")
 
 
+def show_chains(r: chains.Result, g: graph.Graph) -> None:
+    n = len(r.chains)
+    if not n and not any(x.type.startswith("aws_") for x in g.resources.values()):
+        print("\nAttack paths: AWS only so far, and this root has no AWS resources")
+        return
+    print(
+        f"\nAttack paths: {n}" + ("" if n else " (nothing from the internet reaches data or a workload to take over)")
+    )
+    for c in r.chains:
+        direct = c.steps == ["internet"]  # the data store itself is exposed
+        hops = " → ".join(x if x == "internet" else x.rsplit(".", 1)[-1] for x in c.steps + (c.sinks if direct else []))
+        end = f" → {len(c.sinks)} data store{'s' if len(c.sinks) != 1 else ''}" if c.sinks and not direct else ""
+        print(f"  {c.severity:<8} {c.confidence:<8} {sandbox.one_line(hops + end, 140)}")
+        print(f"           {sandbox.one_line(c.entry, 140)}")
+
+
 def write_private(path: str, text: str) -> None:
     """Write an output file, refusing a symlink at the path (a planted link can't redirect the write)."""
     flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
@@ -247,15 +263,17 @@ def _main(argv: list[str] | None) -> int:
         if not a.no_scan:
             scan = scanners.scan(g, d.folder, withs)
             show_scan(scan)
-        graphs.append((g, scan))
+        model = arch.build(g, scan.findings if scan else [])
+        paths = chains.build(g, model)
+        show_chains(paths, g)
+        graphs.append((g, scan, paths))
         if not a.no_diagram:
             path = a.diagram
             if len(chosen) > 1:
                 slug = "root" if c.path == "." else c.path.replace("/", "-")
                 path = str(Path(a.diagram).with_name(f"{Path(a.diagram).stem}-{slug}{Path(a.diagram).suffix}"))
             title = d.folder.name + ("" if c.path == "." else f"/{c.path}")
-            model = arch.build(g, scan.findings if scan else [])
-            write_private(path, diagram.render(model, title, scanned=scan is not None))
+            write_private(path, diagram.render(model, title, scanned=scan is not None, paths=paths))
             print(f"  diagram: {sandbox.one_line(path)} (open it in a browser)")
         complete &= not s.open and not s.notes and not g.notes and not (scan and scan.failed)
     if a.graph_json:
@@ -264,7 +282,10 @@ def _main(argv: list[str] | None) -> int:
             json.dumps(
                 {
                     "folder": str(d.folder),
-                    "graphs": [g.to_dict() | ({"scan": sc.to_dict()} if sc else {}) for g, sc in graphs],
+                    "graphs": [
+                        g.to_dict() | ({"scan": sc.to_dict()} if sc else {}) | {"attack_paths": p.to_dict()["chains"]}
+                        for g, sc, p in graphs
+                    ],
                 },
                 indent=1,
             ),

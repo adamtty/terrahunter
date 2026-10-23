@@ -13,7 +13,7 @@ import json
 import re
 from pathlib import Path
 
-from terrahunter import arch
+from terrahunter import arch, chains
 
 TEMPLATE = Path(__file__).with_name("diagram.html")
 STYLE = {  # connection meaning → how it's drawn
@@ -31,14 +31,19 @@ STYLE = {  # connection meaning → how it's drawn
 _SCRIPT = re.compile(r"<script>(.*?)</script>", re.DOTALL)  # exactly what the browser hashes
 
 
-def render(model: arch.Model, title: str, scanned: bool = False) -> str:
-    """The page; `scanned` says whether stage 4 ran, so "no findings" isn't shown when nothing was looked for."""
+def render(model: arch.Model, title: str, scanned: bool = False, paths: chains.Result | None = None) -> str:
+    """The page; `scanned` says whether stage 4 ran, so "no findings" isn't shown when nothing was looked for;
+    `paths` (stage 5) adds the internet, the attack paths and the access edges they need."""
     data = model.to_dict()
     for e in data["edges"]:
         e["kind"] = "quiet" if e["quiet"] else STYLE.get(e["label"], "other")
         if e["target"] in {c.id for c in model.components if c.unknown}:
             e["kind"] = "unknown"
-    data.update(target=title, chains=[], internet=False, scanned=scanned)
+    found = paths.to_dict() if paths else {"chains": [], "edges": []}
+    data["edges"] += found["edges"]
+    data.update(
+        target=title, chains=found["chains"], internet=bool(found["chains"]), scanned=scanned, walked=paths is not None
+    )
     blob = json.dumps(data).replace("<", "\\u003c")  # nothing in the data can look like markup to the browser
     page = TEMPLATE.read_text(encoding="utf-8").replace("__DATA__", blob)
     script = _SCRIPT.search(page)
