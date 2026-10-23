@@ -17,7 +17,9 @@ classifiers = [
     "Topic :: Security",
 ]
 requires-python = ">=3.11"
-dependencies = []
+dependencies = [
+    "python-hcl2>=8.1.2",
+]
 
 [dependency-groups]
 dev = [
