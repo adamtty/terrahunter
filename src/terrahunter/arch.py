@@ -98,7 +98,7 @@ MEANING = [
     (r"volume_id|(^|\.)bucket$", "stores in"),
     (r"function_name|lambda_function_arn|(^|\.)function", "invokes"),
 ]
-NOT_CONNECTIONS = re.compile(r"(^|\.)(tags(_all)?|name|description|identifier|bucket_prefix|function_name)(\.|$)")
+NOT_CONNECTIONS = re.compile(r"(^|\.)(tags(_all)?|name|description|identifier|bucket_prefix)(\.|$)")
 # what the meaning of a connection says, when it isn't worth drawing all the time
 QUIET = {"encrypted with", "logs to"}
 
@@ -184,7 +184,12 @@ def _ports(rule: dict) -> str:
 
 
 # attributes that are a resource's own name on that type, not a link to another resource
-OWN_NAME = {"aws_s3_bucket": "bucket", "aws_sqs_queue": "name", "aws_sns_topic": "name"}
+OWN_NAME = {
+    "aws_s3_bucket": "bucket",
+    "aws_sqs_queue": "name",
+    "aws_sns_topic": "name",
+    "aws_lambda_function": "function_name",
+}
 
 
 def _meaning(attr: str, source_type: str = "") -> str | None:
@@ -421,7 +426,15 @@ def build(g: graph.Graph, findings: list[scanners.Finding] = ()) -> Model:
             if a in comps
             else sorted(users(a))
             or sorted({t for t in targets(a) if t in comps})
-            or sorted({u for t in targets(a) for u in users(t)})
+            # through plumbing only: a data source or a network (everything references those) says nothing about owners
+            or sorted(
+                {
+                    u
+                    for t in targets(a)
+                    if R[t].mode == "managed" and R[t].type not in ("aws_vpc", "aws_subnet")
+                    for u in users(t)
+                }
+            )
         )
         item = {k: getattr(f, k) for k in ("id", "title", "severity", "source", "file", "line", "url", "address")}
         for o in owners:

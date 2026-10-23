@@ -1,0 +1,205 @@
+"""Stage 5, attack paths: from the internet to the edge and inwards, each hop with what makes it possible, ending at
+the data an identity's policies reach."""
+
+import json
+
+import pytest
+
+from terrahunter import arch, chains, cli, diagram, graph
+
+NET = (
+    'provider "aws" {}\nresource "aws_vpc" "v" {}\nresource "aws_internet_gateway" "igw" {\n  vpc_id = aws_vpc.v.id\n}\n'
+    'resource "aws_subnet" "pub" {\n  vpc_id = aws_vpc.v.id\n  map_public_ip_on_launch = true\n}\n'
+    'resource "aws_subnet" "priv" {\n  vpc_id = aws_vpc.v.id\n}\n'
+)
+ROLE = (
+    'resource "aws_iam_role" "app" {}\nresource "aws_iam_instance_profile" "app" {\n  role = aws_iam_role.app.name\n}\n'
+)
+BUCKETS = 'resource "aws_s3_bucket" "logs" {}\nresource "aws_s3_bucket" "customer_exports" {}\n'
+
+
+def sg(name: str, *ports: int) -> str:
+    rules = "".join(
+        f'  ingress {{\n    from_port = {p}\n    to_port = {p}\n    cidr_blocks = ["0.0.0.0/0"]\n  }}\n' for p in ports
+    )
+    return f'resource "aws_security_group" "{name}" {{\n  vpc_id = aws_vpc.v.id\n{rules}}}\n'
+
+
+def instance(name: str, subnet: str, group: str, extra: str = "") -> str:
+    return (
+        f'resource "aws_instance" "{name}" {{\n  subnet_id = aws_subnet.{subnet}.id\n'
+        f"  vpc_security_group_ids = [aws_security_group.{group}.id]\n{extra}}}\n"
+    )
+
+
+def paths(tmp_path, text: str) -> chains.Result:
+    (tmp_path / "main.tf").write_text(text)
+    g = graph.build(tmp_path, ".")
+    return chains.build(g, arch.build(g))
+
+
+WILDCARD_S3 = (
+    'resource "aws_iam_role_policy" "p" {\n  role = aws_iam_role.app.id\n  policy = <<EOF\n'
+    '{"Statement": [{"Effect": "Allow", "Action": ["s3:*"], "Resource": "*"}]}\nEOF\n}\n'
+)
+
+
+def test_web_server_with_imdsv1_to_every_bucket(tmp_path):
+    r = paths(
+        tmp_path,
+        NET
+        + ROLE
+        + BUCKETS
+        + WILDCARD_S3
+        + sg("web", 80)
+        + instance("web", "pub", "web", "  iam_instance_profile = aws_iam_instance_profile.app.name\n"),
+    )
+    (c,) = r.chains
+    assert (c.severity, c.confidence) == ("critical", "likely")
+    assert c.steps == ["internet", "aws_instance.web", "aws_iam_role.app"]
+    assert sorted(c.sinks) == ["aws_s3_bucket.customer_exports", "aws_s3_bucket.logs"]
+    assert any("IMDSv1" in h and "SSRF" in h for h in c.hops)
+    assert "aws_iam_role.app grants s3:* on every resource" in c.hops
+    assert "aws_s3_bucket.customer_exports ⚠sensitive" in c.hops[-1]
+    edges = {(e["source"], e["target"], e["label"]) for e in r.edges}
+    assert ("internet", "aws_instance.web", "reaches") in edges
+    assert ("aws_iam_role.app", "aws_s3_bucket.logs", "s3:*") in edges
+
+
+def test_a_policy_naming_one_bucket_reaches_only_it(tmp_path):
+    r = paths(
+        tmp_path,
+        NET + ROLE + BUCKETS + 'data "aws_iam_policy_document" "d" {\n  statement {\n    actions = ["s3:GetObject"]\n'
+        "    resources = [aws_s3_bucket.logs.arn]\n  }\n}\n"
+        'resource "aws_iam_role_policy" "p" {\n  role = aws_iam_role.app.id\n'
+        "  policy = data.aws_iam_policy_document.d.json\n}\n"
+        + sg("web", 443)
+        + instance(
+            "web",
+            "pub",
+            "web",
+            '  iam_instance_profile = aws_iam_instance_profile.app.name\n  metadata_options {\n    http_tokens = "required"\n  }\n',
+        ),
+    )
+    (c,) = r.chains
+    assert c.sinks == ["aws_s3_bucket.logs"]
+    assert (c.severity, c.confidence) == ("high", "possible")  # IMDSv2: the app itself has to fall first
+    assert "aws_iam_role.app grants s3:GetObject on the resources it names" in c.hops
+
+
+def test_through_a_load_balancer_and_once_per_workload(tmp_path):
+    lb = (
+        'resource "aws_lb" "front" {\n  security_groups = [aws_security_group.lb.id]\n}\n'
+        'resource "aws_lb_target_group" "tg" {}\n'
+        'resource "aws_lb_listener" "l" {\n  load_balancer_arn = aws_lb.front.arn\n'
+        "  default_action {\n    target_group_arn = aws_lb_target_group.tg.arn\n  }\n}\n"
+        'resource "aws_lb_target_group_attachment" "a" {\n  target_group_arn = aws_lb_target_group.tg.arn\n'
+        "  target_id = aws_instance.app.id\n}\n"
+    )
+    profile = "  iam_instance_profile = aws_iam_instance_profile.app.name\n"
+    r = paths(
+        tmp_path,
+        NET + ROLE + BUCKETS + WILDCARD_S3 + lb + sg("lb", 443) + sg("app") + instance("app", "priv", "app", profile),
+    )
+    (c,) = r.chains  # the private instance isn't an entry by itself: only through the load balancer
+    assert c.steps == ["internet", "aws_lb.front", "aws_instance.app", "aws_iam_role.app"]
+    assert "aws_lb.front routes to aws_instance.app" in c.hops
+    # also reachable directly: one chain, the shortest way in, with a note
+    r = paths(
+        tmp_path,
+        NET
+        + ROLE
+        + BUCKETS
+        + WILDCARD_S3
+        + lb
+        + sg("lb", 443)
+        + sg("app", 22)
+        + instance("app", "pub", "app", profile),
+    )
+    (c,) = r.chains
+    assert c.steps == ["internet", "aws_instance.app", "aws_iam_role.app"]
+    assert "aws_instance.app is also reachable through aws_lb.front" in c.hops
+
+
+def test_exposed_data_stores_are_direct(tmp_path):
+    r = paths(
+        tmp_path,
+        NET + 'resource "aws_db_instance" "billing" {\n  publicly_accessible = true\n}\n'
+        'resource "aws_s3_bucket" "site" {\n  acl = "public-read"\n}\n'
+        'resource "aws_elasticsearch_domain" "search" {\n  vpc_options {\n    subnet_ids = [aws_subnet.priv.id]\n  }\n}\n',
+    )
+    got = {(c.sinks[0], c.severity, c.confidence) for c in r.chains}
+    assert got == {("aws_db_instance.billing", "critical", "direct"), ("aws_s3_bucket.site", "critical", "direct")}
+    assert all(c.steps == ["internet"] for c in r.chains)
+    assert ("internet", "aws_db_instance.billing") in {(e["source"], e["target"]) for e in r.edges}
+
+
+def test_a_long_lived_key_with_admin_through_a_group(tmp_path):
+    r = paths(
+        tmp_path,
+        BUCKETS + 'resource "aws_dynamodb_table" "orders" {}\n'
+        'resource "aws_iam_user" "ci" {}\nresource "aws_iam_access_key" "k" {\n  user = aws_iam_user.ci.name\n}\n'
+        'resource "aws_iam_group" "ops" {}\n'
+        'resource "aws_iam_user_group_membership" "m" {\n  user = aws_iam_user.ci.name\n  groups = [aws_iam_group.ops.name]\n}\n'
+        'resource "aws_iam_group_policy_attachment" "a" {\n  group = aws_iam_group.ops.name\n'
+        '  policy_arn = "arn:aws:iam::aws:policy/AdministratorAccess"\n}\n',
+    )
+    (c,) = r.chains
+    assert c.kind == "leaked key → data" and c.steps == ["internet", "aws_iam_user.ci"]
+    assert len(c.sinks) == 3 and c.severity == "critical"
+    assert "aws_iam_user.ci grants AdministratorAccess on every resource" in c.hops
+
+
+def test_a_function_url_with_no_auth(tmp_path):
+    r = paths(
+        tmp_path,
+        BUCKETS + 'resource "aws_iam_role" "fn" {}\n'
+        'resource "aws_iam_role_policy" "p" {\n  role = aws_iam_role.fn.id\n  policy = jsonencode({\n'
+        '    Statement = [{ Effect = "Allow", Action = "*", Resource = "*" }]\n  })\n}\n'
+        'resource "aws_lambda_function" "f" {\n  function_name = "f"\n  role = aws_iam_role.fn.arn\n}\n'
+        'resource "aws_lambda_function_url" "u" {\n  function_name = aws_lambda_function.f.function_name\n'
+        '  authorization_type = "NONE"\n}\n',
+    )
+    (c,) = r.chains
+    assert c.steps == ["internet", "aws_lambda_function_url.u", "aws_lambda_function.f", "aws_iam_role.fn"]
+    assert len(c.sinks) == 2 and c.severity == "critical"  # Action "*": everything
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        NET + ROLE + BUCKETS + WILDCARD_S3 + sg("web", 80) + instance("web", "priv", "web"),  # no public IP
+        NET + sg("web") + instance("web", "pub", "web"),  # nothing open to the internet
+        NET + 'resource "aws_lb" "in" {\n  internal = true\n}\n',  # an internal load balancer
+    ],
+)
+def test_nothing_reaches_in(tmp_path, text):
+    assert paths(tmp_path, text).chains == []
+
+
+def test_the_cli_and_the_diagram(tmp_path, capsys):
+    (tmp_path / "main.tf").write_text(
+        NET
+        + ROLE
+        + BUCKETS
+        + WILDCARD_S3
+        + sg("web", 80)
+        + instance("web", "pub", "web", "  iam_instance_profile = aws_iam_instance_profile.app.name\n")
+    )
+    out, page = tmp_path / "g.json", tmp_path / "d.html"
+    with pytest.raises(SystemExit):
+        cli.main([str(tmp_path), "--no-scan", "--graph-json", str(out), "--diagram", str(page)])
+    text = capsys.readouterr().out
+    assert "Attack paths: 1" in text and "internet → web → app → 2 data stores" in text
+    assert json.loads(out.read_text())["graphs"][0]["attack_paths"][0]["confidence"] == "likely"
+    html = page.read_text()
+    blob = json.loads(html.split('type="application/json">', 1)[1].split("</script>", 1)[0])
+    assert blob["internet"] and blob["walked"] and len(blob["chains"]) == 1
+    assert {"internet", "aws_iam_role.app"} <= {e["source"] for e in blob["edges"]}
+
+
+def test_the_diagram_without_paths_says_so(tmp_path):
+    (tmp_path / "main.tf").write_text('resource "aws_s3_bucket" "b" {}\n')
+    g = graph.build(tmp_path, ".")
+    page = diagram.render(arch.build(g), "t")
+    assert '"walked": false' in page and '"internet": false' in page
