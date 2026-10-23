@@ -30,6 +30,7 @@ dev = [
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
+markers = ["real_scanners: runs the installed trivy and checkov (skipped when they are missing)"]
 
 [tool.ruff]
 line-length = 120

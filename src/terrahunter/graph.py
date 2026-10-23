@@ -32,7 +32,10 @@ _RES = re.compile(r"(?<![\w.])(data\.)?([a-z][a-z0-9_]*)\.([A-Za-z0-9_-]+)")
 _VAR = re.compile(r"(?<![\w.])var\.([A-Za-z0-9_-]+)")
 _LOCAL = re.compile(r"(?<![\w.])local\.([A-Za-z0-9_-]+)")
 _MOD = re.compile(r"(?<![\w.])module\.([A-Za-z0-9_-]+)(?:\[[^\]]*\])?\.([A-Za-z0-9_-]+)")
-_BLOCK_LINE = re.compile(r'^\s*(resource|data|module)\s+"([^"]+)"(?:\s+"([^"]+)")?', re.MULTILINE)
+# a block's labels may be quoted or not (`data aws_iam_policy_document "x"` is valid HCL)
+_BLOCK_LINE = re.compile(
+    r'^[ \t]*(resource|data|module)\s+"?([A-Za-z0-9_-]+)"?(?:\s+"?([A-Za-z0-9_-]+)"?)?\s*\{', re.MULTILINE
+)
 
 
 @dataclass
@@ -70,6 +73,12 @@ class Graph:
     unknown: dict[str, Unknown] = field(default_factory=dict)
     modules: list[str] = field(default_factory=list)  # module instances loaded, by address
     notes: list[str] = field(default_factory=list)
+    module_dirs: dict[str, Path] = field(default_factory=dict, repr=False)  # module address ("" root) → its directory
+
+    @property
+    def dirs(self) -> list[Path]:
+        """The directories read (real paths, the root's first), for the scanners."""
+        return list(dict.fromkeys(self.module_dirs.values()))
 
     def to_dict(self) -> dict:
         return {
@@ -145,6 +154,13 @@ def _attrs(body, prefix: str = ""):
             yield from _attrs(x, prefix) if isinstance(x, (dict, list)) else [(prefix.rstrip("."), x)]
 
 
+def dir_label(d: Path, folder: Path, allowed: list[Path]) -> str:
+    """How a directory is named in the output: relative to the folder, or `repo:path` in a --with folder."""
+    base = deps._inside_any(d, allowed) or folder
+    rel = os.path.relpath(d, base)
+    return (base.name + ":" if base != folder else "") + (Path(rel).as_posix() if rel != "." else ".")
+
+
 def build(folder: Path, root: str, with_folders: list[Path] | None = None) -> Graph:
     folder = folder.resolve()
     allowed = [folder] + [w.resolve() for w in with_folders or []]
@@ -153,13 +169,12 @@ def build(folder: Path, root: str, with_folders: list[Path] | None = None) -> Gr
     downloads = deps._downloads(root_dir)
 
     def label(d: Path) -> str:
-        base = deps._inside_any(d, allowed) or folder
-        rel = os.path.relpath(d, base)
-        return (base.name + ":" if base != folder else "") + (Path(rel).as_posix() if rel != "." else ".")
+        return dir_label(d, folder, allowed)
 
     def load(d: Path, path: tuple[str, ...], parent: _Scope | None) -> _Scope:
         sc = _Scope(path, d, parent)
         g.modules.append(sc.prefix.rstrip(".") or "(root)")
+        g.module_dirs[sc.prefix.rstrip(".")] = d
         for fname, doc, text in deps.load_dir(d, g.notes, label(d)):
             lines = {}
             for m in _BLOCK_LINE.finditer(text):

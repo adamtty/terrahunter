@@ -1,5 +1,5 @@
-"""The command line: `terrahunter <folder>`. Stages 1 (the folder in), 2 (what's missing) and 3a (the connection
-graph) are built."""
+"""The command line: `terrahunter <folder>`. Stages 1 (the folder in), 2 (what's missing), 3 (the connection graph
+and the diagram) and 4 (vulnerabilities) are built."""
 
 from __future__ import annotations
 
@@ -9,10 +9,10 @@ import os
 import sys
 from pathlib import Path
 
-from terrahunter import __version__, arch, deps, diagram, graph, roots, sandbox
+from terrahunter import __version__, arch, deps, diagram, graph, roots, sandbox, scanners
 
 EXIT_OK, EXIT_INCOMPLETE, EXIT_ERROR = 0, 2, 3
-NEXT = "the next stages (vulnerabilities, attack paths and walking through them) aren't built yet"
+NEXT = "the next stages (attack paths, and walking through them) aren't built yet"
 
 
 class TerrahunterError(Exception):
@@ -56,6 +56,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="where to write the diagram (default: terrahunter-diagram.html here; one file per root with --all-roots)",
     )
     ap.add_argument("--no-diagram", action="store_true", help="don't write the diagram")
+    ap.add_argument("--no-scan", action="store_true", help="don't run trivy and checkov")
     return ap
 
 
@@ -174,6 +175,33 @@ def show_graph(g: graph.Graph) -> None:
         print(f"  ! {sandbox.one_line(note, 300)}")
 
 
+def show_scan(s: scanners.Scan, top: int = 10) -> None:
+    n = len(s.findings)
+    tools = ", ".join(
+        f"{name} {st['version'] or ''}".rstrip() + (f" {st['findings']}" if st["ok"] else " failed")
+        for name, st in s.status.items()
+    )
+    print(f"\nVulnerabilities: {n} finding{'s' if n != 1 else ''} ({tools})")
+    if n:
+        counts = {}
+        for f in s.findings:
+            counts[f.severity or "unrated"] = counts.get(f.severity or "unrated", 0) + 1
+        print("  " + "  ".join(f"{k.lower()} {v}" for k, v in counts.items()))
+        for f in s.findings[:top]:
+            where = f.address or "(not placed)"
+            print(
+                f"    {(f.severity or 'unrated').lower():<8} {sandbox.one_line(f.id, 20):<12} "
+                f"{sandbox.one_line(where, 70)}  {sandbox.one_line(f.title, 90)}"
+            )
+        if n > top:
+            print(f"    … and {n - top} more (on the diagram, and in --graph-json)")
+    for name, st in s.status.items():
+        if not st["ok"]:
+            print(f"  ✗ {name}: {sandbox.one_line(st['error'], 300)}")
+    for note in s.notes:
+        print(f"  ! {sandbox.one_line(note, 300)}")
+
+
 def write_private(path: str, text: str) -> None:
     """Write an output file, refusing a symlink at the path (a planted link can't redirect the write)."""
     flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
@@ -215,19 +243,31 @@ def _main(argv: list[str] | None) -> int:
         show_needs(s)
         g = graph.build(d.folder, c.path, withs)
         show_graph(g)
-        graphs.append(g)
+        scan = None
+        if not a.no_scan:
+            scan = scanners.scan(g, d.folder, withs)
+            show_scan(scan)
+        graphs.append((g, scan))
         if not a.no_diagram:
             path = a.diagram
             if len(chosen) > 1:
                 slug = "root" if c.path == "." else c.path.replace("/", "-")
                 path = str(Path(a.diagram).with_name(f"{Path(a.diagram).stem}-{slug}{Path(a.diagram).suffix}"))
             title = d.folder.name + ("" if c.path == "." else f"/{c.path}")
-            write_private(path, diagram.render(arch.build(g), title))
+            model = arch.build(g, scan.findings if scan else [])
+            write_private(path, diagram.render(model, title, scanned=scan is not None))
             print(f"  diagram: {sandbox.one_line(path)} (open it in a browser)")
-        complete &= not s.open and not s.notes and not g.notes
+        complete &= not s.open and not s.notes and not g.notes and not (scan and scan.failed)
     if a.graph_json:
         write_private(
-            a.graph_json, json.dumps({"folder": str(d.folder), "graphs": [g.to_dict() for g in graphs]}, indent=1)
+            a.graph_json,
+            json.dumps(
+                {
+                    "folder": str(d.folder),
+                    "graphs": [g.to_dict() | ({"scan": sc.to_dict()} if sc else {}) for g, sc in graphs],
+                },
+                indent=1,
+            ),
         )
         print(f"\nwrote {sandbox.one_line(a.graph_json)}")
     print(f"\n({NEXT})")

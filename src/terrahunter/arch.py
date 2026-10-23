@@ -11,7 +11,10 @@ The graph has every resource and every reference; a diagram that drew them all w
 - **connections**: the references that mean something between components, with plumbing collapsed into them
   (instance → instance profile → role is *runs as*; load balancer → listener → target group → attachment → target is
   *routes to*);
-- **unknown**: modules the analysis couldn't see (stage 2), drawn as dashed placeholders so the holes show.
+- **unknown**: modules the analysis couldn't see (stage 2), drawn as dashed placeholders so the holes show;
+- **findings** (stage 4): each scanner finding on the component it's about. One on plumbing (a security group, a
+  bucket's public access block, a group's rule) goes to the components that use it, that it belongs to, or that use
+  what it belongs to; one with no component (a provider block, a VPC) stays in the list not on the diagram.
 
 The resource-type knowledge here is a built-in table for now, to be replaced by the knowledge-base catalogue.
 """
@@ -21,7 +24,7 @@ from __future__ import annotations
 import re
 from dataclasses import asdict, dataclass, field
 
-from terrahunter import deps, graph
+from terrahunter import deps, graph, scanners
 
 # drawable types: type → (glyph, category, short name). Anything else is plumbing (badges / hidden) or not drawn.
 COMPONENTS = {
@@ -130,6 +133,7 @@ class Component:
     module: str
     badges: list[Badge] = field(default_factory=list)
     unknown: bool = False
+    findings: list[dict] = field(default_factory=list)
 
 
 @dataclass
@@ -147,6 +151,7 @@ class Model:
     containers: list[Container]
     components: list[Component]
     connections: list[Connection]
+    loose: list[dict] = field(default_factory=list)  # findings not on any component
 
     def to_dict(self) -> dict:
         return {
@@ -154,6 +159,7 @@ class Model:
             "containers": [asdict(c) for c in self.containers],
             "comps": [asdict(c) for c in self.components],
             "edges": [asdict(e) for e in self.connections],
+            "loose": self.loose,
         }
 
 
@@ -190,7 +196,7 @@ def _meaning(attr: str, source_type: str = "") -> str | None:
     return "uses"
 
 
-def build(g: graph.Graph) -> Model:
+def build(g: graph.Graph, findings: list[scanners.Finding] = ()) -> Model:
     R = g.resources
     out_edges: dict[str, list[graph.Edge]] = {}
     in_edges: dict[str, list[graph.Edge]] = {}
@@ -402,6 +408,33 @@ def build(g: graph.Graph) -> Model:
         if e.target in g.unknown and e.source in comps:
             connect(e.source, e.target, _meaning(e.attr) or "uses")
 
+    # --- findings: on the component, else what uses the resource, else what it belongs to, else what uses that
+    # (a security group rule → its group → the instances in the group)
+    def users(x):
+        return {e.source for e in in_edges.get(x, []) if e.source in comps}
+
+    loose = []
+    for f in findings:
+        a = f.address
+        owners = (
+            [a]
+            if a in comps
+            else sorted(users(a))
+            or sorted({t for t in targets(a) if t in comps})
+            or sorted({u for t in targets(a) for u in users(t)})
+        )
+        item = {k: getattr(f, k) for k in ("id", "title", "severity", "source", "file", "line", "url", "address")}
+        for o in owners:
+            comps[o].findings.append(item)
+        if not owners:
+            loose.append(item)
+    for c in comps.values():
+        if c.findings:
+            worst = min(c.findings, key=lambda x: scanners.rank(x["severity"]))["severity"]
+            n = len(c.findings)
+            text = f"{n} finding{'s' if n != 1 else ''}" + (f", worst {worst.lower()}" if worst else "")
+            c.badges.insert(0, Badge(text, worst in ("CRITICAL", "HIGH")))
+
     used = {c.parent for c in comps.values()} | {c.parent for c in containers if c.parent}
     containers = [c for c in containers if c.id in used or c.kind in ("vpc", "subnet")]
-    return Model(g.root, containers, list(comps.values()), list(conns.values()))
+    return Model(g.root, containers, list(comps.values()), list(conns.values()), loose)
