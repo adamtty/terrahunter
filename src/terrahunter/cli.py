@@ -1,5 +1,5 @@
-"""The command line: `terrahunter <folder>`. Stages 1 (the folder in), 2 (what's missing), 3 (the connection graph
-and the diagram), 4 (vulnerabilities) and 5 (attack paths) are built."""
+"""The command line: `terrahunter <folder>`. Stage 1 (the folder in), 2 (what's missing), 3 (the connection graph and
+the diagram), 4 (vulnerabilities), 5 (attack paths) and 6 (the results: the walkthrough, the fix list, a report)."""
 
 from __future__ import annotations
 
@@ -9,9 +9,11 @@ import os
 import sys
 from pathlib import Path
 
-from terrahunter import __version__, arch, chains, deps, diagram, graph, roots, sandbox, scanners
+from terrahunter import __version__, arch, chains, deps, diagram, graph, report, roots, sandbox, scanners
 
-EXIT_OK, EXIT_INCOMPLETE, EXIT_ERROR = 0, 2, 3
+# 1: an attack path at or above --fail-on (it wins over 2: the paths found are real even when some code was unseen)
+EXIT_OK, EXIT_PATHS, EXIT_INCOMPLETE, EXIT_ERROR = 0, 1, 2, 3
+SEVERITY = ("medium", "high", "critical")
 NEXT = "open the diagram and click an attack path to walk through it, hop by hop"
 
 
@@ -57,6 +59,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     ap.add_argument("--no-diagram", action="store_true", help="don't write the diagram")
     ap.add_argument("--no-scan", action="store_true", help="don't run trivy and checkov")
+    ap.add_argument(
+        "--report", metavar="PATH", help="write the results as Markdown: the fix list, every path hop by hop, findings"
+    )
+    ap.add_argument(
+        "--fail-on",
+        choices=SEVERITY,
+        help="exit 1 when an attack path is at least this severe (for CI)",
+    )
     return ap
 
 
@@ -216,6 +226,15 @@ def show_chains(r: chains.Result, g: graph.Graph) -> None:
         end = f" → {len(c.sinks)} data store{'s' if len(c.sinks) != 1 else ''}" if c.sinks and not direct else ""
         print(f"  {c.severity:<8} {c.confidence:<8} {sandbox.one_line(hops + end, 140)}")
         print(f"           {sandbox.one_line(c.entry, 140)}")
+    if r.fixes:
+        print("  Fix first:")
+        for i, f in enumerate(r.fixes[:5], 1):
+            n = len(f.chains)
+            w = f.where[0] if f.where else None
+            at = f"  ({sandbox.one_line(w['file'], 80)}:{w['line']})" if w else ""
+            print(f"  {i:>3}. {sandbox.one_line(f.action, 110)}: {f.effect} {n} path{'s' if n != 1 else ''}{at}")
+        if len(r.fixes) > 5:
+            print(f"       … and {len(r.fixes) - 5} more (--report)")
 
 
 def write_private(path: str, text: str) -> None:
@@ -254,6 +273,7 @@ def _main(argv: list[str] | None) -> int:
         withs.append(Path(w))
     complete = not d.notes
     graphs = []
+    results: list[report.RootResult] = []
     for c in chosen:
         s = resolve(d.folder, c.path, withs, a.fetch_modules)
         show_needs(s)
@@ -267,6 +287,7 @@ def _main(argv: list[str] | None) -> int:
         paths = chains.build(g, model)
         show_chains(paths, g)
         graphs.append((g, scan, paths))
+        results.append(report.RootResult(c.path, s, g, model, scan, paths))
         if not a.no_diagram:
             path = a.diagram
             if len(chosen) > 1:
@@ -283,7 +304,9 @@ def _main(argv: list[str] | None) -> int:
                 {
                     "folder": str(d.folder),
                     "graphs": [
-                        g.to_dict() | ({"scan": sc.to_dict()} if sc else {}) | {"attack_paths": p.to_dict()["chains"]}
+                        g.to_dict()
+                        | ({"scan": sc.to_dict()} if sc else {})
+                        | {"attack_paths": p.to_dict()["chains"], "fixes": p.to_dict()["fixes"]}
                         for g, sc, p in graphs
                     ],
                 },
@@ -291,5 +314,12 @@ def _main(argv: list[str] | None) -> int:
             ),
         )
         print(f"\nwrote {sandbox.one_line(a.graph_json)}")
+    if a.report:
+        write_private(a.report, report.render(d.folder.name, results))
+        print(f"\nwrote {sandbox.one_line(a.report)}")
     print(f"\n({NEXT})")
+    if a.fail_on:
+        worst = [SEVERITY.index(c.severity) for r in results for c in r.paths.chains if c.severity in SEVERITY]
+        if worst and max(worst) >= SEVERITY.index(a.fail_on):
+            return EXIT_PATHS
     return EXIT_OK if complete else EXIT_INCOMPLETE

@@ -93,6 +93,7 @@ class Chain:
     sinks: list[str] = field(default_factory=list)  # the data stores it ends at
     hops: list[str] = field(default_factory=list)  # what's wrong, a line per hop (each names the ids it's about)
     drawn: bool = True
+    fixes: list[str] = field(default_factory=list)  # ids of the fixes that break or weaken it
 
 
 @dataclass
@@ -100,15 +101,31 @@ class Grant:
     services: set[str]  # service prefixes, or {"*"}
     actions: list[str]  # for the text: "s3:*", "AdministratorAccess"
     targets: set[str]  # resources the policies name (empty: by service, resource "*" or literal ARNs)
+    wide: list[str] = field(default_factory=list)  # the policies granting on every resource (or a broad managed one)
+
+
+@dataclass
+class Fix:
+    id: str
+    action: str  # what to change, one line
+    effect: str  # breaks (the path goes) | narrows (it reaches less) | hardens (a hop gets harder)
+    where: list[dict]  # [{address, file, line}]: the resources to change
+    chains: list[int] = field(default_factory=list)  # indexes into Result.chains
+    severity: str = ""  # the worst path it affects
 
 
 @dataclass
 class Result:
     chains: list[Chain]
     edges: list[dict]  # extra drawn edges: internet → entry, identity → what it can access
+    fixes: list[Fix] = field(default_factory=list)  # most valuable first
 
     def to_dict(self) -> dict:
-        return {"chains": [asdict(c) for c in self.chains], "edges": self.edges}
+        return {
+            "chains": [asdict(c) for c in self.chains],
+            "edges": self.edges,
+            "fixes": [asdict(f) for f in self.fixes],
+        }
 
 
 def _ports(comp: arch.Component) -> list[str]:
@@ -146,6 +163,7 @@ def grants(g: graph.Graph, identity: str) -> Grant:
     services: set[str] = set()
     actions: list[str] = []
     targets: set[str] = set()
+    wide: list[str] = []
     for p in policies:
         docs = [p] + [t for t in out_e.get(p, []) if R[t].type in ("aws_iam_policy", "aws_iam_policy_document")]
         docs += [t for d in docs[1:] for t in out_e.get(d, []) if R[t].type == "aws_iam_policy_document"]
@@ -154,11 +172,14 @@ def grants(g: graph.Graph, identity: str) -> Grant:
         if name in MANAGED:
             services |= MANAGED[name]
             actions.append(name)
+            wide.append(p)
         for d in docs:
             text = str(R[d].body)
             if _ANY_ACTION.search(text):
                 services.add("*")
                 actions.append("*")
+            if (_ANY_ACTION.search(text) or _ANY_RESOURCE.search(text)) and p not in wide:
+                wide.append(p)
             for svc, act in _ACTION.findall(text):
                 if svc in ("sts", "iam") or svc in SERVICE_SINKS or svc in ("ec2", "lambda"):
                     services.add(svc)
@@ -166,7 +187,7 @@ def grants(g: graph.Graph, identity: str) -> Grant:
                     actions.append(f"{svc}:{act}")
             if not _ANY_RESOURCE.search(text):
                 targets |= {t for t in out_e.get(d, []) if R.get(t) and R[t].type in SINKS}
-    return Grant(services, actions, targets)
+    return Grant(services, actions, targets, wide)
 
 
 def build(g: graph.Graph, model: arch.Model) -> Result:
@@ -350,4 +371,91 @@ def build(g: graph.Graph, model: arch.Model) -> Result:
     )
     used = {s for ch in chains for s in ch.steps + ch.sinks} | {"internet"}
     edges = [e for e in edges if e["source"] in used and e["target"] in used]
-    return Result(chains, edges)
+    return Result(chains, edges, fixes(g, model, chains))
+
+
+EFFECT = {"breaks": 0, "narrows": 1, "hardens": 2}
+_ENTRY_FIX = {  # entry type → (what to change, the attribute it's about)
+    "aws_db_instance": "Set publicly_accessible = false (reach it from inside the VPC)",
+    "aws_rds_cluster": "Set publicly_accessible = false on its instances (reach them from inside the VPC)",
+    "aws_s3_bucket": "Remove the public ACL and turn on S3 Block Public Access",
+    "aws_elasticsearch_domain": "Put the domain in a VPC (vpc_options) and restrict its access policy",
+    "aws_opensearch_domain": "Put the domain in a VPC (vpc_options) and restrict its access policy",
+    "aws_lambda_function_url": 'Set authorization_type = "AWS_IAM"',
+    "aws_eks_cluster": "Turn off endpoint_public_access, or limit public_access_cidrs to known ranges",
+}
+
+
+def fixes(g: graph.Graph, model: arch.Model, chains: list[Chain]) -> list[Fix]:
+    """The changes that break or weaken the paths, each with where to make it, most valuable first: the worst path
+    it touches, then whether it removes the path, then how many paths."""
+    comps = {c.id: c for c in model.components}
+    R = g.resources
+    found: dict[str, Fix] = {}
+
+    def where(*addrs: str) -> list[dict]:
+        return [{"address": a, "file": R[a].file, "line": R[a].line} for a in dict.fromkeys(addrs) if a in R]
+
+    def add(fid: str, action: str, effect: str, addrs: list[str], i: int) -> None:
+        f = found.setdefault(fid, Fix(fid, action, effect, where(*addrs)))
+        if i not in f.chains:
+            f.chains.append(i)
+        if fid not in chains[i].fixes:
+            chains[i].fixes.append(fid)
+
+    for i, ch in enumerate(chains):
+        entry = ch.steps[1] if len(ch.steps) > 1 else ch.sinks[0]
+        c = comps.get(entry)
+        if c is None:
+            continue
+        if c.type == "aws_instance":
+            groups = sorted({e.target for e in g.edges if e.source == entry and e.target in model.open_rules})
+            opened = [(p, o) for sg in groups for p, o in model.open_rules[sg]]
+            if opened:  # one fix per set of rules: instances sharing a group share it
+                ports = ", ".join(sorted({p for p, _ in opened}))
+                names = ", ".join(R[sg].name for sg in groups if model.open_rules[sg])
+                origins = sorted({o for _, o in opened})
+                add(
+                    "close:" + ",".join(origins),
+                    f"Close {ports} to the internet in security group {names}",
+                    "breaks",
+                    origins,
+                    i,
+                )
+        elif c.type == "aws_iam_user":
+            keys = [e.source for e in g.edges if e.target == entry and R[e.source].type == "aws_iam_access_key"]
+            add(
+                f"key:{entry}",
+                f"Delete {c.name}'s long-lived access key; use short-lived credentials (SSO, OIDC)",
+                "breaks",
+                keys or [entry],
+                i,
+            )
+        elif c.type in _ENTRY_FIX:
+            add(f"public:{entry}", f"{c.name}: {_ENTRY_FIX[c.type]}", "breaks", [entry], i)
+        for s in ch.steps[1:]:
+            x = comps.get(s)
+            if x is None:
+                continue
+            if x.type in COMPUTE and _has(x, "IMDSv1 allowed") and ch.confidence == "likely":
+                add(
+                    f"imds:{s}",
+                    f'Require IMDSv2 on {x.name}: metadata_options {{ http_tokens = "required" }}',
+                    "hardens",
+                    [s],
+                    i,
+                )
+            if x.cat == "security":
+                wide = grants(g, s).wide
+                if wide and ch.sinks:
+                    add(
+                        f"scope:{s}",
+                        f"Scope {x.name}'s policies to the actions and resources it needs",
+                        "narrows",
+                        wide,
+                        i,
+                    )
+    rank = {"critical": 0, "high": 1, "medium": 2}
+    for f in found.values():
+        f.severity = min((chains[i].severity for i in f.chains), key=rank.__getitem__)
+    return sorted(found.values(), key=lambda f: (rank[f.severity], EFFECT[f.effect], -len(f.chains), f.id))

@@ -14,9 +14,8 @@
 
 > [!WARNING]
 > **terrahunter is being rebuilt from the ground up.** This repository started again from scratch on
-> 23 October 2026. The pipeline below lands one stage at a time; so far it finds the root modules in a folder, tells
-> you what they need that it can't see yet, draws the infrastructure as a diagram, pins scanner findings to it, and
-> maps the attack paths from the internet inwards (AWS so far).
+> 23 October 2026. All six stages of the pipeline below now run end to end (attack paths cover AWS so far), but
+> it's early: expect rough edges, and check what it says against the code.
 
 ## The idea
 
@@ -27,7 +26,7 @@ terrahunter answers that by drawing your infrastructure the way an architect wou
 services, the connections between them) and then walking you through each path an attacker could chain across it,
 one hop at a time, with what's wrong at every step.
 
-## How it will work
+## How it works
 
 1. **Point it at a folder.** Any repository checkout. terrahunter finds the Terraform root modules in it, wherever
    they sit.
@@ -52,7 +51,23 @@ one hop at a time, with what's wrong at every step.
 | 3. Connections and diagram | **built**: the connection graph (every resource in the root and its modules, every reference between them, through variables, locals and module outputs; `--graph-json`), and `terrahunter-diagram.html` on every run: an architecture diagram in 2D or 3D, plumbing folded into badges, unavailable modules drawn as dashed holes |
 | 4. Vulnerabilities | **built**: runs [trivy](https://trivy.dev) and [checkov](https://www.checkov.io) (when installed; `--no-scan` skips them) on a contained copy of the root and every module it calls, and pins each finding to the resource it's about, in every instance of a module, so it shows on the diagram's components |
 | 5. Attack paths | **built** (AWS): finds what the internet reaches (internet-facing load balancers, instances with a public IP behind an open security group, public databases and buckets, unauthenticated function URLs, long-lived access keys), follows the traffic inwards, says how each workload could be taken over (SSH open, IMDSv1 behind a web port, the app itself), what it runs as, and which data stores that identity's policies reach; on the diagram, click a path and step through it hop by hop |
-| 6. Results and walkthrough | **partly built**: the walkthrough is in the diagram (zone out the rest, zoom, step hop by hop with what's wrong at each); a report to share and a fix list are next |
+| 6. Results and walkthrough | **built**: in the diagram, click a path and step through it (everything else fades, each hop zooms in with what's wrong there); a fix list ranked by the paths each change breaks, with the file and line to change; `--report` writes it all as Markdown to share; `--fail-on` for CI |
+
+## Usage
+
+```sh
+uv tool install git+https://github.com/adamtty/terrahunter
+terrahunter path/to/terraform                 # pick a root, or --root envs/prod, or --all-roots
+terrahunter . --root envs/prod --report terrahunter-report.md
+terrahunter . --all-roots --fail-on critical  # in CI: exit 1 when a critical attack path exists
+```
+
+Each run prints what each root needs, the scanner findings, the attack paths and what to fix first, and writes
+`terrahunter-diagram.html` (one self-contained page: open it in a browser). Other options: `--with PATH` (another
+repository the code reads from), `--fetch-modules`, `--graph-json PATH`, `--no-scan`, `--no-diagram`.
+
+Exit codes: 0 done, 1 an attack path at or above `--fail-on`, 2 incomplete (something couldn't be read or scanned),
+3 error.
 
 ## Requirements
 
