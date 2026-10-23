@@ -9,10 +9,10 @@ import os
 import sys
 from pathlib import Path
 
-from terrahunter import __version__, deps, graph, roots, sandbox
+from terrahunter import __version__, arch, deps, diagram, graph, roots, sandbox
 
 EXIT_OK, EXIT_INCOMPLETE, EXIT_ERROR = 0, 2, 3
-NEXT = "the next stages (the diagram, vulnerabilities, attack paths) aren't built yet: this run stops here"
+NEXT = "the next stages (vulnerabilities, attack paths and walking through them) aren't built yet"
 
 
 class TerrahunterError(Exception):
@@ -49,6 +49,13 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument(
         "--graph-json", metavar="PATH", help="write the connection graph (resources, connections, unknowns)"
     )
+    ap.add_argument(
+        "--diagram",
+        metavar="PATH",
+        default="terrahunter-diagram.html",
+        help="where to write the diagram (default: terrahunter-diagram.html here; one file per root with --all-roots)",
+    )
+    ap.add_argument("--no-diagram", action="store_true", help="don't write the diagram")
     return ap
 
 
@@ -209,6 +216,14 @@ def _main(argv: list[str] | None) -> int:
         g = graph.build(d.folder, c.path, withs)
         show_graph(g)
         graphs.append(g)
+        if not a.no_diagram:
+            path = a.diagram
+            if len(chosen) > 1:
+                slug = "root" if c.path == "." else c.path.replace("/", "-")
+                path = str(Path(a.diagram).with_name(f"{Path(a.diagram).stem}-{slug}{Path(a.diagram).suffix}"))
+            title = d.folder.name + ("" if c.path == "." else f"/{c.path}")
+            write_private(path, diagram.render(arch.build(g), title))
+            print(f"  diagram: {sandbox.one_line(path)} (open it in a browser)")
         complete &= not s.open and not s.notes and not g.notes
     if a.graph_json:
         write_private(

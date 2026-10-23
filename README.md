@@ -14,8 +14,8 @@
 
 > [!WARNING]
 > **terrahunter is being rebuilt from the ground up.** This repository started again from scratch on
-> 23 October 2026. The pipeline below lands one stage at a time; so far it finds the root modules in a folder and
-> tells you what they need that it can't see yet.
+> 23 October 2026. The pipeline below lands one stage at a time; so far it finds the root modules in a folder, tells
+> you what they need that it can't see yet, and draws the infrastructure as a diagram.
 
 ## The idea
 
@@ -48,7 +48,7 @@ one hop at a time, with what's wrong at every step.
 |---|---|
 | 1. Folder in | **built**: `terrahunter <folder>` finds the root modules, says why each is one, and lets you pick (`--root`, `--all-roots`) |
 | 2. What's missing | **built**: lists every module and remote state a root needs (followed through nested modules), matches remote state to the stack that writes it, offers to download modules, and takes other repositories with `--with` |
-| 3. Connections and diagram | **in progress**: the connection graph is built (every resource in the root and its modules, every reference between them, resolved through variables, locals and module outputs; unavailable modules show as unknown; `--graph-json`); the diagram is next |
+| 3. Connections and diagram | **built**: the connection graph (every resource in the root and its modules, every reference between them, through variables, locals and module outputs; `--graph-json`), and `terrahunter-diagram.html` on every run: an architecture diagram in 2D or 3D, plumbing folded into badges, unavailable modules drawn as dashed holes |
 | 4. Vulnerabilities | planned |
 | 5. Attack paths | planned |
 | 6. Results and walkthrough | planned |

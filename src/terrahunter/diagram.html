@@ -1,0 +1,376 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src '__SCRIPT_HASH__'; style-src 'unsafe-inline'; img-src data:; base-uri 'none'; form-action 'none'">
+<title>terrahunter</title>
+<style>
+:root{--bg:#f3f5f9;--panel:#ffffff;--line:#dfe3ea;--text:#1d2433;--muted:#667085;--risk:#d92d20;--crit:#d92d20;--high:#f79009;--med:#eaaa08;--low:#2e90fa}
+*{box-sizing:border-box}html,body{height:100%}
+body{margin:0;background:var(--bg);color:var(--text);font:14px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",Inter,sans-serif;display:grid;grid-template-columns:340px 1fr;height:100vh;overflow:hidden}
+aside{background:var(--panel);border-right:1px solid var(--line);overflow:auto;padding:18px 16px}
+h1{font-size:16px;margin:0}.sub{color:var(--muted);font-size:12px;margin:2px 0 14px;word-break:break-all}
+h2{font-size:11px;text-transform:uppercase;letter-spacing:.07em;color:var(--muted);margin:18px 0 8px}
+.toggle{display:inline-flex;border:1px solid var(--line);border-radius:8px;overflow:hidden}
+.toggle button{border:0;background:#fff;padding:6px 14px;font:600 12px inherit;cursor:pointer;color:var(--muted)}
+.toggle button.on{background:#1d2433;color:#fff}
+.chain{border:1px solid var(--line);border-radius:10px;padding:8px 10px;margin-bottom:8px;cursor:pointer;background:#fff}
+.chain:hover{border-color:#98a2b3}.chain.on{border-color:var(--risk);box-shadow:0 0 0 2px #fee4e2}
+.chain.off{opacity:.55;cursor:default}
+.sev{display:inline-block;font-size:11px;font-weight:700;padding:1px 7px;border-radius:999px;margin-right:6px;color:#fff;text-transform:uppercase;letter-spacing:.03em}
+.critical{background:var(--crit)}.high{background:var(--high)}.medium{background:var(--med)}.low{background:var(--low)}
+.entry{font-family:ui-monospace,Menlo,monospace;font-size:12px;word-break:break-all;margin-top:3px}.meta{color:var(--muted);font-size:12px}
+#info pre{white-space:pre-wrap;font-size:12px;background:#f8fafc;padding:8px;border-radius:8px;border:1px solid var(--line);margin:6px 0 0}
+main{position:relative;overflow:hidden}
+svg{width:100%;height:100%;display:block;cursor:grab;background-image:radial-gradient(#d0d5dd 1px,transparent 1px);background-size:18px 18px}
+svg:active{cursor:grabbing}
+.walk{border:1px solid #fda29b;background:#fffbfa;border-radius:12px;padding:12px;margin-top:4px}
+.walk h3{margin:0 0 2px;font-size:15px}.walk .k{font-size:11px;font-weight:700;color:#b42318;text-transform:uppercase;letter-spacing:.06em}
+.walk ul{margin:8px 0 0;padding-left:18px}.walk li{margin:3px 0;font-size:13px}.walk li.bad{color:#b42318;font-weight:600}
+.walk .file{font-family:ui-monospace,Menlo,monospace;font-size:11px;color:#667085}
+.nav{display:flex;gap:8px;margin-top:12px}.nav button{flex:1;border:1px solid var(--line);background:#fff;border-radius:8px;padding:7px;font:600 13px inherit;cursor:pointer}
+.nav button.primary{background:#d92d20;border-color:#d92d20;color:#fff}.nav button:disabled{opacity:.4;cursor:default}
+.next{font-size:12px;color:#667085;margin-top:8px}
+.walkcard{position:absolute;left:18px;bottom:18px;width:400px;max-height:62vh;overflow:auto;box-shadow:0 12px 32px #1018282e}
+.walkcard .walk{margin:0;background:#fff}
+.hint{position:absolute;right:14px;bottom:10px;color:var(--muted);font-size:12px;background:#fffc;padding:3px 8px;border-radius:6px}
+</style></head><body>
+<aside>
+<h1>terrahunter</h1><div class="sub" id="target"></div>
+<div class="toggle"><button id="b2d" class="on">2D</button><button id="b3d">3D</button></div>
+<button id="all" style="margin-left:8px;border:1px solid var(--line);background:#fff;border-radius:8px;padding:6px 10px;font-size:12px;cursor:pointer">show everything</button>
+<h2>Attack paths</h2><div id="chains"></div>
+<h2>Selected</h2><div id="info"><span class="meta">Click a chain to walk through it, or a component.</span></div>
+</aside>
+<main><svg id="svg" xmlns="http://www.w3.org/2000/svg"></svg><div id="walk" class="walkcard" hidden></div><div class="hint">drag to pan · scroll to zoom</div></main>
+<script id="data" type="application/json">__DATA__</script>
+<script>
+const showErr = m => { const i = document.getElementById('info'); i.innerHTML = '<pre style="color:#b42318"></pre>'; i.firstChild.textContent = String(m); };
+window.addEventListener('error', e => showErr(e.message + ' @' + e.lineno));
+window.addEventListener('unhandledrejection', e => showErr((e.reason && (e.reason.stack || e.reason.message)) || e.reason));
+const G = JSON.parse(document.getElementById('data').textContent);
+const NS = 'http://www.w3.org/2000/svg';
+const CAT = {compute:'#ED7100', containers:'#ED7100', network:'#8C4FFF', integration:'#E7157B', database:'#C925D1',
+             analytics:'#8C4FFF', storage:'#7AA116', security:'#DD344C', unknown:'#98a2b3'};
+const BOX = {region:{fill:'#ffffff',stroke:'#98a2b3',dash:'6 4'}, area:{fill:'#f9fafb',stroke:'#cfd4dc',dash:'4 4'},
+             vpc:{fill:'#f4f0ff',stroke:'#8C4FFF',dash:''}, pub:{fill:'#f1f8e9',stroke:'#7AA116',dash:''},
+             priv:{fill:'#eaf3fb',stroke:'#147EBA',dash:''}};
+const CW = 178, CH = 54, BH = 17;
+document.title = `terrahunter · ${G.target}`;
+document.getElementById('target').textContent =
+  `${G.target} · ${G.comps.filter(c => !c.unknown).length} components · ${G.edges.length} connections` +
+  (G.comps.some(c => c.unknown) ? ` · ${G.comps.filter(c => c.unknown).length} not available` : '');
+
+// ---------- layout (once): a fixed place for each kind of thing ----------
+const GAP = 18, PAD = 18, HEAD = 38;
+const pos = {};
+const kids = {};
+for (const c of G.containers) (kids[c.parent || 'ROOT'] ||= []).push({c});
+for (const n of G.comps) (kids[n.parent] ||= []).push({n});
+const cardH = n => { const nb = Math.min(n.badges.length, 3) + (n.badges.length > 3 ? 1 : 0); return CH + nb * BH + (nb ? 6 : 0); };
+const CATORDER = ['network','compute','containers','integration','database','analytics','storage','security'];
+function grid(items, cols) { // items: [{w,h,place(x,y)}] → {w,h}
+  let x = 0, y = 0, rowH = 0, w = 0, i = 0;
+  for (const it of items) { if (i && i % cols === 0) { x = 0; y += rowH + GAP; rowH = 0; }
+    it.place(x, y); x += it.w + GAP; rowH = Math.max(rowH, it.h); w = Math.max(w, x - GAP); i++; }
+  return {w, h:items.length ? y + rowH : 0};
+}
+function compItem(n) { const it = {w:CW, h:cardH(n), place:(x, y) => it.x = x, y:0};
+  it.place = (x, y) => { it.px = x; it.py = y; }; it.n = n; return it; }
+function block(id, inner, minW = 200) { // a container: wrapped header + padded inner box (inner: {w,h,commit(ox,oy)})
+  const c = G.containers.find(x => x.id === id), w = Math.max(minW, inner.w + 2 * PAD);
+  const lines = c ? wrapLines(labelOf(c), w - 28).length : 1, head = HEAD + (lines - 1) * 15;
+  const h = head + inner.h + PAD;
+  return {w, h, place:(x, y) => { pos[id] = {x, y, w, h}; inner.commit(x + PAD, y + head); }};
+}
+function packComps(list, cols) { // a grid of cards
+  const its = list.map(n => ({n, w:CW, h:cardH(n), place(x, y){ this.x = x; this.y = y; }}));
+  const g = grid(its, cols);
+  return {w:g.w, h:g.h, commit:(ox, oy) => its.forEach(it => pos[it.n.id] = {x:ox + it.x, y:oy + it.y, w:it.w, h:it.h})};
+}
+function stack(parts, dir) { // parts: [{w,h,place}] in a row ('x') or column ('y')
+  let off = 0, w = 0, h = 0; const at = [];
+  for (const p of parts) { at.push(off); off += (dir === 'x' ? p.w : p.h) + GAP;
+    w = dir === 'x' ? off - GAP : Math.max(w, p.w); h = dir === 'y' ? off - GAP : Math.max(h, p.h); }
+  return {w, h, commit:(ox, oy) => parts.forEach((p, i) => dir === 'x' ? p.place(ox + at[i], oy) : p.place(ox, oy + at[i]))};
+}
+const compsOf = id => (kids[id] || []).filter(k => k.n).map(k => k.n);
+const contsOf = id => (kids[id] || []).filter(k => k.c).map(k => k.c);
+function subnetBox(c) { const cs = compsOf(c.id); return block(c.id, packComps(cs, Math.min(2, Math.max(1, cs.length))), 220); }
+function vpcBox(c) {
+  const parts = [];
+  const top = compsOf(c.id); if (top.length) { const p = packComps(top, Math.min(4, top.length)); parts.push({w:p.w, h:p.h, place:(x, y) => p.commit(x, y)}); }
+  const subs = contsOf(c.id).sort((a, b) => (a.az || '').localeCompare(b.az || '') || (a.public === b.public ? 0 : a.public ? -1 : 1));
+  if (subs.length) { const row = stack(subs.map(subnetBox), 'x'); parts.push({w:row.w, h:row.h, place:(x, y) => row.commit(x, y)}); }
+  return block(c.id, stack(parts, 'y'), 260);
+}
+function servicesBox(id) { // regional / global areas: grouped by category, a column per category
+  const groups = {}; for (const n of compsOf(id)) (groups[n.cat] ||= []).push(n);
+  const cols = CATORDER.filter(c => groups[c]).map(c => { const p = packComps(groups[c], 1); return {w:p.w, h:p.h, place:(x, y) => p.commit(x, y)}; });
+  const rows = []; for (let i = 0; i < cols.length; i += 4) rows.push(stack(cols.slice(i, i + 4), 'x'));
+  return block(id, stack(rows.map(r => ({w:r.w, h:r.h, place:(x, y) => r.commit(x, y)})), 'y'), 220);
+}
+function regionBox(c) {
+  const vpcs = contsOf(c.id).filter(x => x.kind === 'vpc').map(vpcBox);
+  const left = stack(vpcs, 'y'); const parts = [];
+  if (vpcs.length) parts.push({w:left.w, h:left.h, place:(x, y) => left.commit(x, y)});
+  for (const a of contsOf(c.id).filter(x => x.kind === 'area')) parts.push(servicesBox(a.id));
+  const loose = compsOf(c.id); if (loose.length) { const p = packComps(loose, 2); parts.push({w:p.w, h:p.h, place:(x, y) => p.commit(x, y)}); }
+  return block(c.id, stack(parts, 'x'));
+}
+(function layout() {
+  const top = [];
+  if (G.internet) top.push({w:120, h:70, place:(x, y) => pos.internet = {x, y:y + 40, w:120, h:70}});
+  for (const c of contsOf('ROOT')) top.push(c.kind === 'region' ? regionBox(c) : servicesBox(c.id));
+  const s = stack(top, 'x'); const X = GAP * 3; s.commit(0, 0);
+  // the Internet sits level with the first entry it reaches
+  const firstEntry = G.edges.filter(e => e.source === 'internet').map(e => pos[e.target]).filter(Boolean).sort((a, b) => a.y - b.y)[0];
+  if (pos.internet && firstEntry) pos.internet.y = firstEntry.y + firstEntry.h / 2 - 35;
+})();
+setTimeout(() => { // #3d&chain=1&step=2 opens straight onto a step (handy to share)
+  const q = Object.fromEntries(location.hash.slice(1).split('&').filter(Boolean).map(x => x.includes('=') ? x.split('=') : [x, true]));
+  if (q['3d']) { MODE = '3d'; document.getElementById('b2d').classList.remove('on'); document.getElementById('b3d').classList.add('on'); }
+  render(); fit();
+  const ci = parseInt(q.chain, 10);
+  if (!isNaN(ci) && G.chains[ci] && G.chains[ci].drawn) { document.querySelectorAll('.chain')[ci].click();
+    const target = Math.max(0, Math.min(parseInt(q.step || '1', 10) - 1, walkSteps(G.chains[ci]).length - 1)); for (let k = 0; k < target; k++) go(1); }
+});
+
+// ---------- helpers ----------
+const el = (tag, attrs = {}, parent) => { const e = document.createElementNS(NS, tag);
+  for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, v); if (parent) parent.appendChild(e); return e; };
+const esc = s => String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const text = (parent, x, y, s, attrs = {}) => { const t = el('text', {x, y, ...attrs}, parent); t.textContent = s; return t; };
+const byId = Object.fromEntries(G.comps.map(n => [n.id, n]));
+const contById = Object.fromEntries(G.containers.map(c => [c.id, c]));
+function boxStyle(c) { return c.kind === 'subnet' ? BOX[c.public ? 'pub' : 'priv'] : BOX[c.kind] || BOX.area; }
+function edgePoints(e) {
+  const a = pos[e.source], b = pos[e.target]; if (!a || !b) return null;
+  const right = b.x + b.w / 2 >= a.x + a.w / 2;
+  const p0 = {x:right ? a.x + a.w : a.x, y:a.y + Math.min(a.h, CH) / 2};
+  const p3 = {x:right ? b.x : b.x + b.w, y:b.y + Math.min(b.h, CH) / 2};
+  const dx = Math.max(40, Math.abs(p3.x - p0.x) / 2) * (right ? 1 : -1);
+  return [p0, {x:p0.x + dx, y:p0.y}, {x:p3.x - dx, y:p3.y}, p3];
+}
+const EDGE = {traffic:{c:'#344054',d:''}, identity:{c:'#8C4FFF',d:'5 4'}, access:{c:'#b54708',d:'2 4'}, storage:{c:'#98a2b3',d:'3 3'},
+              quiet:{c:'#c0c6d0',d:'2 3'}, unknown:{c:'#98a2b3',d:'5 4'}, other:{c:'#667085',d:''}};
+
+// ---------- state ----------
+let MODE = '2d', SEL = null, FOCUS = null, STEP = 0;
+function walkSteps(c) { const w = c.steps.map(id => ({ids:[id]})); if (c.sinks.length) w.push({ids:c.sinks, final:true}); return w; }
+const hot = () => { if (SEL == null) return null; const c = G.chains[SEL];
+  const ids = new Set([...c.steps, ...c.sinks]); const order = {}; c.steps.forEach((s, i) => order[s] ??= i + 1);
+  c.sinks.forEach(s => order[s] ??= c.steps.length + 1);
+  const W = walkSteps(c); const seen = new Set(W.slice(0, STEP + 1).flatMap(w => w.ids)); // reveal as you walk
+  return {ids:seen, order, chain:c, cur:new Set((W[STEP] || W[0]).ids)}; };
+function edgeHot(e, h) { if (!h || !h.ids.has(e.source) || !h.ids.has(e.target)) return false; const c = h.chain;
+  for (let i = 0; i + 1 < c.steps.length; i++) if (e.source === c.steps[i] && e.target === c.steps[i + 1]) return true;
+  const last = c.steps[c.steps.length - 1]; return e.source === last && c.sinks.includes(e.target); }
+
+// ---------- 2D ----------
+const svg = document.getElementById('svg');
+let view = {x:0, y:0, k:1};
+function render() {
+  svg.innerHTML = ''; const root = el('g', {id:'root'}, svg);
+  el('defs', {}, svg).innerHTML = `<marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0L10,5L0,10z" fill="context-stroke"/></marker>`;
+  (MODE === '2d' ? render2d : render3d)(root, hot()); applyView();
+}
+function render2d(root, h) {
+  const conts = G.containers.filter(c => pos[c.id]).sort((a, b) => pos[a.id].depth - pos[b.id].depth);
+  for (const c of conts) drawContainer(root, c, h);
+  drawEdges(root, h);
+  if (G.internet) drawInternet2d(root, h);
+  for (const n of G.comps) if (pos[n.id]) drawCard(root, n, h);
+}
+function labelOf(c) { return c.label + (c.az && c.az !== '?' ? ` · ${c.az}` : ''); }
+function wrapLines(s, width, px = 6.6) { // greedy word wrap for a label of ~12px text
+  const max = Math.max(8, Math.floor(width / px)), out = []; let line = '';
+  for (const w of s.split(/\s+/)) { if ((line + ' ' + w).trim().length > max && line) { out.push(line); line = w; } else line = (line + ' ' + w).trim(); }
+  if (line) out.push(line); return out;
+}
+function drawContainer(g, c, h) {
+  const p = pos[c.id], st = boxStyle(c);
+  el('rect', {x:p.x, y:p.y, width:p.w, height:p.h, rx:10, fill:st.fill, stroke:st.stroke, 'stroke-width':1.4,
+              'stroke-dasharray':st.dash, opacity:h ? .75 : 1}, g);
+  wrapLines(labelOf(c), p.w - 28).forEach((ln, i) => text(g, p.x + 14, p.y + 24 + i * 15, ln,
+       {'font-size':12, 'font-weight':600, fill:st.stroke === '#98a2b3' ? '#475467' : st.stroke}));
+}
+function drawEdges(g, h) {
+  for (const e of G.edges) {
+    const pts = edgePoints(e); if (!pts) continue;
+    const on = edgeHot(e, h) || (FOCUS && (e.source === FOCUS || e.target === FOCUS)), st = EDGE[e.kind] || EDGE.traffic;
+    if (e.kind === 'access' && !on) continue; // data-access lines only for the selected chain or component
+    el('path', {d:`M${pts[0].x},${pts[0].y} C${pts[1].x},${pts[1].y} ${pts[2].x},${pts[2].y} ${pts[3].x},${pts[3].y}`, fill:'none', stroke:on ? '#d92d20' : st.c,
+      'stroke-width':on ? 3 : 1.4, 'stroke-dasharray':on ? '' : st.d, 'marker-end':'url(#arr)',
+      opacity:h && !on ? .15 : (e.kind === 'quiet' && !on ? .45 : .85)}, g);
+    if (e.kind === 'access' || on) {
+      const mid = {x:(pts[0].x + pts[3].x) / 2, y:(pts[0].y + pts[3].y) / 2};
+      text(g, mid.x, mid.y - 5, e.label, {'text-anchor':'middle', 'font-size':10, fill:on ? '#d92d20' : st.c,
+        'font-weight':600, opacity:h && !on ? .25 : 1, 'paint-order':'stroke', stroke:'#fff', 'stroke-width':3});
+    }
+  }
+}
+function drawInternet2d(g, h) {
+  const p = pos.internet; const on = h && h.ids.has('internet');
+  const grp = el('g', {opacity:h && !on ? .3 : 1}, g);
+  el('rect', {x:p.x, y:p.y, width:p.w, height:p.h, rx:34, fill:'#fff', stroke:on ? '#d92d20' : '#344054', 'stroke-width':on ? 3 : 1.5}, grp);
+  text(grp, p.x + p.w / 2, p.y + p.h / 2 + 5, '🌐 Internet', {'text-anchor':'middle', 'font-size':13, 'font-weight':600});
+  if (on) badgeNum(grp, p.x + p.w - 4, p.y + 4, h.order.internet);
+  if (h && h.cur.has('internet')) ring(grp, p.x - 6, p.y - 6, p.w + 12, p.h + 12, 40);
+}
+function pulse() { const a = document.createElementNS(NS, 'animate');
+  a.setAttribute('attributeName', 'stroke-opacity'); a.setAttribute('values', '1;.25;1'); a.setAttribute('dur', '1.6s'); a.setAttribute('repeatCount', 'indefinite'); return a; }
+function ring(g, x, y, w, h, rx = 13) { el('rect', {x, y, width:w, height:h, rx, fill:'none', stroke:'#d92d20', 'stroke-width':3}, g).appendChild(pulse()); }
+function badgeNum(g, x, y, n) { if (!n) return; el('circle', {cx:x, cy:y, r:11, fill:'#d92d20'}, g);
+  text(g, x, y + 4, n, {'text-anchor':'middle', 'font-size':12, 'font-weight':700, fill:'#fff'}); }
+function drawCard(g, n, h) {
+  const p = pos[n.id], on = h && h.ids.has(n.id);
+  const grp = el('g', {opacity:h && !on ? .28 : 1, style:'cursor:pointer'}, g);
+  grp.addEventListener('click', ev => { ev.stopPropagation(); showComp(n); });
+  el('rect', {x:p.x, y:p.y, width:p.w, height:p.h, rx:9, fill:n.unknown ? '#f9fafb' : '#fff', stroke:on ? '#d92d20' : (n.unknown ? '#98a2b3' : '#d0d5dd'),
+              'stroke-width':on ? 2.5 : 1, 'stroke-dasharray':n.unknown ? '5 4' : ''}, grp);
+  el('rect', {x:p.x + 9, y:p.y + 9, width:36, height:36, rx:7, fill:CAT[n.cat] || '#667085'}, grp);
+  text(grp, p.x + 27, p.y + 31, n.glyph, {'text-anchor':'middle', 'font-size':n.glyph.length > 3 ? 9 : 11, 'font-weight':700, fill:'#fff'});
+  text(grp, p.x + 54, p.y + 24, n.name.length > 18 ? n.name.slice(0, 17) + '…' : n.name, {'font-size':12.5, 'font-weight':600});
+  text(grp, p.x + 54, p.y + 40, n.tname, {'font-size':11, fill:'#667085'});
+  const bs = n.badges.slice(0, 3); if (n.badges.length > 3) bs.push({text:`+${n.badges.length - 3} more`, risk:false});
+  bs.forEach((b, i) => { const by = p.y + CH + i * BH;
+    el('rect', {x:p.x + 9, y:by, width:p.w - 18, height:BH - 3, rx:4, fill:b.risk ? '#fef3f2' : '#f2f4f7', stroke:b.risk ? '#fda29b' : 'none'}, grp);
+    text(grp, p.x + 15, by + 10.5, (b.risk ? '⚠ ' : '') + (b.text.length > 30 ? b.text.slice(0, 29) + '…' : b.text),
+         {'font-size':9.5, fill:b.risk ? '#b42318' : '#475467', 'font-weight':b.risk ? 600 : 400}); });
+  if (on) badgeNum(grp, p.x + p.w - 2, p.y + 2, h.order[n.id] || '·');
+  if (h && h.cur.has(n.id)) ring(grp, p.x - 6, p.y - 6, p.w + 12, p.h + 12);
+}
+
+// ---------- 3D (isometric): the floor is the 2D drawing under an isometric matrix; components stand on it ----------
+const C30 = Math.cos(Math.PI / 6), S30 = 0.5;
+const iso = (x, y, z = 0) => ({x:(x - y) * C30, y:(x + y) * S30 - z});
+function render3d(root, h) {
+  const floor = el('g', {transform:`matrix(${C30} ${S30} ${-C30} ${S30} 0 0)`}, root);
+  const conts = G.containers.filter(c => pos[c.id]).sort((a, b) => pos[a.id].depth - pos[b.id].depth);
+  for (const c of conts) { // a slab with thickness, then the 2D box on top
+    const p = pos[c.id], st = boxStyle(c), d = 6;
+    const a = iso(p.x, p.y + p.h), b = iso(p.x + p.w, p.y + p.h), cc = iso(p.x + p.w, p.y);
+    el('polygon', {points:`${a.x},${a.y} ${b.x},${b.y} ${b.x},${b.y + d} ${a.x},${a.y + d}`, fill:st.stroke, opacity:.35}, root.insertBefore(el('g'), floor));
+    el('polygon', {points:`${b.x},${b.y} ${cc.x},${cc.y} ${cc.x},${cc.y + d} ${b.x},${b.y + d}`, fill:st.stroke, opacity:.22}, root.insertBefore(el('g'), floor));
+    drawContainer(floor, c, h);
+  }
+  drawEdges(floor, h);
+  const items = G.comps.filter(n => pos[n.id]).map(n => ({n, p:pos[n.id]}));
+  if (G.internet) items.push({n:null, p:pos.internet});
+  items.sort((a, b) => (a.p.x + a.p.w / 2 + a.p.y + a.p.h / 2) - (b.p.x + b.p.w / 2 + b.p.y + b.p.h / 2));
+  for (const it of items) it.n ? drawBlock(root, it.n, it.p, h) : drawInternet3d(root, it.p, h);
+}
+function shade(hex, f) { const n = parseInt(hex.slice(1), 16); const r = n >> 16, g = (n >> 8) & 255, b = n & 255;
+  const m = v => Math.max(0, Math.min(255, Math.round(v * f))); return `rgb(${m(r)},${m(g)},${m(b)})`; }
+function drawBlock(root, n, p, h) {
+  const on = h && h.ids.has(n.id), col = CAT[n.cat] || '#667085';
+  const s = 46, cx = p.x + p.w / 2, cy = p.y + 28, z = n.cat === 'security' ? 14 : 26;
+  const x0 = cx - s / 2, y0 = cy - s / 2, x1 = cx + s / 2, y1 = cy + s / 2;
+  const grp = el('g', {opacity:h && !on ? .28 : 1, style:'cursor:pointer'}, root);
+  grp.addEventListener('click', ev => { ev.stopPropagation(); showComp(n); });
+  const P = (x, y, zz) => { const q = iso(x, y, zz); return `${q.x},${q.y}`; };
+  el('polygon', {points:[P(x0,y1,0),P(x1,y1,0),P(x1,y1,z),P(x0,y1,z)].join(' '), fill:shade(col, .72)}, grp);
+  el('polygon', {points:[P(x1,y0,0),P(x1,y1,0),P(x1,y1,z),P(x1,y0,z)].join(' '), fill:shade(col, .55)}, grp);
+  el('polygon', {points:[P(x0,y0,z),P(x1,y0,z),P(x1,y1,z),P(x0,y1,z)].join(' '), fill:col,
+                 stroke:on ? '#d92d20' : shade(col, .5), 'stroke-width':on ? 3 : 1}, grp);
+  const top = iso(cx, cy, z);
+  text(grp, top.x, top.y + 4, n.glyph, {'text-anchor':'middle', 'font-size':11, 'font-weight':800, fill:'#fff'});
+  const lab = iso(cx, y1 + 6, 0);
+  text(grp, lab.x, lab.y + 16, n.name.length > 20 ? n.name.slice(0, 19) + '…' : n.name,
+       {'text-anchor':'middle', 'font-size':11, 'font-weight':600, 'paint-order':'stroke', stroke:'#fff', 'stroke-width':3});
+  const risks = n.badges.filter(b => b.risk);
+  if (risks.length) text(grp, lab.x, lab.y + 29, '⚠ ' + (risks[0].text.length > 26 ? risks[0].text.slice(0, 25) + '…' : risks[0].text) + (risks.length > 1 ? ` +${risks.length - 1}` : ''),
+       {'text-anchor':'middle', 'font-size':9.5, fill:'#b42318', 'font-weight':600, 'paint-order':'stroke', stroke:'#fff', 'stroke-width':3});
+  if (on) { const b = iso(cx, cy, z + 26); badgeNum(grp, b.x, b.y, h.order[n.id] || '·'); }
+  if (h && h.cur.has(n.id)) { const q = iso(cx, cy, 0); el('ellipse', {cx:q.x, cy:q.y + 4, rx:58, ry:32, fill:'none', stroke:'#d92d20', 'stroke-width':3, opacity:.8}, grp).appendChild(pulse()); }
+}
+function drawInternet3d(root, p, h) {
+  const on = h && h.ids.has('internet'), c = iso(p.x + p.w / 2, p.y + p.h / 2, 30);
+  const grp = el('g', {opacity:h && !on ? .3 : 1}, root);
+  el('ellipse', {cx:c.x, cy:c.y, rx:52, ry:24, fill:'#fff', stroke:on ? '#d92d20' : '#344054', 'stroke-width':on ? 3 : 1.5}, grp);
+  text(grp, c.x, c.y + 5, '🌐 Internet', {'text-anchor':'middle', 'font-size':13, 'font-weight':600});
+  if (on) badgeNum(grp, c.x + 44, c.y - 20, h.order.internet);
+  if (h && h.cur.has('internet')) el('ellipse', {cx:c.x, cy:c.y, rx:62, ry:32, fill:'none', stroke:'#d92d20', 'stroke-width':3}, grp).appendChild(pulse());
+}
+
+// ---------- panel, chains, pan / zoom ----------
+function showComp(n) {
+  document.getElementById('walk').hidden = true;
+  if (FOCUS !== n.id) { FOCUS = n.id; SEL = null; document.querySelectorAll('.chain').forEach(x => x.classList.remove('on')); render(); }
+  const out = G.edges.filter(e => e.source === n.id).map(e => `→ ${e.label} ${e.target}`);
+  const inn = G.edges.filter(e => e.target === n.id).map(e => `← ${e.source} (${e.label})`);
+  const badges = n.badges.map(b => (b.risk ? '⚠ ' : '· ') + b.text);
+  document.getElementById('info').innerHTML = `<b>${esc(n.id)}</b><div class="meta">${esc(n.tname)} · ${esc(n.file)}:${esc(n.line)}</div><pre>${esc([...badges, ...out, ...inn].join('\n') || 'no connections')}</pre>`;
+}
+// ---------- walkthrough ----------
+const nameOf = id => id === 'internet' ? 'The internet' : (byId[id] ? byId[id].name : id);
+function hopsAbout(c, id) { if (id === 'internet') return c.hops.filter(x => /^Internet/.test(x));
+  const own = c.hops.filter(x => x.includes(id) && !/^reaches:/.test(x));
+  // what the identity can do: the chain's "grants" line belongs on the role / user step
+  const last = c.steps[c.steps.length - 1];
+  if (id === last && byId[id] && byId[id].cat === 'security') own.push(...c.hops.filter(x => /grants/.test(x) && !own.includes(x)));
+  return own; }
+function edgeBetween(a, b) { return G.edges.find(e => e.source === a && e.target === b); }
+function showStep() {
+  const c = G.chains[SEL], W = walkSteps(c), st = W[STEP], i = STEP + 1, n = W.length; let body = '';
+  if (st.final) {
+    const src = c.steps[c.steps.length - 1];
+    const reach = c.hops.find(x => /^reaches:/.test(x)) || '';
+    body = `<div class="k">Step ${i} of ${n} · where it ends</div><h3>${st.ids.length} data store${st.ids.length > 1 ? 's' : ''} reachable</h3><ul>` +
+      st.ids.map(id => { const e = edgeBetween(src, id); const sens = new RegExp(id.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '[^,]*⚠sensitive').test(reach);
+        return `<li class="${sens ? 'bad' : ''}">${esc(nameOf(id))} <span class="file">${esc(byId[id] ? byId[id].tname : '')}</span> — <b>${esc(e ? e.label : '?')}</b> access${sens ? ' · ⚠ sensitive' : ''}</li>`; }).join('') + '</ul>';
+  } else {
+    const id = st.ids[0], comp = byId[id];
+    const bad = comp ? comp.badges.filter(b => b.risk).map(b => b.text) : [];
+    const other = comp ? comp.badges.filter(b => !b.risk).map(b => b.text) : [];
+    const hops = hopsAbout(c, id);
+    const nxt = W[STEP + 1]; const e = nxt && !nxt.final ? edgeBetween(id, nxt.ids[0]) : null;
+    body = `<div class="k">Step ${i} of ${n}${i === 1 ? ' · the way in' : ''}</div><h3>${esc(nameOf(id))}</h3>` +
+      (comp ? `<div class="file">${esc(comp.tname)} · ${esc(comp.file)}:${esc(comp.line)}</div>` : '<div class="file">anyone, anywhere</div>') +
+      `<ul>${bad.map(b => `<li class="bad">⚠ ${esc(b)}</li>`).join('')}${hops.map(x => `<li>${esc(x)}</li>`).join('')}${other.map(b => `<li>${esc(b)}</li>`).join('')}</ul>` +
+      (nxt ? `<div class="next">Next: ${nxt.final ? `the ${nxt.ids.length} data store(s) it can reach` : esc(nameOf(nxt.ids[0])) + (e ? ` (${esc(e.label)})` : '')}</div>` : '');
+  }
+  const card = document.getElementById('walk'); card.hidden = false;
+  card.innerHTML = `<div class="walk"><span class="sev ${esc(c.severity)}">${esc(c.severity)}</span><span class="meta">${esc(c.kind)} · ${esc(c.confidence)}</span>${body}
+    <div class="nav"><button id="prev" ${STEP ? '' : 'disabled'}>◀ Back</button><button id="next" class="primary" ${STEP + 1 < n ? '' : 'disabled'}>Next ▶</button></div>
+    <div class="next">← → keys step through · Esc shows everything</div></div>`;
+  document.getElementById('prev').onclick = () => go(-1); document.getElementById('next').onclick = () => go(1);
+  render(); zoomTo(st.ids);
+}
+function go(d) { if (SEL == null) return; const n = walkSteps(G.chains[SEL]).length; const s = STEP + d; if (s < 0 || s >= n) return; STEP = s; showStep(); }
+window.addEventListener('keydown', e => { if (e.key === 'ArrowRight') go(1); else if (e.key === 'ArrowLeft') go(-1);
+  else if (e.key === 'Escape') document.getElementById('all').click(); });
+function boxOf(id) { const p = pos[id]; if (!p) return null; if (MODE === '2d') return {x0:p.x, y0:p.y, x1:p.x + p.w, y1:p.y + p.h};
+  const pts = [iso(p.x, p.y), iso(p.x + p.w, p.y), iso(p.x, p.y + p.h), iso(p.x + p.w, p.y + p.h), iso(p.x + p.w / 2, p.y + 28, 70)];
+  return {x0:Math.min(...pts.map(q => q.x)), y0:Math.min(...pts.map(q => q.y)), x1:Math.max(...pts.map(q => q.x)), y1:Math.max(...pts.map(q => q.y))}; }
+function zoomTo(ids) { const bs = ids.map(boxOf).filter(Boolean); if (!bs.length) return;
+  const b = {x0:Math.min(...bs.map(q => q.x0)), y0:Math.min(...bs.map(q => q.y0)), x1:Math.max(...bs.map(q => q.x1)), y1:Math.max(...bs.map(q => q.y1))};
+  const W = svg.clientWidth, H = svg.clientHeight, pad = 140, bw = b.x1 - b.x0 + pad, bh = b.y1 - b.y0 + pad;
+  const k = Math.min(W / bw, H / bh, 1.9); const to = {k, x:W / 2 - (b.x0 + b.x1) / 2 * k, y:H / 2 - (b.y0 + b.y1) / 2 * k};
+  const from = {...view}, t0 = performance.now(), dur = 550;
+  const tick = t => { const u = Math.min(1, (t - t0) / dur), e = u < .5 ? 2 * u * u : 1 - Math.pow(-2 * u + 2, 2) / 2;
+    view = {k:from.k + (to.k - from.k) * e, x:from.x + (to.x - from.x) * e, y:from.y + (to.y - from.y) * e}; applyView(); if (u < 1) requestAnimationFrame(tick); };
+  requestAnimationFrame(tick); }
+
+const list = document.getElementById('chains');
+if (!G.chains.length) list.innerHTML = '<span class="meta">Attack paths, and walking through them hop by hop, arrive in stage 5. For now: the architecture, its connections and what each component exposes. Click a component.</span>';
+G.chains.forEach((c, i) => {
+  const d = document.createElement('div'); d.className = 'chain' + (c.drawn ? '' : ' off');
+  d.innerHTML = `<span class="sev ${esc(c.severity)}">${esc(c.severity)}</span><span class="meta">${esc(c.kind)} · ${esc(c.confidence)}</span><div class="entry">${esc(c.entry)}</div>` + (c.drawn ? '' : '<div class="meta">not on the diagram (provider block)</div>');
+  d.onclick = () => { if (!c.drawn) return; SEL = i; FOCUS = null; STEP = 0;
+    document.querySelectorAll('.chain').forEach(x => x.classList.remove('on')); d.classList.add('on'); showStep(); };
+  list.appendChild(d);
+});
+document.getElementById('all').onclick = () => { SEL = null; FOCUS = null; STEP = 0; document.getElementById('walk').hidden = true;
+  document.getElementById('info').innerHTML = '<span class="meta">Click a chain to walk through it, or a component.</span>'; fit(); document.querySelectorAll('.chain').forEach(x => x.classList.remove('on')); render(); };
+for (const [id, m] of [['b2d', '2d'], ['b3d', '3d']]) document.getElementById(id).onclick = () => {
+  MODE = m; document.getElementById('b2d').classList.toggle('on', m === '2d'); document.getElementById('b3d').classList.toggle('on', m === '3d'); if (SEL != null) showStep(); else { render(); fit(); } };
+function applyView() { const r = document.getElementById('root'); if (r) r.setAttribute('transform', `translate(${view.x} ${view.y}) scale(${view.k})`); }
+function fit() { const r = document.getElementById('root'); if (!r) return; const b = r.getBBox(), W = svg.clientWidth, H = svg.clientHeight;
+  const k = Math.min(W / (b.width + 60), H / (b.height + 60), 1.4); view = {k, x:(W - b.width * k) / 2 - b.x * k, y:(H - b.height * k) / 2 - b.y * k}; applyView(); }
+let drag = null;
+svg.addEventListener('mousedown', e => drag = {x:e.clientX - view.x, y:e.clientY - view.y});
+window.addEventListener('mousemove', e => { if (drag) { view.x = e.clientX - drag.x; view.y = e.clientY - drag.y; applyView(); } });
+window.addEventListener('mouseup', () => drag = null);
+svg.addEventListener('wheel', e => { e.preventDefault(); const f = Math.exp(-e.deltaY * .0015), r = svg.getBoundingClientRect();
+  const mx = e.clientX - r.left, my = e.clientY - r.top; view.x = mx - (mx - view.x) * f; view.y = my - (my - view.y) * f; view.k *= f; applyView(); }, {passive:false});
+window.addEventListener('resize', fit);
+</script></body></html>
