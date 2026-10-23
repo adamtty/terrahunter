@@ -6,7 +6,7 @@
 *{box-sizing:border-box}html,body{height:100%}
 body{margin:0;background:var(--bg);color:var(--text);font:14px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",Inter,sans-serif;display:grid;grid-template-columns:340px 1fr;height:100vh;overflow:hidden}
 aside{background:var(--panel);border-right:1px solid var(--line);overflow:auto;padding:18px 16px}
-h1{font-size:16px;margin:0}.sub{color:var(--muted);font-size:12px;margin:2px 0 14px;word-break:break-all}
+h1{font-size:16px;margin:0}.sub{color:var(--muted);font-size:12px;margin:2px 0 14px;overflow-wrap:anywhere}
 h2{font-size:11px;text-transform:uppercase;letter-spacing:.07em;color:var(--muted);margin:18px 0 8px}
 .toggle{display:inline-flex;border:1px solid var(--line);border-radius:8px;overflow:hidden}
 .toggle button{border:0;background:#fff;padding:6px 14px;font:600 12px inherit;cursor:pointer;color:var(--muted)}
@@ -30,6 +30,9 @@ svg:active{cursor:grabbing}
 .next{font-size:12px;color:#667085;margin-top:8px}
 .walkcard{position:absolute;left:18px;bottom:18px;width:400px;max-height:62vh;overflow:auto;box-shadow:0 12px 32px #1018282e}
 .walkcard .walk{margin:0;background:#fff}
+.finds{list-style:none;margin:8px 0 0;padding:0}.finds li{border-top:1px solid var(--line);padding:6px 0;font-size:12px}
+.finds .id{font-family:ui-monospace,Menlo,monospace;font-size:11px;color:var(--muted)}.finds a{color:inherit}
+.unrated{background:#98a2b3}
 .hint{position:absolute;right:14px;bottom:10px;color:var(--muted);font-size:12px;background:#fffc;padding:3px 8px;border-radius:6px}
 </style></head><body>
 <aside>
@@ -37,6 +40,7 @@ svg:active{cursor:grabbing}
 <div class="toggle"><button id="b2d" class="on">2D</button><button id="b3d">3D</button></div>
 <button id="all" style="margin-left:8px;border:1px solid var(--line);background:#fff;border-radius:8px;padding:6px 10px;font-size:12px;cursor:pointer">show everything</button>
 <h2>Attack paths</h2><div id="chains"></div>
+<h2>Findings</h2><div id="findings"></div>
 <h2>Selected</h2><div id="info"><span class="meta">Click a chain to walk through it, or a component.</span></div>
 </aside>
 <main><svg id="svg" xmlns="http://www.w3.org/2000/svg"></svg><div id="walk" class="walkcard" hidden></div><div class="hint">drag to pan · scroll to zoom</div></main>
@@ -298,8 +302,27 @@ function showComp(n) {
   const out = G.edges.filter(e => e.source === n.id).map(e => `→ ${e.label} ${e.target}`);
   const inn = G.edges.filter(e => e.target === n.id).map(e => `← ${e.source} (${e.label})`);
   const badges = n.badges.map(b => (b.risk ? '⚠ ' : '· ') + b.text);
-  document.getElementById('info').innerHTML = `<b>${esc(n.id)}</b><div class="meta">${esc(n.tname)} · ${esc(n.file)}:${esc(n.line)}</div><pre>${esc([...badges, ...out, ...inn].join('\n') || 'no connections')}</pre>`;
+  document.getElementById('info').innerHTML = `<b>${esc(n.id)}</b><div class="meta">${esc(n.tname)} · ${esc(n.file)}:${esc(n.line)}</div><pre>${esc([...badges, ...out, ...inn].join('\n') || 'no connections')}</pre>` + findList(n.findings);
 }
+// a finding's severity as a pill: checkov without a platform key rates nothing
+const sevPill = s => `<span class="sev ${s ? esc(s.toLowerCase()) : 'unrated'}">${s ? esc(s) : 'unrated'}</span>`;
+const safeUrl = u => /^https:\/\//.test(u || '') ? u : '';
+function findList(fs) {
+  if (!fs || !fs.length) return '';
+  return '<ul class="finds">' + fs.map(f => `<li>${sevPill(f.severity)}${safeUrl(f.url) ? `<a href="${esc(safeUrl(f.url))}" target="_blank" rel="noopener noreferrer">${esc(f.title || f.id)}</a>` : esc(f.title || f.id)}` +
+    `<div class="id">${esc(f.source)} ${esc(f.id)} · ${esc(f.address || '')}${f.address ? ' · ' : ''}${esc(f.file)}:${esc(f.line)}</div></li>`).join('') + '</ul>';
+}
+(() => {
+  // one finding can be on several components (a security group's, on each instance using it): count it once
+  const uniq = new Map(G.comps.flatMap(c => c.findings || []).concat(G.loose || []).map(f => [[f.source, f.id, f.address, f.file, f.line].join('|'), f]));
+  const all = [...uniq.values()], box = document.getElementById('findings');
+  if (!G.scanned) { box.innerHTML = '<span class="meta">Not scanned (trivy and checkov weren\'t run).</span>'; return; }
+  const n = {}; for (const f of all) n[f.severity || ''] = (n[f.severity || ''] || 0) + 1;
+  const order = ['CRITICAL', 'HIGH', 'MEDIUM', 'LOW', ''];
+  box.innerHTML = (all.length ? order.filter(s => n[s]).map(s => `${sevPill(s)}<span class="meta">${n[s]}</span> `).join('') : '<span class="meta">none</span>') +
+    '<div class="meta">Each one is on the component it\'s about: click a component to see its own.</div>' +
+    ((G.loose || []).length ? `<details><summary class="meta">${G.loose.length} not on the diagram</summary>${findList(G.loose)}</details>` : '');
+})();
 // ---------- walkthrough ----------
 const nameOf = id => id === 'internet' ? 'The internet' : (byId[id] ? byId[id].name : id);
 function hopsAbout(c, id) { if (id === 'internet') return c.hops.filter(x => /^Internet/.test(x));

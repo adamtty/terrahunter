@@ -15,7 +15,7 @@
 > [!WARNING]
 > **terrahunter is being rebuilt from the ground up.** This repository started again from scratch on
 > 23 October 2026. The pipeline below lands one stage at a time; so far it finds the root modules in a folder, tells
-> you what they need that it can't see yet, and draws the infrastructure as a diagram.
+> you what they need that it can't see yet, draws the infrastructure as a diagram, and pins scanner findings to it.
 
 ## The idea
 
@@ -49,14 +49,23 @@ one hop at a time, with what's wrong at every step.
 | 1. Folder in | **built**: `terrahunter <folder>` finds the root modules, says why each is one, and lets you pick (`--root`, `--all-roots`) |
 | 2. What's missing | **built**: lists every module and remote state a root needs (followed through nested modules), matches remote state to the stack that writes it, offers to download modules, and takes other repositories with `--with` |
 | 3. Connections and diagram | **built**: the connection graph (every resource in the root and its modules, every reference between them, through variables, locals and module outputs; `--graph-json`), and `terrahunter-diagram.html` on every run: an architecture diagram in 2D or 3D, plumbing folded into badges, unavailable modules drawn as dashed holes |
-| 4. Vulnerabilities | planned |
+| 4. Vulnerabilities | **built**: runs [trivy](https://trivy.dev) and [checkov](https://www.checkov.io) (when installed; `--no-scan` skips them) on a contained copy of the root and every module it calls, and pins each finding to the resource it's about, in every instance of a module, so it shows on the diagram's components |
 | 5. Attack paths | planned |
 | 6. Results and walkthrough | planned |
+
+## Requirements
+
+Python 3.11 or later. For stage 4, [trivy](https://trivy.dev/latest/getting-started/installation/) and
+[checkov](https://www.checkov.io/2.Basics/Installing%20Checkov.html) on your `PATH`. Without them the rest still
+runs, and the run says which scanner is missing (exit code 2: incomplete).
 
 ## Security
 
 terrahunter is meant to run on Terraform you don't necessarily trust, such as a pull request from a stranger.
-See [SECURITY.md](SECURITY.md) for what that covers and how to report a problem privately.
+The scanners never see the folder itself. They get a copy holding only regular Terraform files, run from an empty
+directory with a throwaway home, a minimal environment and no network. A module source that points outside the
+folders under review stops the scan before it starts. See [SECURITY.md](SECURITY.md) for what that covers and how to
+report a problem privately.
 
 ## License
 

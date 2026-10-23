@@ -31,13 +31,14 @@ STYLE = {  # connection meaning → how it's drawn
 _SCRIPT = re.compile(r"<script>(.*?)</script>", re.DOTALL)  # exactly what the browser hashes
 
 
-def render(model: arch.Model, title: str) -> str:
+def render(model: arch.Model, title: str, scanned: bool = False) -> str:
+    """The page; `scanned` says whether stage 4 ran, so "no findings" isn't shown when nothing was looked for."""
     data = model.to_dict()
     for e in data["edges"]:
         e["kind"] = "quiet" if e["quiet"] else STYLE.get(e["label"], "other")
         if e["target"] in {c.id for c in model.components if c.unknown}:
             e["kind"] = "unknown"
-    data.update(target=title, chains=[], internet=False)
+    data.update(target=title, chains=[], internet=False, scanned=scanned)
     blob = json.dumps(data).replace("<", "\\u003c")  # nothing in the data can look like markup to the browser
     page = TEMPLATE.read_text(encoding="utf-8").replace("__DATA__", blob)
     script = _SCRIPT.search(page)
