@@ -1,5 +1,9 @@
-"""The command line: `terrahunter <folder>`. Stage 1 (the folder in), 2 (what's missing), 3 (the connection graph and
-the diagram), 4 (vulnerabilities), 5 (attack paths) and 6 (the results: the walkthrough, the fix list, a report)."""
+"""The command line.
+
+`terrahunter <folder>` (or `terrahunter hunt <folder>`) runs everything: stage 1 (the folder in), 2 (what's missing),
+3 (the connection graph and the diagram), 4 (vulnerabilities), 5 (attack paths) and 6 (the results: the walkthrough,
+the fix list, a report). `terrahunter map <folder>` stops after stage 3: the connections and the diagram, no scanners.
+"""
 
 from __future__ import annotations
 
@@ -15,18 +19,29 @@ from terrahunter import __version__, arch, chains, deps, diagram, graph, report,
 EXIT_OK, EXIT_PATHS, EXIT_INCOMPLETE, EXIT_ERROR = 0, 1, 2, 3
 SEVERITY = ("medium", "high", "critical")
 NEXT = "open the diagram and click an attack path to walk through it, hop by hop"
+NEXT_MAP = "open the diagram; `terrahunter hunt <folder>` adds the scanner findings and the attack paths"
+MODES = ("hunt", "map")
 
 
 class TerrahunterError(Exception):
     pass
 
 
-def build_parser() -> argparse.ArgumentParser:
-    ap = argparse.ArgumentParser(
-        prog="terrahunter",
-        description="Point it at a folder of Terraform: it finds the root modules in it (and, as the rebuild "
-        "lands, maps the infrastructure and the paths an attacker could chain through it).",
-    )
+def build_parser(mode: str = "hunt") -> argparse.ArgumentParser:
+    if mode == "map":
+        ap = argparse.ArgumentParser(
+            prog="terrahunter map",
+            description="Map a folder of Terraform: its root modules, what they need, every connection between "
+            "their resources, and the architecture diagram (2D and 3D). No scanners, no attack paths.",
+        )
+    else:
+        ap = argparse.ArgumentParser(
+            prog="terrahunter",
+            usage="terrahunter [hunt] folder [options]\n       terrahunter map folder [options]",
+            description="Point it at a folder of Terraform: it maps the infrastructure, finds what's wrong with it, "
+            "and the paths an attacker could chain through it from the internet. `terrahunter map <folder>` stops "
+            "after the map and the diagram.",
+        )
     ap.add_argument("--version", action="version", version=f"terrahunter {__version__}")
     ap.add_argument("folder", help="the folder to analyse: a repository checkout, or any directory of Terraform")
     pick = ap.add_mutually_exclusive_group()
@@ -58,6 +73,8 @@ def build_parser() -> argparse.ArgumentParser:
         help="where to write the diagram (default: terrahunter-diagram.html here; one file per root with --all-roots)",
     )
     ap.add_argument("--no-diagram", action="store_true", help="don't write the diagram")
+    if mode == "map":
+        return ap
     ap.add_argument("--no-scan", action="store_true", help="don't run trivy and checkov")
     ap.add_argument(
         "--report", metavar="PATH", help="write the results as Markdown: the fix list, every path hop by hop, findings"
@@ -260,7 +277,11 @@ def main(argv: list[str] | None = None) -> None:
 
 
 def _main(argv: list[str] | None) -> int:
-    a = build_parser().parse_args(argv)
+    argv = list(sys.argv[1:] if argv is None else argv)
+    # a mode first, when something follows it (a folder that happens to be called `map` is still `./map`)
+    mode = argv.pop(0) if len(argv) > 1 and argv[0] in MODES else "hunt"
+    a = build_parser(mode).parse_args(argv)
+    mapping = mode == "map"
     if not Path(a.folder).is_dir():
         raise TerrahunterError(f"not a directory: {a.folder}")
     d = roots.discover(a.folder)
@@ -280,14 +301,17 @@ def _main(argv: list[str] | None) -> int:
         g = graph.build(d.folder, c.path, withs)
         show_graph(g)
         scan = None
-        if not a.no_scan:
+        if not mapping and not a.no_scan:  # (map has no --no-scan: it never scans)
             scan = scanners.scan(g, d.folder, withs)
             show_scan(scan)
         model = arch.build(g, scan.findings if scan else [])
-        paths = chains.build(g, model)
-        show_chains(paths, g)
+        paths = None
+        if not mapping:
+            paths = chains.build(g, model)
+            show_chains(paths, g)
         graphs.append((g, scan, paths))
-        results.append(report.RootResult(c.path, s, g, model, scan, paths))
+        if paths:
+            results.append(report.RootResult(c.path, s, g, model, scan, paths))
         if not a.no_diagram:
             path = a.diagram
             if len(chosen) > 1:
@@ -306,7 +330,7 @@ def _main(argv: list[str] | None) -> int:
                     "graphs": [
                         g.to_dict()
                         | ({"scan": sc.to_dict()} if sc else {})
-                        | {"attack_paths": p.to_dict()["chains"], "fixes": p.to_dict()["fixes"]}
+                        | ({"attack_paths": p.to_dict()["chains"], "fixes": p.to_dict()["fixes"]} if p else {})
                         for g, sc, p in graphs
                     ],
                 },
@@ -314,6 +338,9 @@ def _main(argv: list[str] | None) -> int:
             ),
         )
         print(f"\nwrote {sandbox.one_line(a.graph_json)}")
+    if mapping:
+        print(f"\n({NEXT_MAP})")
+        return EXIT_OK if complete else EXIT_INCOMPLETE
     if a.report:
         write_private(a.report, report.render(d.folder.name, results))
         print(f"\nwrote {sandbox.one_line(a.report)}")

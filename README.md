@@ -58,12 +58,15 @@ one hop at a time, with what's wrong at every step.
 ```sh
 uv tool install git+https://github.com/adamtty/terrahunter
 terrahunter path/to/terraform                 # pick a root, or --root envs/prod, or --all-roots
+terrahunter map path/to/terraform             # just the map: connections and the diagram, no scanners
 terrahunter . --root envs/prod --report terrahunter-report.md
 terrahunter . --all-roots --fail-on critical  # in CI: exit 1 when a critical attack path exists
 ```
 
 Each run prints what each root needs, the scanner findings, the attack paths and what to fix first, and writes
-`terrahunter-diagram.html` (one self-contained page: open it in a browser). Other options: `--with PATH` (another
+`terrahunter-diagram.html` (one self-contained page: open it in a browser). `terrahunter map` stops after the
+connections and the diagram (stages 1 to 3): quick, and it needs neither trivy nor checkov. `terrahunter hunt` is the
+full run, the same as plain `terrahunter`. Other options: `--with PATH` (another
 repository the code reads from), `--fetch-modules`, `--graph-json PATH`, `--no-scan`, `--no-diagram`.
 
 Exit codes: 0 done, 1 an attack path at or above `--fail-on`, 2 incomplete (something couldn't be read or scanned),
