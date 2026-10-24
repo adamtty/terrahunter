@@ -26,7 +26,7 @@ from __future__ import annotations
 import re
 from dataclasses import asdict, dataclass, field
 
-from terrahunter import clouds, deps, graph, policies, scanners
+from terrahunter import clouds, conditions, deps, graph, kb, policies, scanners
 
 # drawable types: type → (glyph, category, short name). Anything else is plumbing (badges / hidden) or not drawn.
 COMPONENTS = {
@@ -214,8 +214,139 @@ def _meaning(attr: str, source_type: str = "") -> str | None:
     return "uses"
 
 
+# --- the knowledge base's catalogue: what a type it has curated is, how it's drawn and connected, when it's exposed
+# the catalogue's connection meanings, in the words the diagram and the attack paths use
+KB_MEANING = {
+    "runs-in": "runs in",
+    "guarded-by": "guarded by",
+    "runs-as": "runs as",
+    "grants": "grants",
+    "grants-to": "grants",
+    "attached-to": "attached",
+    "routes-to": "routes to",
+    "fronts": "fronts",
+    "encrypted-with": "encrypted with",
+    "stores-in": "stores in",
+    "triggers": "invokes",
+    "reads": "reads",
+    "writes": "writes",
+    "peers-with": "peers with",
+    "contains": "contains",
+    "monitors": "logs to",
+    "restricts": "restricts",
+    "registered-in": "registered in",
+    "other": "uses",
+}
+# meanings a connection through a hidden resource keeps (an instance → its instance profile → a role: runs as)
+CARRIED = {"runs as", "routes to", "invokes", "fronts", "stores in", "reads", "writes"}
+KB_CAT = {"entry": "network", "identity": "security", "management": "integration", "plumbing": "network"}
+_STORAGE = re.compile(r"bucket|volume|file_system|disk|storage|vault|share|snapshot|backup|archive|glacier")
+# words in a badge that make it a risk, not just worth knowing
+_RISK = re.compile(
+    r"internet|public|anonymous|anyone|admin|full access|any role|IMDSv1|unauthenticated|wildcard", re.IGNORECASE
+)
+
+
+# types whose exposure terrahunter's own rules judge, with ports, routes or the policies themselves: the catalogue's
+# test for these is coarser (an RDS instance's publicly_accessible, without its security groups), so it doesn't add
+JUDGED = {
+    "aws_db_instance", "aws_rds_cluster", "aws_neptune_cluster", "aws_elasticsearch_domain", "aws_opensearch_domain",
+    "aws_eks_cluster", "aws_lambda_function", "aws_lambda_function_url", "aws_lb", "aws_alb", "aws_elb",
+    "aws_instance", "aws_launch_template", "aws_autoscaling_group", "aws_ecs_service", "aws_s3_bucket",
+    "aws_sns_topic", "aws_sqs_queue", "aws_secretsmanager_secret", "aws_ecr_repository", "aws_api_gateway_rest_api",
+    "aws_apigatewayv2_api", "aws_cognito_user_pool", "aws_cognito_identity_pool",
+    *clouds.VMS, *clouds.WEB_APPS, *clouds.SERVERLESS, "azurerm_kubernetes_cluster", "google_container_cluster",
+    "azurerm_application_gateway", "azurerm_lb", "azurerm_storage_account", "azurerm_storage_container",
+    "google_storage_bucket", "google_bigquery_dataset", "google_sql_database_instance", *clouds.DB_FIREWALLS,
+}  # fmt: skip
+
+
+def _kb(rtype: str) -> dict:
+    return kb.entry(rtype) or {}
+
+
+def kb_drawn(rtype: str) -> bool:
+    return _kb(rtype).get("draw") == "component"
+
+
+def _kb_look(rtype: str) -> tuple[str, str, str]:
+    """(glyph, category, short name) for a type the built-in table doesn't have, from its catalogue entry."""
+    e = _kb(rtype)
+    service = e.get("service") or rtype.split("_", 1)[-1].replace("_", " ")
+    cat = e.get("category") or "unknown"
+    cat = ("storage" if _STORAGE.search(rtype) else "database") if cat == "data" else KB_CAT.get(cat, cat)
+    words = [w for w in re.split(r"[^A-Za-z0-9]+", service) if w]
+    glyph = "".join(w[0] for w in words if w[0].isupper() or w[0].isdigit())[:3] or service[:3].upper()
+    known = {w.lower() for w in words} | {"aws", "azurerm", "google", "amazon", "azure"}
+    tail = [w for w in rtype.split("_")[1:] if w.lower() not in known]
+    return glyph, cat, f"{service} {' '.join(tail)}".strip()
+
+
+def _kb_label(e: graph.Edge, R: dict, ix: conditions.Index) -> str | None:
+    """What a reference means by the source type's catalogue entry; None when the entry doesn't say."""
+    for c in _kb(R[e.source].type).get("connections") or []:
+        to = set(c.get("to") or [])
+        if not (e.attr == c.get("attr") or e.attr.startswith(f"{c.get('attr')}.")):
+            continue
+        if R[e.target].type not in to and kb.canonical(R[e.target].type) not in to:
+            continue
+        if c.get("when") and conditions.evaluate(c["when"], e.source, ix) is False:
+            continue
+        return KB_MEANING.get(c.get("meaning", "other"), "uses")
+    return None
+
+
+def _short(when: str) -> str:
+    """An exposure's prose, cut to a badge's length."""
+    s = re.split(r"[:;(]", when, maxsplit=1)[0].strip().rstrip(",.")
+    return s if len(s) <= 70 else s[:69].rstrip() + "…"
+
+
+# an exposure that lets anyone in without credentials of the service's own (an anonymous principal, allUsers, no
+# authorisation, self sign-up), as opposed to an endpoint every network can reach that still asks who's calling
+_ANONYMOUS = re.compile(
+    r'Principal|anonymous|anyone|allUsers|allAuthenticatedUsers|unauthenticated|"\*"|= NONE|without (auth|sign)'
+    r"|public[- ](read|access|ACL|bucket|blob|container)|every identity|any (AWS )?account|self[- ]sign",
+    re.IGNORECASE,
+)
+
+
+def kb_exposures(rtype: str) -> list[tuple[dict, str, bool]]:
+    """(exposure, a short reason, anonymous) for each exposure the catalogue has a test for that the internet, or
+    any signed-in account (an attacker's own), reaches. The reason is the badge of the risky setting with the same
+    test, when there is one, else the start of the prose. Identities are left out: a long-lived key is a badge."""
+    e = _kb(rtype)
+    if e.get("category") == "identity":
+        return []
+    badges = {repr(r.get("test")): r.get("badge", "") for r in e.get("risky_settings") or [] if r.get("test")}
+    out = []
+    for x in e.get("exposure") or []:
+        if x.get("test") and x.get("reach", "internet") in ("internet", "any-authenticated"):
+            b = badges.get(repr(x["test"]), "")
+            reason = b if b and "<" not in b else _short(x.get("when", ""))
+            out.append((x, reason, bool(_ANONYMOUS.search(x.get("when", "")))))
+    return out
+
+
+def kb_badges(rtype: str, addr: str, ix: conditions.Index) -> list[Badge]:
+    """A badge for each of the catalogue's risky settings whose test holds (unknown ones aren't shown). Badges whose
+    text terrahunter fills in itself (`open to internet: <ports>`) are left to the built-in rules."""
+    out = []
+    for x in _kb(rtype).get("risky_settings") or []:
+        text = x.get("badge") or ""
+        if text and "<" not in text and x.get("test") and conditions.evaluate(x["test"], addr, ix) is True:
+            out.append(Badge(text, bool(_RISK.search(text))))
+    return out
+
+
+def _said(text: str, badges: list[Badge]) -> bool:
+    t = text.lower()
+    return any(t in b.text.lower() or b.text.lower() in t for b in badges)
+
+
 def build(g: graph.Graph, findings: list[scanners.Finding] = ()) -> Model:
     R = g.resources
+    ix = conditions.Index.of(g)
     out_edges: dict[str, list[graph.Edge]] = {}
     in_edges: dict[str, list[graph.Edge]] = {}
     for e in g.edges:
@@ -319,20 +450,60 @@ def build(g: graph.Graph, findings: list[scanners.Finding] = ()) -> Model:
     for a, why in policies.aws_exposure(R, targets, sources, of).items():
         exposed.setdefault(a, []).extend(why)
 
+    # --- the catalogue's exposures, where the built-in rules found none: on the component itself, or (for plumbing,
+    # such as a listener or a bucket policy) on the components it's about. An unknown test is a possible exposure.
+    drawn = {a for a, r in R.items() if r.mode == "managed" and (r.type in COMPONENTS or kb_drawn(r.type))}
+
+    def onto(a: str) -> list[str]:
+        if a in drawn:
+            return [a]
+        to = {t for b in _kb(R[a].type).get("badge_on") or [] for t in b.get("to") or []}
+        near = [x for x in targets(a) + [e.source for e in in_edges.get(a, [])] if x in drawn]
+        return sorted({x for x in near if not to or R[x].type in to or kb.canonical(R[x].type) in to})
+
+    maybe: dict[str, list[tuple[str, str]]] = {}
+    reachable: dict[str, set[str]] = {}  # endpoints every network reaches, that still ask who's calling
+    reasoned = {c for c, v in exposed.items() if any(not (w == "all" or w[:1].isdigit()) for w, _ in v)}
+    for a, r in R.items():
+        if r.mode != "managed":
+            continue
+        for x, reason, anonymous in kb_exposures(r.type):
+            v = conditions.evaluate(x["test"], a, ix)
+            if v is False:
+                continue
+            for c in onto(a):
+                if R[c].type in JUDGED:
+                    continue
+                if not anonymous:
+                    reachable.setdefault(c, set()).add(reason)
+                elif v is None:
+                    maybe.setdefault(c, []).append((reason, a))
+                elif c not in reasoned:
+                    exposed.setdefault(c, []).append((reason, a))
+
     # --- components, placed by their own references
     comps: dict[str, Component] = {}
     for a, r in R.items():
-        if r.mode != "managed" or r.type not in COMPONENTS:
+        if a not in drawn:
             continue
-        glyph, cat, tname = COMPONENTS[r.type]
+        glyph, cat, tname = COMPONENTS.get(r.type) or _kb_look(r.type)
         subs = targets(a, *clouds.SUBNETS) + [
             s
             for via in targets(a, "aws_db_subnet_group", "azurerm_network_interface")
             for s in targets(via, *clouds.SUBNETS)
         ]
-        if r.type in GLOBAL:
+        e = {} if r.type in COMPONENTS else _kb(r.type)
+        where, placement = e.get("sits_in"), e.get("placement") or []
+        for pw in e.get("placement_when") or []:
+            if conditions.evaluate(pw.get("test"), a, ix):
+                where, placement = pw.get("sits_in", where), pw.get("placement", placement)
+                break
+        for attr in placement:  # the subnets its placement attributes name, directly or through one resource
+            for t in targets(a, attr=rf"^{re.escape(attr)}(\.|$)"):
+                subs += [t] if R[t].type in clouds.SUBNETS else targets(t, *clouds.SUBNETS)
+        if r.type in GLOBAL or where == "global" or where == "account" and e.get("category") == "identity":
             parent = home(r.type, 2)
-        elif r.type in REGIONAL:
+        elif r.type in REGIONAL or where in ("account", "region") or e and not subs and where not in ("vpc", "subnet"):
             parent = home(r.type, 1)
         elif len(set(subs)) == 1:
             parent = subs[0]
@@ -358,6 +529,10 @@ def build(g: graph.Graph, findings: list[scanners.Finding] = ()) -> Model:
             badges.append(Badge(f"open to internet: {', '.join(ports)}", True))
         if reasons:
             badges.append(Badge(f"public: {'; '.join(reasons)}", True))
+        if maybe.get(a) and not reasons:
+            badges.append(Badge(f"possibly public: {'; '.join(sorted({w for w, _ in maybe[a]}))}", True))
+        if reachable.get(a) and not reasons:
+            badges.append(Badge("reachable from any network"))
         b = r.body
         nics = [n for n in _list(b.get("network_interfaces")) if isinstance(n, dict)]  # a launch template's
         if (
@@ -379,6 +554,7 @@ def build(g: graph.Graph, findings: list[scanners.Finding] = ()) -> Model:
             badges.append(Badge("unencrypted"))
         if r.type == "aws_s3_bucket" and _s(b.get("acl")) in ("public-read", "public-read-write"):
             badges.append(Badge(f"ACL {_s(b.get('acl'))}", True))
+        badges += [b for b in kb_badges(r.type, a, ix) if not _said(b.text, badges)]
         comps[a] = Component(a, r.type, r.name, glyph, cat, tname, parent, r.file, r.line, r.module, badges)
 
     # IAM plumbing as badges
@@ -405,6 +581,25 @@ def build(g: graph.Graph, findings: list[scanners.Finding] = ()) -> Model:
         for p in targets(a, "aws_iam_role", "aws_iam_user", "aws_iam_group"):
             comps[p].badges.append(Badge(label, risky))
 
+    # the catalogue's plumbing drawn as badges (a public access block, a bucket's encryption configuration): its risky
+    # settings on the components it's about, or on every one of its targets in the account for an account-wide one
+    for a, r in R.items():
+        if r.mode != "managed" or a in comps or _kb(r.type).get("draw") != "badge":
+            continue
+        found = kb_badges(r.type, a, ix)
+        if not found:
+            continue
+        on: set[str] = set()
+        for item in _kb(r.type).get("badge_on") or []:
+            to = set(item.get("to") or [])
+            if item.get("scope"):
+                on |= {c for c in comps if comps[c].type in to}
+            else:
+                near = targets(a) + [e.source for e in in_edges.get(a, [])]
+                on |= {c for c in near if c in comps and (comps[c].type in to or kb.canonical(comps[c].type) in to)}
+        for c in sorted(on):
+            comps[c].badges += [b for b in found if not _said(b.text, comps[c].badges)]
+
     # --- connections: meaningful references between components, with plumbing collapsed into them
     conns: dict[tuple[str, str], Connection] = {}
 
@@ -414,9 +609,21 @@ def build(g: graph.Graph, findings: list[scanners.Finding] = ()) -> Model:
 
     for e in g.edges:
         if e.source in comps and e.target in comps:
-            m = _meaning(e.attr, R[e.source].type)
+            m = _kb_label(e, R, ix) or _meaning(e.attr, R[e.source].type)
             if m:
                 connect(e.source, e.target, m)
+    # through the catalogue's hidden plumbing: a component → a hidden resource → a component keeps the meaning
+    for e in g.edges:
+        h = e.target
+        if e.source not in comps or h in comps or h not in R or _kb(R[h].type).get("draw") != "hidden":
+            continue
+        first = _kb_label(e, R, ix)
+        for e2 in out_edges.get(h, []):
+            if e2.target in comps and e2.target != e.source:
+                second = _kb_label(e2, R, ix)
+                label = second if second in CARRIED else first if first in CARRIED else None
+                if label:
+                    connect(e.source, e2.target, label)
     for inst in of("aws_instance", "aws_launch_template"):
         for prof in targets(inst, "aws_iam_instance_profile"):
             for role in targets(prof, "aws_iam_role"):

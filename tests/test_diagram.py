@@ -117,7 +117,11 @@ resource "aws_iam_access_key" "k" { user = aws_iam_user.u.name }
     assert ("aws_instance.web", "aws_iam_role.r", "runs as") in conns(m)
     assert comp(m, "aws_instance.web").badges == []  # IMDSv2 required: nothing to say
     assert [(b.text, b.risk) for b in comp(m, "aws_iam_role.r").badges] == [("AdministratorAccess", True)]
-    assert [b.text for b in comp(m, "aws_iam_user.u").badges] == ["long-lived access key"]
+    # the knowledge base adds that the key's secret is in the state
+    assert [b.text for b in comp(m, "aws_iam_user.u").badges] == [
+        "long-lived access key",
+        "secret key in Terraform state",
+    ]
     assert comp(m, "aws_iam_role.r").parent == "global"
 
 
