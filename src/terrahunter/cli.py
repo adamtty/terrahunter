@@ -13,7 +13,7 @@ import os
 import sys
 from pathlib import Path
 
-from terrahunter import __version__, arch, chains, deps, diagram, graph, plan, report, roots, sandbox, scanners
+from terrahunter import __version__, arch, chains, clouds, deps, diagram, graph, plan, report, roots, sandbox, scanners
 
 # 1: an attack path at or above --fail-on (it wins over 2: the paths found are real even when some code was unseen)
 EXIT_OK, EXIT_PATHS, EXIT_INCOMPLETE, EXIT_ERROR = 0, 1, 2, 3
@@ -237,8 +237,8 @@ def show_scan(s: scanners.Scan, top: int = 10) -> None:
 
 def show_chains(r: chains.Result, g: graph.Graph) -> None:
     n = len(r.chains)
-    if not n and not any(x.type.startswith("aws_") for x in g.resources.values()):
-        print("\nAttack paths: AWS only so far, and this root has no AWS resources")
+    if not n and not any(clouds.cloud(x.type) for x in g.resources.values()):
+        print("\nAttack paths: AWS, Azure and Google Cloud so far, and this root has none of their resources")
         return
     print(
         f"\nAttack paths: {n}" + ("" if n else " (nothing from the internet reaches data or a workload to take over)")
