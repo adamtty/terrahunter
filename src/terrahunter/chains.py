@@ -150,6 +150,7 @@ class Chain:
     drawn: bool = True
     fixes: list[str] = field(default_factory=list)  # ids of the fixes that break or weaken it
     also: list[str] = field(default_factory=list)  # other entry points into the same workload, identity and data
+    within: list[str] = field(default_factory=list)  # what's stored in the data stores it reaches (objects, documents)
 
 
 @dataclass
@@ -238,6 +239,15 @@ def _host_ports(g: graph.Graph, svc: str) -> list[int] | None:
 
 def _has(comp: arch.Component, text: str) -> bool:
     return any(b.text == text for b in comp.badges)
+
+
+def _stores_in(e: graph.Edge, R: dict) -> bool:
+    """Whether a reference is a resource kept in the one it names (the catalogue's stores-in: an object's bucket)."""
+    for c in (kb.entry(R[e.source].type) or {}).get("connections") or []:
+        attr = c.get("attr", "")
+        if c.get("meaning") == "stores-in" and (e.attr == attr or e.attr.startswith(f"{attr}.")):
+            return R[e.target].type in (c.get("to") or [])
+    return False
 
 
 def _edges(g: graph.Graph) -> tuple[dict[str, list[str]], dict[str, list[str]], dict[tuple[str, str], list[str]]]:
@@ -681,6 +691,14 @@ def build(g: graph.Graph, model: arch.Model) -> Result:
                     old.hops.insert(1, also_text(node.id, eid))
     chains += found.values()
 
+    # what's stored in the stores a path reaches comes with them: the catalogue's stores-in connections (an object in
+    # its bucket, a document in its database, a secret's versions)
+    stored: dict[str, list[str]] = {}
+    for e in g.edges:
+        if e.source in R and e.target in R and e.source not in comps and _stores_in(e, R):
+            stored.setdefault(e.target, []).append(e.source)
+    for ch in chains:
+        ch.within = sorted({x for s in ch.sinks for x in stored.get(s, [])})
     for ch in chains:
         if ch.severity:
             continue
