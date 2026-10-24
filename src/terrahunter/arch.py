@@ -26,7 +26,7 @@ from __future__ import annotations
 import re
 from dataclasses import asdict, dataclass, field
 
-from terrahunter import clouds, deps, graph, scanners
+from terrahunter import clouds, deps, graph, policies, scanners
 
 # drawable types: type → (glyph, category, short name). Anything else is plumbing (badges / hidden) or not drawn.
 COMPONENTS = {
@@ -313,6 +313,8 @@ def build(g: graph.Graph, findings: list[scanners.Finding] = ()) -> Model:
             for c in cidrs:
                 sg_rules[sg].append((_ports(b), _s(c), r))
     exposed, public_ips = clouds.exposure(R, targets, sources, of)
+    for a, why in policies.aws_exposure(R, targets, sources, of).items():
+        exposed.setdefault(a, []).extend(why)
 
     # --- components, placed by their own references
     comps: dict[str, Component] = {}
@@ -421,6 +423,12 @@ def build(g: graph.Graph, findings: list[scanners.Finding] = ()) -> Model:
                     connect(lb, svc, "routes to")
                 for asg in sources(tg, "aws_autoscaling_group"):
                     connect(lb, asg, "routes to")
+    # API Gateway: the integration is the edge from the API to what it calls
+    for integ in of("aws_api_gateway_integration", "aws_apigatewayv2_integration"):
+        for api in targets(integ, "aws_api_gateway_rest_api", "aws_apigatewayv2_api"):
+            for t in targets(integ, *COMPONENTS):
+                if t != api:
+                    connect(api, t, "invokes" if R[t].type == "aws_lambda_function" else "routes to")
     for va in of("aws_volume_attachment"):
         for i in targets(va, "aws_instance"):
             for v in targets(va, "aws_ebs_volume"):
