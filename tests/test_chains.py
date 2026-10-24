@@ -209,6 +209,21 @@ def test_the_diagram_without_paths_says_so(tmp_path):
     assert '"walked": false' in page and '"internet": false' in page
 
 
+def test_what_is_stored_in_a_store_comes_with_it(tmp_path):
+    r = paths(
+        tmp_path,
+        NET
+        + ROLE
+        + BUCKETS
+        + WILDCARD_S3
+        + 'resource "aws_s3_object" "report" {\n  bucket = aws_s3_bucket.customer_exports.id\n  key = "r.csv"\n}\n'
+        + sg("web", 80)
+        + instance("web", "pub", "web", "  iam_instance_profile = aws_iam_instance_profile.app.name\n"),
+    )
+    (c,) = r.chains
+    assert "aws_s3_bucket.customer_exports" in c.sinks and c.within == ["aws_s3_object.report"]
+
+
 @pytest.mark.parametrize(
     ("own", "sinks"),
     [

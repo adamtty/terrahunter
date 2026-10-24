@@ -74,7 +74,7 @@ def score_root(folder: Path, key: dict, inputs: dict | None = None) -> dict:
             # on its storage account, a bucket policy on its bucket): keys may name either
             entries = {norm(entry_of(c)), *map(norm, c.also), *(norm(o) for _, o in model.exposed.get(entry_of(c), []))}
             if e in entries or first in on_path | entries:
-                hit = len(want & {norm(s) for s in c.sinks})
+                hit = len(want & {norm(s) for s in [*c.sinks, *c.within]})
                 if hit > best_hit:
                     best, best_hit = i, hit
         row = {
@@ -89,7 +89,7 @@ def score_root(folder: Path, key: dict, inputs: dict | None = None) -> dict:
         if best is not None:
             used.add(best)
             row["confidence"] = CONF.get(found[best].confidence, found[best].confidence)
-            row["missed"] = sorted(want - {norm(s) for s in found[best].sinks})
+            row["missed"] = sorted(want - {norm(s) for s in [*found[best].sinks, *found[best].within]})
         out["expected"].append(row)
     for i, c in enumerate(found):
         if i in used:
