@@ -306,7 +306,7 @@ def _short(when: str) -> str:
 # authorisation, self sign-up), as opposed to an endpoint every network can reach that still asks who's calling
 _ANONYMOUS = re.compile(
     r'Principal|anonymous|anyone|allUsers|allAuthenticatedUsers|unauthenticated|"\*"|= NONE|without (auth|sign)'
-    r"|public[- ](read|access|ACL|bucket|blob|container)|every identity|any (AWS )?account|self[- ]sign",
+    r"|public[- ](read|ACL|bucket|blob|container)|every identity|any (AWS )?account|self[- ]sign",
     re.IGNORECASE,
 )
 
@@ -324,7 +324,8 @@ def kb_exposures(rtype: str) -> list[tuple[dict, str, bool]]:
         if x.get("test") and x.get("reach", "internet") in ("internet", "any-authenticated"):
             b = badges.get(repr(x["test"]), "")
             reason = b if b and "<" not in b else _short(x.get("when", ""))
-            out.append((x, reason, bool(_ANONYMOUS.search(x.get("when", "")))))
+            condition = x.get("when", "").split(": ", 1)[0]  # the condition, not the explanation after it
+            out.append((x, reason, bool(_ANONYMOUS.search(condition))))
     return out
 
 

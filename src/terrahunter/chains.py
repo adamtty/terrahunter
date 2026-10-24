@@ -26,7 +26,7 @@ import itertools
 import re
 from dataclasses import asdict, dataclass, field
 
-from terrahunter import arch, clouds, deps, graph, policies
+from terrahunter import arch, clouds, deps, graph, kb, policies
 
 COMPUTE = (
     {
@@ -99,6 +99,56 @@ POLICY_TYPES = (
     "aws_iam_group_policy_attachment",
     "aws_iam_policy_attachment",
 )
+
+
+# --- the knowledge base: data stores beyond the built-in table, managed policies and roles by their permissions
+def kb_store(rtype: str) -> bool:
+    e = kb.entry(rtype)
+    return rtype in SINKS or bool(e and e.get("data_store") and e.get("draw") == "component")
+
+
+def kb_service(rtype: str) -> str:
+    """The IAM service prefix of an AWS type, when its name starts with one the IAM data knows (aws_glacier_vault →
+    glacier, aws_kms_key → kms)."""
+    words = rtype.split("_")[1:]
+    known = kb._actions() if rtype.startswith("aws_") else {}
+    return next((p for n in (2, 1) if (p := "".join(words[:n])) in known), "")
+
+
+def stores_of(svc: str, store_types: set[str]) -> set[str]:
+    """The data store types an IAM service prefix reaches: the built-in table's, and the knowledge base's by name."""
+    return SERVICE_SINKS.get(svc, set()) | {t for t in store_types if t.startswith("aws_") and kb_service(t) == svc}
+
+
+def managed_services(name: str) -> set[str]:
+    """The services an AWS managed policy the built-in table doesn't know reaches, from its document."""
+    doc = kb.managed_policy(name)
+    out: set[str] = set()
+    for st in arch._list(doc.get("Statement")) if isinstance(doc, dict) else []:
+        if not isinstance(st, dict) or st.get("Effect") != "Allow":
+            continue
+        for act in arch._list(st.get("Action")):
+            out.add("*" if act == "*" else str(act).split(":")[0].lower())
+        if st.get("NotAction"):  # everything but some actions (PowerUserAccess)
+            out.add("*")
+    return out
+
+
+def role_services(perms: list[dict]) -> set[str]:
+    """An Azure built-in role's data services, from its actions and data actions."""
+    return {
+        svc
+        for p in perms
+        for act in [*(p.get("actions") or []), *(p.get("data_actions") or [])]
+        for rx, svc in clouds.AZURE_ACTIONS
+        if rx.search(act)
+    }
+
+
+def gcp_services(role: str) -> set[str]:
+    return {
+        svc for perm in kb.gcp_role(role) or [] for prefix, svc in clouds.GCP_PERMISSIONS if perm.startswith(prefix)
+    }
 
 
 @dataclass
@@ -246,8 +296,9 @@ def grants(g: graph.Graph, identity: str) -> Grant:
         docs += [t for d in docs[1:] for t in out_e.get(d, []) if R[t].type == "aws_iam_policy_document"]
         arn = deps.unquote(R[p].body.get("policy_arn")) or ""
         name = arn.rsplit("/", 1)[-1] if arn.startswith("arn:") else ""
-        if name in MANAGED:
-            services |= MANAGED[name]
+        known = MANAGED.get(name) or (managed_services(name) if name else set())
+        if known:
+            services |= known
             actions.append(name)
             wide.append(p)
         for d in docs:
@@ -258,12 +309,12 @@ def grants(g: graph.Graph, identity: str) -> Grant:
             if (_ANY_ACTION.search(text) or _ANY_RESOURCE.search(text)) and p not in wide:
                 wide.append(p)
             for svc, act in _ACTION.findall(text):
-                if svc in ("sts", "iam") or svc in SERVICE_SINKS or svc in ("ec2", "lambda"):
+                if svc in ("sts", "iam", "ec2", "lambda") or svc in SERVICE_SINKS or svc in kb._actions():
                     services.add(svc)
                 if f"{svc}:{act}" not in actions:
                     actions.append(f"{svc}:{act}")
             if not _ANY_RESOURCE.search(text):
-                targets |= {t for t in out_e.get(d, []) if R.get(t) and R[t].type in SINKS}
+                targets |= {t for t in out_e.get(d, []) if R.get(t) and kb_store(R[t].type)}
     return Grant(services, actions, targets, wide)
 
 
@@ -275,7 +326,7 @@ def _azure_grants(g: graph.Graph, principal: str) -> Grant:
         if R[a].type == "azurerm_role_assignment":
             b = R[a].body
             role = deps.unquote(b.get("role_definition_name")) or ""
-            services = set(clouds.AZURE_ROLES.get(role, set()))
+            services = set(clouds.AZURE_ROLES.get(role) or role_services(kb.azure_role(role) or []))
             for d in out_e.get(a, []):  # a custom role: its actions
                 if R[d].type == "azurerm_role_definition":
                     role = role or R[d].name
@@ -323,7 +374,7 @@ def _gcp_grants(g: graph.Graph, identity: str) -> Grant:
         if on is None:
             continue
         role = deps.unquote(R[b].body.get("role")) or ""
-        services = {svc for prefix, svc in clouds.GCP_ROLES if role.startswith(prefix)}
+        services = {svc for prefix, svc in clouds.GCP_ROLES if role.startswith(prefix)} or gcp_services(role)
         if not services:
             continue
         scope = None if on == "" else {t for t in out_e.get(b, []) if on in attrs.get((b, t), [])}
@@ -341,7 +392,8 @@ def build(g: graph.Graph, model: arch.Model) -> Result:
     out: dict[str, list[arch.Connection]] = {}
     for e in model.connections:
         out.setdefault(e.source, []).append(e)
-    stores = [c for c in model.components if c.type in SINKS]
+    stores = [c for c in model.components if kb_store(c.type)]
+    store_types = {c.type for c in stores}
 
     def reach(identity: str) -> tuple[list[str], Grant]:
         gr = grants(g, identity)
@@ -350,7 +402,7 @@ def build(g: graph.Graph, model: arch.Model) -> Result:
                 c.id
                 for c in stores
                 if any(
-                    ("*" in svcs or any(c.type in SERVICE_SINKS.get(x, ()) for x in svcs))
+                    ("*" in svcs or any(c.type in stores_of(x, store_types) for x in svcs))
                     and (scope is None or c.id in scope)
                     for svcs, scope in gr.pairs
                 )
@@ -358,7 +410,7 @@ def build(g: graph.Graph, model: arch.Model) -> Result:
         elif "*" in gr.services:
             hit = [c.id for c in stores]
         else:
-            hit = [c.id for c in stores if any(c.type in SERVICE_SINKS.get(s, ()) for s in gr.services)]
+            hit = [c.id for c in stores if any(c.type in stores_of(s, store_types) for s in gr.services)]
             if gr.targets:  # the policies name their resources: those, where they're drawn
                 named = [t for t in gr.targets if t in comps]
                 hit = [t for t in hit if t in named] or named
@@ -366,7 +418,8 @@ def build(g: graph.Graph, model: arch.Model) -> Result:
 
     def sensitive(cid: str) -> bool:
         c = comps[cid]
-        return c.type in SECRET_STORES or bool(SENSITIVE.search(c.name))
+        e = kb.entry(c.type) or {}
+        return c.type in SECRET_STORES or bool(e.get("sensitive_default")) or bool(SENSITIVE.search(c.name))
 
     def public_ip(c: arch.Component) -> bool:
         if _has(c, "public IP"):
@@ -406,10 +459,13 @@ def build(g: graph.Graph, model: arch.Model) -> Result:
 
     # --- entry points: (component, why the internet reaches it, the ports)
     entries: list[tuple[str, str]] = []
+    unsure: set[str] = set()  # entries the knowledge base's test couldn't settle (a value terrahunter can't resolve)
+    exposed_only: set[str] = set()  # public by the knowledge base, but not data or compute: the exposure is the path
     for c in model.components:
         b = R[c.id].body if c.id in R else {}
         ports = _ports(c)
         reasons = next((x.text.removeprefix("public: ") for x in c.badges if x.text.startswith("public: ")), "")
+        maybe = next((x.text.removeprefix("possibly public: ") for x in c.badges if x.text.startswith("possibly ")), "")
         if c.type in ("aws_lb", "aws_alb", "aws_elb") and not arch._bool(b.get("internal")):
             entries.append((c.id, "internet-facing load balancer" + (f", open on {', '.join(ports)}" if ports else "")))
         elif c.type in ("azurerm_application_gateway", "azurerm_lb") and "public_ip_address_id" in str(
@@ -436,7 +492,7 @@ def build(g: graph.Graph, model: arch.Model) -> Result:
             entries.append((c.id, f"{c.tname}: {reasons}"))
         elif c.type in ("aws_api_gateway_rest_api", "aws_apigatewayv2_api") and reasons:
             entries.append((c.id, f"public API: {reasons}"))
-        elif c.type in SINKS and reasons:
+        elif kb_store(c.type) and reasons:
             entries.append((c.id, f"public {c.tname}: {reasons}"))
         elif c.type == "aws_cognito_user_pool" and self_sign_up(c.id):
             entries.append((c.id, "anyone can sign up (self sign-up is on, and a client lets them sign in)"))
@@ -458,6 +514,12 @@ def build(g: graph.Graph, model: arch.Model) -> Result:
             pub = not vc or not isinstance(vc[0], dict) or deps.unquote(vc[0].get("endpoint_public_access")) != "false"
             if pub:
                 entries.append((c.id, "Kubernetes API endpoint open to the internet"))
+        elif reasons and kb.curated(c.type):  # anything else the knowledge base says anyone can reach
+            entries.append((c.id, f"public {c.tname}: {reasons}"))
+            exposed_only.add(c.id)
+        elif maybe and kb_store(c.type):  # a test the knowledge base couldn't settle: possibly public
+            entries.append((c.id, f"possibly public {c.tname}: {maybe}"))
+            unsure.add(c.id)
 
     chains: list[Chain] = []
     edges: list[dict] = []
@@ -501,7 +563,7 @@ def build(g: graph.Graph, model: arch.Model) -> Result:
             more = " …" if len(gr.actions) > 6 else ""
             hops.append(f"{identity} grants {', '.join(gr.actions[:6])}{more} on {scope}")
         for t in sinks:  # each edge names the actions for that store's service
-            own = [x for x in gr.actions if comps[t].type in SERVICE_SINKS.get(x.split(":")[0], ())]
+            own = [x for x in gr.actions if comps[t].type in stores_of(x.split(":")[0].lower(), store_types)]
             add_edge(identity, t, ", ".join((own or [x for x in gr.actions if ":" not in x])[:2]) or "access", "access")
         return sinks
 
@@ -543,11 +605,16 @@ def build(g: graph.Graph, model: arch.Model) -> Result:
                         Chain("", kind + (" → data" if sinks else ""), "direct", f"{c.name}: {why}", steps, sinks, h)
                     )
             continue
-        if c.type in SINKS:  # the data store itself is on the internet
+        if kb_store(c.type):  # the data store itself is on the internet
             hops = [*base, reached([eid])]
-            chains.append(
-                Chain("critical", "exposed data store", "direct", f"{c.name}: {why}", ["internet"], [eid], hops)
-            )
+            conf = "possible" if eid in unsure else "direct"
+            sev = "critical" if conf == "direct" or sensitive(eid) else "high"
+            chains.append(Chain(sev, "exposed data store", conf, f"{c.name}: {why}", ["internet"], [eid], hops))
+            continue
+        if eid in exposed_only and c.type not in COMPUTE and c.type not in APIS:  # a key anyone may use, a topic
+            # anyone may publish to: what the internet gets is the resource itself
+            sev = "critical" if sensitive(eid) else "high"
+            chains.append(Chain(sev, "exposed resource", "direct", f"{c.name}: {why}", ["internet"], [eid], [*base]))
             continue
         # where the traffic goes: the entry itself, and what it routes to / fronts / invokes (two hops)
         paths = [[eid]]
@@ -582,7 +649,7 @@ def build(g: graph.Graph, model: arch.Model) -> Result:
             ]
             hops.append(text)
             # what the workload touches directly (a database its configuration names, a volume attached to it)
-            direct = [x.target for x in out.get(node.id, []) if x.target in comps and comps[x.target].type in SINKS]
+            direct = [x.target for x in out.get(node.id, []) if x.target in comps and kb_store(comps[x.target].type)]
             for d in direct:
                 add_edge(node.id, d, next(x.label for x in out[node.id] if x.target == d), "access")
             where = "the instance metadata service" if node.type in clouds.VMS else "its environment"

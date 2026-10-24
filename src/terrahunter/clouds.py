@@ -169,6 +169,13 @@ GCP_ROLES = [  # role prefix → service
     ("roles/compute.admin", "gcp-disk"),
     ("roles/compute.storageAdmin", "gcp-disk"),
 ]
+GCP_PERMISSIONS = [  # a predefined role's permission (from the knowledge base) → the data it reads
+    ("storage.objects.", "gcs"),
+    ("cloudsql.", "cloudsql"),
+    ("secretmanager.versions.access", "gcp-secrets"),
+    ("bigquery.tables.getData", "bigquery"),
+    ("compute.disks.", "gcp-disk"),
+]
 GCP_IAM = {  # binding type → the attribute naming the resource it's on ("" = the project)
     "google_project_iam_member": "",
     "google_project_iam_binding": "",
