@@ -16,7 +16,21 @@ from pathlib import Path
 
 import hcl2
 
-from terrahunter import __version__, arch, chains, clouds, deps, diagram, graph, plan, report, roots, sandbox, scanners
+from terrahunter import (
+    __version__,
+    arch,
+    chains,
+    clouds,
+    deps,
+    diagram,
+    graph,
+    kb,
+    plan,
+    report,
+    roots,
+    sandbox,
+    scanners,
+)
 
 # 1: an attack path at or above --fail-on (it wins over 2: the paths found are real even when some code was unseen)
 EXIT_OK, EXIT_PATHS, EXIT_INCOMPLETE, EXIT_ERROR = 0, 1, 2, 3
@@ -92,6 +106,12 @@ def build_parser(mode: str = "hunt") -> argparse.ArgumentParser:
         metavar="PATH",
         help="a plan for the root, as JSON (`terraform show -json tf.plan > plan.json`; a state works too): every "
         "instance, with the values that will really be deployed; needs --root (one root)",
+    )
+    ap.add_argument(
+        "--kb",
+        metavar="PATH",
+        help="the knowledge base to read: a bundle (terrahunter-kb.json.gz) or a knowledge base checkout (default: "
+        "the bundle terrahunter ships)",
     )
     if mode == "map":
         return ap
@@ -322,6 +342,12 @@ def _main(argv: list[str] | None) -> int:
     mode = argv.pop(0) if len(argv) > 1 and argv[0] in MODES else "hunt"
     a = build_parser(mode).parse_args(argv)
     mapping = mode == "map"
+    if a.kb:
+        kb.use(Path(a.kb))
+    try:
+        kb.version()  # read it now, so a bad --kb stops the run before anything else
+    except kb.KBError as e:
+        raise TerrahunterError(str(e)) from e
     if not Path(a.folder).is_dir():
         raise TerrahunterError(f"not a directory: {a.folder}")
     d = roots.discover(a.folder)
