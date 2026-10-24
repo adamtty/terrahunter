@@ -26,7 +26,7 @@ import itertools
 import re
 from dataclasses import asdict, dataclass, field
 
-from terrahunter import arch, clouds, deps, graph
+from terrahunter import arch, clouds, deps, graph, policies
 
 COMPUTE = (
     {
@@ -154,6 +154,48 @@ def _ports(comp: arch.Component) -> list[str]:
         if m:
             return [p.strip() for p in m.group(1).split(",")]
     return []
+
+
+def _port_in(port: int, rule: str) -> bool:
+    """Whether a port number falls in a rule's port text ('22', '8000-8100', 'all')."""
+    if rule == "all":
+        return True
+    lo, _, hi = rule.partition("-")
+    try:
+        return int(lo) <= port <= int(hi or lo)
+    except ValueError:
+        return False
+
+
+def _host_ports(g: graph.Graph, svc: str) -> list[int] | None:
+    """The host ports an ECS service's containers publish (hostPort, or containerPort in host network mode); None
+    when the task definition can't be read, so nothing is ruled out."""
+    out: list[int] = []
+    read = False
+    for e in g.edges:
+        if (
+            e.source != svc
+            or g.resources.get(e.target) is None
+            or g.resources[e.target].type != "aws_ecs_task_definition"
+        ):
+            continue
+        td = g.resources[e.target].body
+        defs = policies.document(td.get("container_definitions"), any_json=True)
+        if not isinstance(defs, list):
+            return None
+        read = True
+        host_mode = deps.unquote(td.get("network_mode")) in ("host", "awsvpc")
+        for c in defs:
+            for m in (c.get("portMappings") or []) if isinstance(c, dict) else []:
+                hp = m.get("hostPort") if isinstance(m, dict) else None
+                hp = (
+                    hp
+                    if hp not in (None, 0)
+                    else (m.get("containerPort") if host_mode and isinstance(m, dict) else None)
+                )
+                if isinstance(hp, (int, float)) or str(hp).isdigit():
+                    out.append(int(hp))
+    return out if read else None  # read and publishing nothing: [] (no host port to reach it on)
 
 
 def _has(comp: arch.Component, text: str) -> bool:
@@ -331,6 +373,25 @@ def build(g: graph.Graph, model: arch.Model) -> Result:
         sub = R.get(c.parent)  # launched into a subnet that hands out public IPs
         return bool(sub and arch._bool(sub.body.get("map_public_ip_on_launch")))
 
+    def host_exposure(svc: str) -> tuple[str, list[str]]:
+        """An ECS service on EC2 is reached through its hosts' ports: (the exposed host, its open ports), or ("", [])."""
+        for e in out.get(svc, []):
+            if e.label != "runs on" or e.target not in comps:
+                continue
+            h = comps[e.target]
+            lts = [
+                comps[x.target]
+                for x in out.get(h.id, [])
+                if x.target in comps and comps[x.target].type == "aws_launch_template"
+            ]
+            ports = sorted({p for x in [h, *lts] for p in _ports(x)})
+            published = _host_ports(g, svc)
+            if published is not None and "all" not in ports:
+                ports = [p for p in ports if any(_port_in(hp, p) for hp in published)]
+            if ports and (public_ip(h) or any(public_ip(x) for x in lts)):
+                return h.id, ports
+        return "", []
+
     def firewall(cid: str) -> str:
         kinds = sorted({FIREWALL[R[o].type] for _, o in model.exposed.get(cid, []) if o in R and R[o].type in FIREWALL})
         return " and ".join(kinds) or "firewall"
@@ -349,6 +410,18 @@ def build(g: graph.Graph, model: arch.Model) -> Result:
             entries.append((c.id, f"internet-facing {c.tname} (a public frontend IP)"))
         elif c.type in clouds.VMS and ports and public_ip(c):
             entries.append((c.id, f"public IP, {firewall(c.id)} open to the internet on {', '.join(ports)}"))
+        elif c.type == "aws_ecs_service" and host_exposure(c.id)[0]:
+            host, hp = host_exposure(c.id)
+            entries.append((c.id, f"runs on {comps[host].name}: public IP, open to the internet on {', '.join(hp)}"))
+        elif (
+            c.type == "aws_ecs_service"
+            and ports
+            and any(
+                isinstance(n, dict) and arch._bool(n.get("assign_public_ip"))
+                for n in arch._list(b.get("network_configuration"))
+            )
+        ):
+            entries.append((c.id, f"public IP (assign_public_ip), open to the internet on {', '.join(ports)}"))
         elif c.type in clouds.WEB_APPS and deps.unquote(b.get("public_network_access_enabled")) != "false":
             entries.append((c.id, f"{c.tname} on the internet" + (", HTTP allowed" if _has(c, "HTTP allowed") else "")))
         elif (c.type in clouds.SERVERLESS or c.type in COMPUTE) and reasons:
@@ -359,7 +432,8 @@ def build(g: graph.Graph, model: arch.Model) -> Result:
             entries.append((c.id, f"public {c.tname}: {reasons}"))
         elif c.type in ("azurerm_kubernetes_cluster", "google_container_cluster") and clouds.public_k8s(c.type, b):
             entries.append((c.id, "Kubernetes API endpoint open to the internet"))
-        elif c.type in ("aws_db_instance", "aws_rds_cluster") and _has(c, "publicly accessible"):
+        elif c.type in ("aws_db_instance", "aws_rds_cluster") and _has(c, "publicly accessible") and ports:
+            # publicly_accessible gives it a public address; its security group still decides who connects
             entries.append((c.id, "publicly accessible database" + (f", open on {', '.join(ports)}" if ports else "")))
         elif c.type == "aws_s3_bucket" and any(b.text.startswith("ACL public") for b in c.badges):
             entries.append((c.id, "bucket ACL makes it public"))
@@ -442,6 +516,19 @@ def build(g: graph.Graph, model: arch.Model) -> Result:
             if node is None or node.type not in COMPUTE:
                 continue
             roles = [x.target for x in out.get(node.id, []) if x.label == "runs as" and x.target in comps]
+            # an ECS task on EC2 can also reach its host's metadata service, so the host's role is one hop further
+            host_roles: dict[str, str] = {}
+            for e in out.get(node.id, []) if node.type == "aws_ecs_service" else []:
+                if e.label == "runs on" and e.target in comps:
+                    via = [e.target] + [
+                        x.target
+                        for x in out.get(e.target, [])
+                        if x.target in comps and comps[x.target].type == "aws_launch_template"
+                    ]
+                    for v in via:
+                        for x in out.get(v, []):
+                            if x.label == "runs as" and x.target in comps and x.target not in roles:
+                                host_roles.setdefault(x.target, e.target)
             # an Azure workload with a system-assigned identity, or a GCP one on the default service account, is its
             # own identity: no extra step, its grants come from itself
             own = clouds.system_identity(node.type, R[node.id].body) if node.id in R else ""
@@ -455,9 +542,16 @@ def build(g: graph.Graph, model: arch.Model) -> Result:
             for d in direct:
                 add_edge(node.id, d, next(x.label for x in out[node.id] if x.target == d), "access")
             where = "the instance metadata service" if node.type in clouds.VMS else "its environment"
-            for role in roles + ([node.id] if own else []) or [None]:
+            for role in roles + list(host_roles) + ([node.id] if own else []) or [None]:
                 h, steps, sinks = list(hops), ["internet", *path], list(direct)
-                if role == node.id:
+                if role in host_roles:
+                    steps.append(role)
+                    h.append(
+                        f"{node.id} runs on {host_roles[role]}: from the container, the host's instance metadata "
+                        f"service gives {role} (unless the host blocks it)"
+                    )
+                    sinks += [t for t in via_identity(role, h) if t not in sinks]
+                elif role == node.id:
                     h.append(f"{node.id} runs as {own}: its credentials come from {where}")
                     sinks += [t for t in via_identity(role, h) if t not in sinks]
                 elif role:

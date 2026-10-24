@@ -22,6 +22,7 @@ STYLE = {  # connection meaning → how it's drawn
     "invokes": "traffic",
     "runs as": "identity",
     "attached": "storage",
+    "runs on": "other",
     "stores in": "storage",
     "runs in": "other",
     "guarded by": "other",

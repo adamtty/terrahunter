@@ -124,7 +124,10 @@ def test_through_a_load_balancer_and_once_per_workload(tmp_path):
 def test_exposed_data_stores_are_direct(tmp_path):
     r = paths(
         tmp_path,
-        NET + 'resource "aws_db_instance" "billing" {\n  publicly_accessible = true\n}\n'
+        NET + sg("db", 5432) + 'resource "aws_db_instance" "billing" {\n  publicly_accessible = true\n'
+        "  vpc_security_group_ids = [aws_security_group.db.id]\n}\n"
+        # publicly accessible, but no security group open to the internet: not exposed
+        'resource "aws_db_instance" "internal" {\n  publicly_accessible = true\n}\n'
         'resource "aws_s3_bucket" "site" {\n  acl = "public-read"\n}\n'
         'resource "aws_elasticsearch_domain" "search" {\n  vpc_options {\n    subnet_ids = [aws_subnet.priv.id]\n  }\n}\n',
     )

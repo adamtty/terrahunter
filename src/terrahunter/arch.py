@@ -356,7 +356,12 @@ def build(g: graph.Graph, findings: list[scanners.Finding] = ()) -> Model:
         if reasons:
             badges.append(Badge(f"public: {'; '.join(reasons)}", True))
         b = r.body
-        if _bool(b.get("associate_public_ip_address")) or a in public_ips:
+        nics = [n for n in _list(b.get("network_interfaces")) if isinstance(n, dict)]  # a launch template's
+        if (
+            _bool(b.get("associate_public_ip_address"))
+            or a in public_ips
+            or any(_bool(n.get("associate_public_ip_address")) for n in nics)
+        ):
             badges.append(Badge("public IP", True))
         badges += [Badge(text, risky) for text, risky in clouds.badges(r.type, b)]
         if _bool(b.get("publicly_accessible")):
@@ -429,6 +434,22 @@ def build(g: graph.Graph, findings: list[scanners.Finding] = ()) -> Model:
             for t in targets(integ, *COMPONENTS):
                 if t != api:
                     connect(api, t, "invokes" if R[t].type == "aws_lambda_function" else "routes to")
+    # ECS: a service runs as its task definition's task role, and (on EC2) on the hosts of its cluster: instances or
+    # launch templates whose user data joins it, or the auto scaling groups of its capacity providers
+    for svc in of("aws_ecs_service"):
+        for td in targets(svc, "aws_ecs_task_definition"):
+            for role in targets(td, "aws_iam_role", attr=r"^task_role_arn$"):
+                connect(svc, role, "runs as")
+        if _s(R[svc].body.get("launch_type")) == "FARGATE":
+            continue
+        for cl in targets(svc, "aws_ecs_cluster"):
+            hosts = sources(cl, "aws_instance", "aws_launch_template")
+            for ccp in sources(cl, "aws_ecs_cluster_capacity_providers"):
+                for cp in targets(ccp, "aws_ecs_capacity_provider"):
+                    hosts += targets(cp, "aws_autoscaling_group")
+            hosts += [asg for lt in list(hosts) for asg in sources(lt, "aws_autoscaling_group")]
+            for h in dict.fromkeys(hosts):
+                connect(svc, h, "runs on")
     for va in of("aws_volume_attachment"):
         for i in targets(va, "aws_instance"):
             for v in targets(va, "aws_ebs_volume"):
