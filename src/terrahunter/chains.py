@@ -54,6 +54,7 @@ SERVICE_SINKS = {
     "kinesis": {"aws_kinesis_stream"},
     "sqs": {"aws_sqs_queue"},
     "ecr": {"aws_ecr_repository"},
+    "sns": {"aws_sns_topic"},
     "elasticfilesystem": {"aws_efs_file_system"},
 }
 SERVICE_SINKS.update(clouds.SERVICE_SINKS)
@@ -350,8 +351,10 @@ def build(g: graph.Graph, model: arch.Model) -> Result:
             entries.append((c.id, f"public IP, {firewall(c.id)} open to the internet on {', '.join(ports)}"))
         elif c.type in clouds.WEB_APPS and deps.unquote(b.get("public_network_access_enabled")) != "false":
             entries.append((c.id, f"{c.tname} on the internet" + (", HTTP allowed" if _has(c, "HTTP allowed") else "")))
-        elif c.type in clouds.SERVERLESS and reasons:
+        elif (c.type in clouds.SERVERLESS or c.type in COMPUTE) and reasons:
             entries.append((c.id, f"{c.tname}: {reasons}"))
+        elif c.type in ("aws_api_gateway_rest_api", "aws_apigatewayv2_api") and reasons:
+            entries.append((c.id, f"public API: {reasons}"))
         elif c.type in SINKS and reasons:
             entries.append((c.id, f"public {c.tname}: {reasons}"))
         elif c.type in ("azurerm_kubernetes_cluster", "google_container_cluster") and clouds.public_k8s(c.type, b):
@@ -512,6 +515,28 @@ _PUBLIC_FIX = [  # the resource that makes something public → what to change t
     ({"google_sql_database_instance"}, "Remove 0.0.0.0/0 from authorized_networks (or turn off the public IP)"),
     ({"google_bigquery_dataset"}, "Remove the allUsers / allAuthenticatedUsers access entry"),
     (set(clouds.GCP_IAM), "Remove allUsers / allAuthenticatedUsers from the IAM binding"),
+    (
+        {"aws_s3_bucket_policy", "aws_s3_bucket"},
+        'Remove the statement that allows Principal "*" (or pin it with a condition); turn on S3 Block Public Access',
+    ),
+    (
+        {
+            "aws_sns_topic_policy",
+            "aws_sqs_queue_policy",
+            "aws_secretsmanager_secret_policy",
+            "aws_ecr_repository_policy",
+            "aws_sns_topic",
+            "aws_sqs_queue",
+            "aws_secretsmanager_secret",
+            "aws_ecr_repository",
+        },
+        'Remove the statement that allows Principal "*", or pin it to the accounts or sources that need it',
+    ),
+    ({"aws_lambda_permission"}, 'Give the permission a specific principal and a source_arn / source_account, not "*"'),
+    (
+        {"aws_api_gateway_method", "aws_apigatewayv2_route"},
+        "Put an authorizer on it (IAM, Cognito or a Lambda authorizer)",
+    ),
 ]
 
 
