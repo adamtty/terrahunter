@@ -87,6 +87,19 @@ repository the code reads from), `--fetch-modules`, `--graph-json PATH`, `--no-s
 Exit codes: 0 done, 1 an attack path at or above `--fail-on`, 2 incomplete (something couldn't be read or scanned),
 3 error.
 
+## Measuring it
+
+`scripts/bench.py` scores the attack paths against the labelled benchmark in
+[terrahunter-kb](https://github.com/adamtty/terrahunter-kb): deliberately vulnerable Terraform (TerraGoat, AWSGoat,
+CloudGoat, IAM Vulnerable, CloudFoxable) with hand-written answer keys. It reports recall (expected paths found, and
+how much of their data), precision (paths that match; those the key contradicts, with its reason) and confidence
+side by side.
+
+```sh
+(cd ../terrahunter-kb && python scripts/bench/fetch.py)   # the projects, at their pinned commits
+uv run python scripts/bench.py --kb ../terrahunter-kb --report bench.md
+```
+
 ## Requirements
 
 Python 3.11 or later. For stage 4, [trivy](https://trivy.dev/latest/getting-started/installation/) and
