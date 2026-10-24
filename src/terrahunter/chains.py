@@ -112,6 +112,7 @@ class Chain:
     hops: list[str] = field(default_factory=list)  # what's wrong, a line per hop (each names the ids it's about)
     drawn: bool = True
     fixes: list[str] = field(default_factory=list)  # ids of the fixes that break or weaken it
+    also: list[str] = field(default_factory=list)  # other entry points into the same workload, identity and data
 
 
 @dataclass
@@ -458,6 +459,8 @@ def build(g: graph.Graph, model: arch.Model) -> Result:
 
     def compromise(c: arch.Component, via_lb: bool, has_role: bool) -> tuple[str, str]:
         """How an attacker gets something out of compute they reach: (the hop's text, its confidence)."""
+        if c.type in APIS:
+            return f"{c.id}: anyone who can call it gets what its integration does, as the role it runs as", "direct"
         ports = set(_ports(c))
         web = bool(ports & WEB_PORTS) or via_lb
         admin = [ADMIN_PORTS[p] for p in ("22", "3389", "all") if p in ports]
@@ -494,6 +497,10 @@ def build(g: graph.Graph, model: arch.Model) -> Result:
     def reached(sinks: list[str]) -> str:
         return "reaches: " + ", ".join(t + (" ⚠sensitive" if sensitive(t) else "") for t in sinks)
 
+    def also_text(node_id: str, other: str) -> str:
+        how = "directly from the internet" if other == node_id else f"through {other}"
+        return f"{node_id} is also reachable {how}"
+
     found: dict[tuple, Chain] = {}  # one chain per (workload, identity, data): the shortest way in wins
     for eid, why in entries:
         c = comps[eid]
@@ -513,7 +520,7 @@ def build(g: graph.Graph, model: arch.Model) -> Result:
                 paths += [[eid, e.target, e2.target] for e2 in out.get(e.target, []) if e2.label == "invokes"]
         for path in paths:
             node = comps.get(path[-1])
-            if node is None or node.type not in COMPUTE:
+            if node is None or node.type not in COMPUTE and node.type not in APIS:
                 continue
             roles = [x.target for x in out.get(node.id, []) if x.label == "runs as" and x.target in comps]
             # an ECS task on EC2 can also reach its host's metadata service, so the host's role is one hop further
@@ -570,12 +577,17 @@ def build(g: graph.Graph, model: arch.Model) -> Result:
                 )
                 key = (node.id, role, tuple(sinks))
                 ch = Chain("", kind, conf, f"{c.name}: {why}", steps, sinks, h)
-                if key not in found or len(steps) < len(found[key].steps):
-                    if key in found:
-                        ch.hops.insert(1, f"{node.id} is also reachable through {found[key].steps[1]}")
+                old = found.get(key)
+                if old is None:
                     found[key] = ch
-                elif found[key].steps[1] != eid:
-                    found[key].hops.insert(1, f"{node.id} is also reachable through {eid}")
+                elif (CONFIDENCE[conf], len(steps)) < (CONFIDENCE[old.confidence], len(old.steps)):
+                    # the likelier way in (then the shorter) is the path; the other is kept as an alternative
+                    ch.also = [old.steps[1], *[x for x in old.also if x != eid]]
+                    ch.hops.insert(1, also_text(node.id, old.steps[1]))
+                    found[key] = ch
+                elif old.steps[1] != eid and eid not in old.also:
+                    old.also.append(eid)
+                    old.hops.insert(1, also_text(node.id, eid))
     chains += found.values()
 
     for ch in chains:
@@ -594,15 +606,15 @@ def build(g: graph.Graph, model: arch.Model) -> Result:
             ch.severity = "medium"
         ch.drawn = all(s == "internet" or s in comps for s in ch.steps + ch.sinks)
     rank = {"critical": 0, "high": 1, "medium": 2}
-    chains.sort(
-        key=lambda ch: (rank[ch.severity], {"direct": 0, "likely": 1, "possible": 2}[ch.confidence], -len(ch.sinks))
-    )
+    chains.sort(key=lambda ch: (rank[ch.severity], CONFIDENCE[ch.confidence], -len(ch.sinks)))
     used = {s for ch in chains for s in ch.steps + ch.sinks} | {"internet"}
     edges = [e for e in edges if e["source"] in used and e["target"] in used]
     return Result(chains, edges, fixes(g, model, chains))
 
 
 EFFECT = {"breaks": 0, "narrows": 1, "hardens": 2}
+CONFIDENCE = {"direct": 0, "likely": 1, "possible": 2}
+APIS = {"aws_api_gateway_rest_api", "aws_apigatewayv2_api"}  # an API whose integration runs as a role
 _PUBLIC_FIX = [  # the resource that makes something public → what to change there
     (clouds.DB_FIREWALLS, "Remove the firewall rule that admits every address (use private endpoints)"),
     ({"azurerm_storage_container"}, 'Set container_access_type = "private"'),

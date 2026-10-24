@@ -111,10 +111,11 @@ def statements(doc: dict) -> list[dict]:
             for kind, ids in p.items():
                 principals |= {f"{kind}:{i}" for i in _list(ids)}
         conds, values = set(), {}
-        for _, kv in (st.get("Condition") or {}).items() if isinstance(st.get("Condition"), dict) else []:
+        for op, kv in (st.get("Condition") or {}).items() if isinstance(st.get("Condition"), dict) else []:
             for k, v in kv.items() if isinstance(kv, dict) else []:
                 conds.add(str(k).lower())
                 values[str(k).lower()] = [str(x) for x in _list(v)]
+                values[f"{str(k).lower()}#op"] = [str(op)]
         out.append(
             {
                 "effect": str(st.get("Effect", "Allow")),
@@ -146,6 +147,7 @@ def document_statements(body: dict) -> list[dict]:
                 k = (deps.unquote(c.get("variable")) or "").lower()
                 conds.add(k)
                 values[k] = [deps.unquote(v) or str(v) for v in _list(c.get("values"))]
+                values[f"{k}#op"] = [deps.unquote(c.get("test")) or ""]
         out.append(
             {
                 "effect": deps.unquote(st.get("effect")) or "Allow",
@@ -162,8 +164,10 @@ def is_public(st: dict) -> bool:
     if st["effect"] != "Allow" or not ({"*", "AWS:*"} & st["principals"]):
         return False
     for k in st["conditions"] & RESTRICTING:
-        if k == "aws:sourceip" and all(v in ("0.0.0.0/0", "::/0") for v in st["condition_values"].get(k, [])):
-            continue  # a "restriction" to every address isn't one
+        vals = st["condition_values"].get(k, [])
+        op = (st["condition_values"].get(f"{k}#op") or [""])[0]
+        if k == "aws:sourceip" and op.startswith("IpAddress") and any(v in ("0.0.0.0/0", "::/0") for v in vals):
+            continue  # the values are alternatives: one of them is every address, so it restricts nothing
         return False
     return True
 

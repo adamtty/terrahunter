@@ -150,3 +150,28 @@ def test_cli_var_errors(tmp_path, capsys):
             cli.main([str(tmp_path), "--no-scan", "--no-diagram", *bad])
         assert e.value.code == cli.EXIT_ERROR
     assert cli.parse_vars(["region=eu-west-1", "ports=[22, 443]"]) == {"region": '"eu-west-1"', "ports": [22, 443]}
+
+
+def test_partial_values_keep_what_is_known():
+    def whole(text):
+        return ev(text, {"var.w": ["0.0.0.0/0"]})
+
+    assert values.partial("concat([aws_vpc.v.cidr_block], var.w)", whole) == ["${aws_vpc.v.cidr_block}", '"0.0.0.0/0"']
+    assert values.partial('concat(var.w, ["${aws_eip.x.public_ip}/32"])', whole) == [
+        '"0.0.0.0/0"',
+        '"${aws_eip.x.public_ip}/32"',
+    ]
+    with pytest.raises(values.Unknown):
+        values.partial("aws_vpc.v.cidr_block", whole)
+
+
+def test_a_concat_with_an_unknown_part_still_opens_the_group(tmp_path):
+    write(
+        tmp_path,
+        {
+            "main.tf": NET + 'variable "w" {\n  default = ["0.0.0.0/0"]\n}\n'
+            'resource "aws_security_group" "web" {\n  ingress {\n    from_port = 22\n    to_port = 22\n'
+            "    cidr_blocks = concat([aws_vpc.v.cidr_block], var.w)\n  }\n}\n"
+        },
+    )
+    assert cidr(graph.build(tmp_path, ".")) == ["${aws_vpc.v.cidr_block}", '"0.0.0.0/0"']

@@ -140,3 +140,33 @@ def test_api_gateway_with_no_authorizer(tmp_path):
     )
     (c,) = build(tmp_path, v2).chains  # a route's authorization_type defaults to NONE
     assert c.steps[1:3] == ["aws_apigatewayv2_api.http", "aws_lambda_function.fn"]
+
+
+@pytest.mark.parametrize(("op", "public"), [("IpAddress", True), ("NotIpAddress", False)])
+def test_a_source_ip_list_that_includes_everyone(tmp_path, op, public):
+    r = build(
+        tmp_path,
+        'variable "w" {\n  default = ["0.0.0.0/0"]\n}\nresource "aws_eip" "ip" {}\nresource "aws_s3_bucket" "b" {}\n'
+        'resource "aws_s3_bucket_policy" "p" {\n  bucket = aws_s3_bucket.b.id\n  policy = jsonencode({\n'
+        '    Statement = [{ Effect = "Allow", Principal = "*", Action = "s3:GetObject",\n'
+        f'      Condition = {{ {op} = {{ "aws:SourceIp" = concat(var.w, ["${{aws_eip.ip.public_ip}}/32"]) }} }} }}]\n'
+        "  })\n}\n",
+    )
+    assert bool(r.chains) is public
+
+
+def test_an_api_that_calls_aws_as_its_role(tmp_path):
+    r = build(
+        tmp_path,
+        'resource "aws_s3_bucket" "site" {}\nresource "aws_iam_role" "apigw" {}\n'
+        'resource "aws_iam_role_policy" "p" {\n  role = aws_iam_role.apigw.id\n  policy = <<EOF\n'
+        '{"Statement": [{"Effect": "Allow", "Action": "s3:GetObject", "Resource": "${aws_s3_bucket.site.arn}/*"}]}\nEOF\n}\n'
+        'resource "aws_api_gateway_rest_api" "api" {}\n'
+        'resource "aws_api_gateway_method" "get" {\n  rest_api_id = aws_api_gateway_rest_api.api.id\n'
+        '  http_method = "GET"\n  authorization = "NONE"\n}\n'
+        'resource "aws_api_gateway_integration" "s3" {\n  rest_api_id = aws_api_gateway_rest_api.api.id\n'
+        '  type = "AWS"\n  credentials = aws_iam_role.apigw.arn\n}\n',
+    )
+    (c,) = r.chains
+    assert c.steps == ["internet", "aws_api_gateway_rest_api.api", "aws_iam_role.apigw"]
+    assert (c.sinks, c.confidence) == (["aws_s3_bucket.site"], "direct")
