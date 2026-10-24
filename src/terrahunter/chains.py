@@ -717,6 +717,21 @@ def build(g: graph.Graph, model: arch.Model) -> Result:
                     old.also.append(eid)
                     old.hops.insert(1, also_text(node.id, eid))
     chains += found.values()
+    # a public API with nothing behind it that the paths above follow (a mock integration, an HTTP backend outside
+    # the configuration) still answers anyone who calls it: its responses are what the internet gets
+    started = {ch.steps[1] for ch in chains if len(ch.steps) > 1} | {s for ch in chains for s in ch.sinks}
+    for eid, why in entries:
+        if comps[eid].type in APIS and eid not in started:
+            keyed = any(
+                arch._bool(R[m].body.get("api_key_required"))
+                for m in R
+                if R[m].type == "aws_api_gateway_method" and eid in [e.target for e in g.edges if e.source == m]
+            )
+            conf = "possible" if keyed else "direct"
+            hops = [f"Internet → {eid}: {why}"]
+            if keyed:
+                hops.append(f"{eid}: the method needs an API key: a leaked or shared key gets its response")
+            chains.append(Chain("", "exposed API", conf, f"{comps[eid].name}: {why}", ["internet", eid], [], hops))
 
     # what's stored in the stores a path reaches comes with them: the catalogue's stores-in connections (an object in
     # its bucket, a document in its database, a secret's versions)
