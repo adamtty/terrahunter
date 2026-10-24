@@ -188,3 +188,13 @@ def test_a_heredoc_closed_with_trailing_spaces(tmp_path):
     g = graph.build(tmp_path, ".")
     assert not g.notes and ("aws_sqs_queue_policy.p", "aws_sqs_queue.q", "queue_url") in edges(g)
     assert g.resources["aws_sqs_queue_policy.p"].line == 2
+
+
+def test_a_heredoc_marker_with_spaces_does_not_swallow_what_follows(tmp_path):
+    # with a later heredoc closed by the same marker, the parser reads `EOF ` as content up to that one and drops
+    # every block in between without an error
+    run = 'resource "null_resource" "{n}" {{\n  provisioner "local-exec" {{\n    command = <<EOF\necho {n}\nEOF{sp}\n  }}\n}}\n'
+    text = run.format(n="a", sp="  ") + 'resource "aws_instance" "vm" {}\n' + run.format(n="b", sp="")
+    write(tmp_path, {"main.tf": text})
+    g = graph.build(tmp_path, ".")
+    assert {"null_resource.a", "aws_instance.vm", "null_resource.b"} <= set(g.resources)
