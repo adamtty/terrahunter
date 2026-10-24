@@ -27,7 +27,9 @@ def test_fixes_say_what_breaks_which_path_and_where(tmp_path):
         + sg("web", 80)
         + instance("a", "pub", "web", PROFILE)
         + instance("b", "pub", "web", PROFILE)
-        + 'resource "aws_db_instance" "db" {\n  publicly_accessible = true\n}\n',
+        + sg("db", 5432)
+        + 'resource "aws_db_instance" "db" {\n  publicly_accessible = true\n'
+        "  vpc_security_group_ids = [aws_security_group.db.id]\n}\n",
     )
     by = {f.id.split(":")[0]: f for f in r.fixes}
     close = by["close"]  # one security group, two instances: one change breaks both paths

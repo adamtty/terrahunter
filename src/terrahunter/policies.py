@@ -61,10 +61,11 @@ def _unquote_all(v):
     return v
 
 
-def document(value) -> dict | None:
+def document(value, any_json: bool = False):
     """A policy attribute's value → the policy as a dict, when it's a literal: JSON text, a heredoc of JSON, or
-    jsonencode of an object (read with the HCL parser). None for anything else (a reference, an expression)."""
-    if isinstance(value, dict):
+    jsonencode of an object (read with the HCL parser). None for anything else (a reference, an expression).
+    `any_json` accepts any JSON value (a list: ECS container definitions), not only an object."""
+    if isinstance(value, (dict, list)) and any_json or isinstance(value, dict):
         return _unquote_all(value)
     if not isinstance(value, str):
         return None
@@ -82,12 +83,13 @@ def document(value) -> dict | None:
             parsed = hcl2.loads(f"x = {m.group(1)}\n").get("x")
         except Exception:  # noqa: BLE001 - an expression the parser can't read isn't a literal policy
             return None
-        return _unquote_all(parsed) if isinstance(parsed, dict) else None
+        ok = isinstance(parsed, (dict, list)) if any_json else isinstance(parsed, dict)
+        return _unquote_all(parsed) if ok else None
     try:
         doc = json.loads(s)
     except (ValueError, RecursionError):
         return None
-    return doc if isinstance(doc, dict) else None
+    return doc if isinstance(doc, (dict, list) if any_json else dict) else None
 
 
 def _list(v) -> list:
