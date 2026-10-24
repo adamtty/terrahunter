@@ -393,6 +393,13 @@ def build(g: graph.Graph, model: arch.Model) -> Result:
                 return h.id, ports
         return "", []
 
+    def self_sign_up(pool: str) -> bool:
+        """A user pool anyone can join: self sign-up isn't turned off and some client can sign them in."""
+        cfg = arch._list(R[pool].body.get("admin_create_user_config"))
+        admin_only = any(isinstance(x, dict) and arch._bool(x.get("allow_admin_create_user_only")) for x in cfg)
+        clients = [e.source for e in g.edges if e.target == pool and R[e.source].type == "aws_cognito_user_pool_client"]
+        return not admin_only and bool(clients)
+
     def firewall(cid: str) -> str:
         kinds = sorted({FIREWALL[R[o].type] for _, o in model.exposed.get(cid, []) if o in R and R[o].type in FIREWALL})
         return " and ".join(kinds) or "firewall"
@@ -431,6 +438,10 @@ def build(g: graph.Graph, model: arch.Model) -> Result:
             entries.append((c.id, f"public API: {reasons}"))
         elif c.type in SINKS and reasons:
             entries.append((c.id, f"public {c.tname}: {reasons}"))
+        elif c.type == "aws_cognito_user_pool" and self_sign_up(c.id):
+            entries.append((c.id, "anyone can sign up (self sign-up is on, and a client lets them sign in)"))
+        elif c.type == "aws_cognito_identity_pool" and arch._bool(b.get("allow_unauthenticated_identities")):
+            entries.append((c.id, "anyone gets its guest role (unauthenticated identities are allowed)"))
         elif c.type in ("azurerm_kubernetes_cluster", "google_container_cluster") and clouds.public_k8s(c.type, b):
             entries.append((c.id, "Kubernetes API endpoint open to the internet"))
         elif c.type in ("aws_db_instance", "aws_rds_cluster") and _has(c, "publicly accessible") and ports:
@@ -506,6 +517,32 @@ def build(g: graph.Graph, model: arch.Model) -> Result:
         c = comps[eid]
         add_edge("internet", eid, "reaches", "traffic")
         base = [f"Internet → {eid}: {why}"]
+        if c.type in ("aws_cognito_user_pool", "aws_cognito_identity_pool"):
+            # sign up (or come as a guest), get an identity from the identity pool, act as the role it hands out
+            idps = (
+                [eid]
+                if c.type == "aws_cognito_identity_pool"
+                else [x.target for x in out.get(eid, []) if x.label == "signs in to"]
+            )
+            for idp in idps:
+                guest = c.type == "aws_cognito_identity_pool"
+                for x in out.get(idp, []):
+                    if x.label != ("assumes as guest" if guest else "assumes") or x.target not in comps:
+                        continue
+                    role = x.target
+                    steps = ["internet", *dict.fromkeys([eid, idp]), role]
+                    h = [*base]
+                    if not guest:
+                        h.append(f"{eid} signs in to {idp}: a signed-up user gets an identity from it")
+                    h.append(f"{idp} assumes {role}: the identity's credentials act as it")
+                    sinks = via_identity(role, h)
+                    if sinks:
+                        h.append(reached(sinks))
+                    kind = "internet → " + ("identity pool (guest)" if guest else "sign-up → identity pool") + " → role"
+                    chains.append(
+                        Chain("", kind + (" → data" if sinks else ""), "direct", f"{c.name}: {why}", steps, sinks, h)
+                    )
+            continue
         if c.type in SINKS:  # the data store itself is on the internet
             hops = [*base, reached([eid])]
             chains.append(
@@ -598,7 +635,7 @@ def build(g: graph.Graph, model: arch.Model) -> Result:
             and re.search(r"AdministratorAccess|PowerUserAccess|grants \*|Owner|Contributor|roles/(owner|editor)", h)
             for h in ch.hops
         )
-        if ch.sinks and (ch.confidence == "likely" or admin or any(sensitive(s) for s in ch.sinks)):
+        if ch.sinks and (ch.confidence in ("direct", "likely") or admin or any(sensitive(s) for s in ch.sinks)):
             ch.severity = "critical"
         elif ch.sinks or admin:
             ch.severity = "high"
@@ -684,6 +721,9 @@ _ENTRY_FIX = {  # entry type → (what to change, the attribute it's about)
     "aws_opensearch_domain": "Put the domain in a VPC (vpc_options) and restrict its access policy",
     "aws_lambda_function_url": 'Set authorization_type = "AWS_IAM"',
     "aws_eks_cluster": "Turn off endpoint_public_access, or limit public_access_cidrs to known ranges",
+    "aws_cognito_user_pool": "Turn off self sign-up (admin_create_user_config.allow_admin_create_user_only = true), "
+    "or give signed-up users a role that reaches only what they need",
+    "aws_cognito_identity_pool": "Turn off allow_unauthenticated_identities, or give the guest role nothing it doesn't need",
 }
 
 
