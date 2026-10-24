@@ -77,6 +77,7 @@ VMS = {
     "azurerm_windows_virtual_machine",
     "azurerm_virtual_machine",
     "google_compute_instance",
+    "google_container_node_pool",  # its nodes are Compute Engine instances
 }
 WEB_APPS = {  # on the internet unless restricted
     "azurerm_app_service",
@@ -265,6 +266,27 @@ def exposure(R: dict, targets, sources, of) -> tuple[dict[str, list[tuple[str, s
             exposed[inst] = opened
         if any(isinstance(ni, dict) and "access_config" in ni for ni in _list(b.get("network_interface"))):
             public_ip[inst] = "external IP (access_config)"
+    # GKE node pools: the nodes are instances in the cluster's network, with external IPs unless the nodes are private
+    for pool in of("google_container_node_pool"):
+        b = R[pool].body
+        clusters = targets(pool, "google_container_cluster")
+        nets = {n for c in clusters for n in targets(c, "google_compute_network")}
+        nets |= {
+            n
+            for c in clusters
+            for sn in targets(c, "google_compute_subnetwork")
+            for n in targets(sn, "google_compute_network")
+        }
+        tags = {_s(t) for t in _list(_block(b, "node_config").get("tags"))}
+        opened = [(p, r) for net, ports, want, r in fw if net in nets and (not want or want & tags) for p in ports]
+        if opened:
+            exposed[pool] = opened
+        private = _s(_block(b, "network_config").get("enable_private_nodes")).lower() == "true" or any(
+            _s(_block(R[c].body, "private_cluster_config").get("enable_private_nodes")).lower() == "true"
+            for c in clusters
+        )
+        if clusters and not private:
+            public_ip[pool] = "nodes with external IPs (the cluster's nodes aren't private)"
 
     # databases: a firewall rule admitting every address
     for r in of(*DB_FIREWALLS):
@@ -361,6 +383,10 @@ def system_identity(rtype: str, body: dict) -> str:
         sa = _block(body, "service_account")
         if sa and (not sa.get("email") or "compute@developer" in _s(sa.get("email"))):
             return "the default compute service account"
+    if rtype == "google_container_node_pool":
+        sa = _s(_block(body, "node_config").get("service_account"))
+        if not sa or "compute@developer" in sa:
+            return "the default compute service account"
     if rtype in SERVERLESS and "service_account" not in str(body):
         return "the default compute service account"
     return ""
@@ -369,9 +395,12 @@ def system_identity(rtype: str, body: dict) -> str:
 def default_sa_services(rtype: str, body: dict) -> tuple[set[str], list[str]]:
     """What GCP's default compute service account reaches: it's an Editor on the project, cut down by the instance's
     access scopes (serverless has none)."""
-    if rtype not in ("google_compute_instance", "google_compute_instance_template"):
+    if rtype == "google_container_node_pool":  # the node pool's own scopes (none when node_config sets none)
+        scopes = " ".join(_s(x) for x in _list(_block(body, "node_config").get("oauth_scopes")))
+    elif rtype not in ("google_compute_instance", "google_compute_instance_template"):
         return {"*"}, ["roles/editor (default compute service account)"]
-    scopes = " ".join(_s(x) for x in _list(_block(body, "service_account").get("scopes")))
+    else:
+        scopes = " ".join(_s(x) for x in _list(_block(body, "service_account").get("scopes")))
     if "cloud-platform" in scopes:
         return {"*"}, ["roles/editor (default compute service account, cloud-platform scope)"]
     services = set()
