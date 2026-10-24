@@ -37,6 +37,8 @@ INPUTS = {
     "cloudgoat": {"variables": {"cg_whitelist": ['"0.0.0.0/0"'], "cgid": '"bench"', "profile": '"bench"'}},
     # the default challenge set, which terraform.tfvars.example turns on (every *_enabled defaults to false)
     "cloudfoxable": {"var_files": ["aws/terraform.tfvars.example"]},
+    # every finding on: the full corpus the README describes and NCC's sample audits use
+    "sadcloud": {"variables": {"all_findings": True}},
 }
 CONF = {"direct": "certain", "likely": "likely", "possible": "possible"}  # terrahunter → the key's words
 
@@ -139,7 +141,8 @@ def markdown(results: dict[str, list[dict]]) -> str:
         "",
         (
             "Inputs the answer keys assume: CloudGoat's `cg_whitelist` (the player's address) is `0.0.0.0/0`, the player "
-            "being the attacker; CloudFoxable uses its `terraform.tfvars.example` (its default challenges)."
+            "being the attacker; CloudFoxable uses its `terraform.tfvars.example` (its default challenges); sadcloud "
+            "runs with `all_findings = true` (the README's full corpus)."
         ),
         "",
         "| Project | Roots | Expected | Found | Recall | Paths | Matched | Contradicted | Unlabelled |",
