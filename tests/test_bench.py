@@ -67,3 +67,15 @@ def test_nothing_fetched(tmp_path, capsys):
     (tmp_path / "kb" / "bench" / "demo" / "expected.json").write_text("[]")
     assert bench.main(["--kb", str(tmp_path / "kb")]) == 2
     assert "not fetched" in capsys.readouterr().err
+
+
+def test_a_key_may_name_what_opens_the_entry(tmp_path):
+    # a public container is drawn on its storage account; the key names the container
+    text = (
+        'resource "azurerm_storage_account" "sa" {\n  name = "sa"\n}\n'
+        'resource "azurerm_storage_container" "c" {\n  storage_account_name = azurerm_storage_account.sa.name\n'
+        '  container_access_type = "blob"\n}\n'
+    )
+    (tmp_path / "main.tf").write_text(text)
+    row = bench.score_root(tmp_path, {"root": ".", "paths": [path("Z-01", "azurerm_storage_container.c", [])]})
+    assert row["expected"][0]["found"]

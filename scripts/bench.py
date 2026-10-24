@@ -70,7 +70,9 @@ def score_root(folder: Path, key: dict, inputs: dict | None = None) -> dict:
         best, best_hit = None, -1
         for i, c in enumerate(found):
             on_path = {norm(x) for x in c.steps[1:]} | ({norm(c.sinks[0])} if c.steps == ["internet"] else set())
-            entries = {norm(entry_of(c)), *map(norm, c.also)}  # the path's entry, and its other ways in
+            # the path's entry, its other ways in, and what opens the entry to the internet (a public container
+            # on its storage account, a bucket policy on its bucket): keys may name either
+            entries = {norm(entry_of(c)), *map(norm, c.also), *(norm(o) for _, o in model.exposed.get(entry_of(c), []))}
             if e in entries or first in on_path | entries:
                 hit = len(want & {norm(s) for s in c.sinks})
                 if hit > best_hit:
