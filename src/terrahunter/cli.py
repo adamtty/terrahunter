@@ -10,8 +10,11 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 from pathlib import Path
+
+import hcl2
 
 from terrahunter import __version__, arch, chains, clouds, deps, diagram, graph, plan, report, roots, sandbox, scanners
 
@@ -73,6 +76,17 @@ def build_parser(mode: str = "hunt") -> argparse.ArgumentParser:
         help="where to write the diagram (default: terrahunter-diagram.html here; one file per root with --all-roots)",
     )
     ap.add_argument("--no-diagram", action="store_true", help="don't write the diagram")
+    ap.add_argument(
+        "--var",
+        action="append",
+        default=[],
+        metavar="NAME=VALUE",
+        help="a value for one of the root's variables, as terraform -var takes it (VALUE is HCL: a string, a "
+        'number, or ["0.0.0.0/0"]); repeatable. terraform.tfvars and *.auto.tfvars are read on their own',
+    )
+    ap.add_argument(
+        "--var-file", action="append", default=[], metavar="PATH", help="a .tfvars file for the root; repeatable"
+    )
     ap.add_argument(
         "--plan",
         metavar="PATH",
@@ -206,6 +220,8 @@ def show_graph(g: graph.Graph) -> None:
     )
     for note in g.notes:
         print(f"  ! {sandbox.one_line(note, 300)}")
+    for line in g.info:
+        print(f"  · {sandbox.one_line(line, 300)}")
 
 
 def show_scan(s: scanners.Scan, top: int = 10) -> None:
@@ -260,6 +276,24 @@ def show_chains(r: chains.Result, g: graph.Graph) -> None:
             print(f"       … and {len(r.fixes) - 5} more (--report)")
 
 
+def parse_vars(pairs: list[str]) -> dict:
+    """--var NAME=VALUE → {name: value in the parser's shape}. VALUE is read as HCL; if it isn't valid HCL, it's a
+    string (as terraform takes `-var region=eu-west-1`)."""
+    out = {}
+    for pair in pairs:
+        name, eq, value = pair.partition("=")
+        if not eq or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_-]*", name.strip()):
+            raise TerrahunterError(f"--var {pair}: expected NAME=VALUE")
+        try:
+            parsed = hcl2.loads(f"x = {value}\n").get("x")
+        except Exception:  # noqa: BLE001 - not HCL: a plain string
+            parsed = None
+        if parsed is None or (isinstance(parsed, str) and not parsed.startswith('"')):
+            parsed = f'"{value}"'  # a bare word (eu-west-1) is a string, not an expression
+        out[name.strip()] = parsed
+    return out
+
+
 def write_private(path: str, text: str) -> None:
     """Write an output file, refusing a symlink at the path (a planted link can't redirect the write)."""
     flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
@@ -299,6 +333,10 @@ def _main(argv: list[str] | None) -> int:
             raise TerrahunterError(f"--with {w}: not a directory")
         withs.append(Path(w))
     complete = not d.notes
+    inputs = parse_vars(a.var)
+    for f in a.var_file:
+        if not Path(f).is_file():
+            raise TerrahunterError(f"--var-file {f}: not a file")
     planned = None
     if a.plan:
         if len(chosen) != 1:
@@ -312,7 +350,7 @@ def _main(argv: list[str] | None) -> int:
     for c in chosen:
         s = resolve(d.folder, c.path, withs, a.fetch_modules)
         show_needs(s)
-        g = graph.build(d.folder, c.path, withs)
+        g = graph.build(d.folder, c.path, withs, inputs, [Path(f) for f in a.var_file])
         if planned is not None:
             n = len(g.resources)
             g = plan.apply(g, planned)

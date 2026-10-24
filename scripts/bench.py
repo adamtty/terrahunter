@@ -31,6 +31,13 @@ from pathlib import Path
 from terrahunter import arch, chains, graph
 
 _INDEX = re.compile(r"\[[^\]]*\]")
+# the inputs each project's answer key assumes (from its source.yaml notes), given as -var / -var-file would be
+INPUTS = {
+    # the scenarios open their entry points to the player's address (cg_whitelist); the key's attacker is the player
+    "cloudgoat": {"variables": {"cg_whitelist": ['"0.0.0.0/0"'], "cgid": '"bench"', "profile": '"bench"'}},
+    # the default challenge set, which terraform.tfvars.example turns on (every *_enabled defaults to false)
+    "cloudfoxable": {"var_files": ["aws/terraform.tfvars.example"]},
+}
 CONF = {"direct": "certain", "likely": "likely", "possible": "possible"}  # terrahunter → the key's words
 
 
@@ -42,10 +49,12 @@ def entry_of(c: chains.Chain) -> str:
     return c.steps[1] if len(c.steps) > 1 else (c.sinks[0] if c.sinks else "")
 
 
-def score_root(folder: Path, key: dict) -> dict:
+def score_root(folder: Path, key: dict, inputs: dict | None = None) -> dict:
     root = key["root"]
+    inputs = inputs or {}
     with contextlib.redirect_stdout(io.StringIO()):
-        g = graph.build(folder, root)
+        files = [folder / f for f in inputs.get("var_files", [])]
+        g = graph.build(folder, root, variables=inputs.get("variables"), var_files=[f for f in files if f.is_file()])
         model = arch.build(g)
         found = chains.build(g, model).chains
     expected = [p for p in key.get("paths", []) if p["steps"][:1] == ["internet"]]
@@ -127,6 +136,11 @@ def markdown(results: dict[str, list[dict]]) -> str:
             f"{t['given_credentials']} paths start from given credentials (not scored yet)"
         ),
         "",
+        (
+            "Inputs the answer keys assume: CloudGoat's `cg_whitelist` (the player's address) is `0.0.0.0/0`, the player "
+            "being the attacker; CloudFoxable uses its `terraform.tfvars.example` (its default challenges)."
+        ),
+        "",
         "| Project | Roots | Expected | Found | Recall | Paths | Matched | Contradicted | Unlabelled |",
         "|---|---|---|---|---|---|---|---|---|",
     ]
@@ -180,7 +194,7 @@ def main(argv: list[str] | None = None) -> int:
         if not folder.is_dir():
             print(f"{name}: not fetched (python scripts/bench/fetch.py {name} in the kb); skipped", file=sys.stderr)
             continue
-        results[name] = [score_root(folder, root) for root in json.loads(key_file.read_text())]
+        results[name] = [score_root(folder, root, INPUTS.get(name)) for root in json.loads(key_file.read_text())]
     if not results:
         print("nothing to score", file=sys.stderr)
         return 2
