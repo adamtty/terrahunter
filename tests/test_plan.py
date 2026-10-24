@@ -37,7 +37,7 @@ def test_instances_replace_blocks(estate):
         'module.web["b"].aws_instance.web',
         'module.web["b"].aws_security_group.web',
     ]
-    assert any("count = 0" in n and "aws_s3_bucket.unused" in n for n in g.notes)
+    assert any("count = 0" in n and "aws_s3_bucket.unused" in n for n in g.info) and not g.notes
     web = g.resources['module.web["a"].aws_instance.web']
     assert (web.name, web.module, web.file) == ("web (a)", 'module.web["a"]', "modules/web/main.tf")
 
@@ -52,9 +52,12 @@ def test_connections_between_instances(estate):
     assert {("aws_subnet.pub[0]", "aws_vpc.v"), ("aws_subnet.pub[1]", "aws_vpc.v")} <= edges
 
 
-def test_resolved_values_reveal_what_the_code_hides(estate):
+def test_resolved_values_and_instances(estate):
+    # the code alone now knows var.public's default (true), so the open CIDR is seen without a plan; the plan adds the
+    # instances: one path per module instance, where the code alone has one per block
     without = graph.build(estate, ".")
-    assert chains.build(without, arch.build(without)).chains == []  # the CIDR is `${var.open}`: not known
+    assert without.resources["module.web.aws_security_group.web"].body["ingress"][0]["cidr_blocks"] == ['"0.0.0.0/0"']
+    assert len(chains.build(without, arch.build(without)).chains) == 1
     g = planned(estate)
     sg = g.resources['module.web["a"].aws_security_group.web'].body
     assert sg["ingress"][0]["cidr_blocks"] == ['"0.0.0.0/0"']
@@ -116,8 +119,8 @@ def test_a_state_and_a_plan_for_something_else(tmp_path, estate):
 def test_the_cli(estate, capsys):
     with pytest.raises(SystemExit) as e:
         cli.main(["map", str(estate), "--no-diagram", "--plan", str(estate / "plan.json")])
-    assert e.value.code == cli.EXIT_INCOMPLETE  # the count = 0 note
-    assert "Plan: 5 resource blocks → 7 instances" in capsys.readouterr().out
+    assert e.value.code == cli.EXIT_OK  # a block not deployed is worth knowing, not a gap
+    assert "Plan: 4 resource blocks → 7 instances" in capsys.readouterr().out  # the count = 0 bucket is already gone
 
 
 @pytest.mark.parametrize("bad", ["not json", "[]", '{"planned_values": 3}'])

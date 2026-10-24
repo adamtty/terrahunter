@@ -14,16 +14,22 @@ resolved in its scope:
 Every attribute of every resource is walked, and each reference that reaches another resource becomes an edge that
 remembers the attribute it came from. Lookups are cached and cycle-safe. Without a plan, `count` and `for_each`
 instances aren't expanded: one node per resource block.
+
+Values known before apply are evaluated (`values`): the root's variables (defaults, then `terraform.tfvars`,
+`*.auto.tfvars`, `--var-file`, `--var`), what each module call passes, locals, and what's built from them. A
+resource or module whose `count` is 0 or whose `for_each` is empty leaves the graph (noted), and every attribute
+whose value is known gets it in place of the expression, so `cidr_blocks = [var.allowed]` reads as the CIDR.
 """
 
 from __future__ import annotations
 
+import json
 import os
 import re
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
-from terrahunter import deps, sandbox
+from terrahunter import deps, sandbox, values
 
 MAX_DEPTH = 24  # resolution hops through vars, locals and outputs
 _SKIP_ATTRS = {"count", "for_each", "depends_on", "lifecycle", "provider", "provisioner", "connection"}
@@ -74,7 +80,8 @@ class Graph:
     edges: list[Edge] = field(default_factory=list)
     unknown: dict[str, Unknown] = field(default_factory=dict)
     modules: list[str] = field(default_factory=list)  # module instances loaded, by address
-    notes: list[str] = field(default_factory=list)
+    notes: list[str] = field(default_factory=list)  # what couldn't be read: the analysis is incomplete
+    info: list[str] = field(default_factory=list)  # worth knowing, not a gap (blocks not deployed)
     module_dirs: dict[str, Path] = field(default_factory=dict, repr=False)  # module address ("" root) → its directory
 
     @property
@@ -90,6 +97,7 @@ class Graph:
             "unknown": [asdict(u) for u in self.unknown.values()],
             "modules": self.modules,
             "notes": self.notes,
+            "info": self.info,
         }
 
 
@@ -102,6 +110,7 @@ class _Scope:
     locals: dict[str, object] = field(default_factory=dict)
     outputs: dict[str, object] = field(default_factory=dict)
     calls: dict[str, dict] = field(default_factory=dict)  # module name → its call body (the arguments)
+    variables: dict[str, object] = field(default_factory=dict)  # name → its default (_UNSET when it has none)
     children: dict[str, _Scope] = field(default_factory=dict)
 
     @property
@@ -163,7 +172,28 @@ def dir_label(d: Path, folder: Path, allowed: list[Path]) -> str:
     return (base.name + ":" if base != folder else "") + (Path(rel).as_posix() if rel != "." else ".")
 
 
-def build(folder: Path, root: str, with_folders: list[Path] | None = None) -> Graph:
+_UNSET = object()
+_TFVARS_AUTO = re.compile(r"\.auto\.tfvars(\.json)?$")
+
+
+def read_tfvars(path: Path) -> dict:
+    """A .tfvars or .tfvars.json file → {name: value in the parser's shape}. Raises OSError / ValueError."""
+    text = sandbox.read_regular(path).decode("utf-8", "replace")
+    if path.name.endswith(".json"):
+        return deps._requote(json.loads(text))
+    data = deps._hcl(text)
+    return {k: v for k, v in data.items() if not str(k).startswith("__")}
+
+
+def build(
+    folder: Path,
+    root: str,
+    with_folders: list[Path] | None = None,
+    variables: dict | None = None,
+    var_files: list[Path] | None = None,
+) -> Graph:
+    """The graph of one root. `variables` ({name: value in the parser's shape}) and `var_files` are the root's
+    inputs, as `-var` and `-var-file` would give them."""
     folder = folder.resolve()
     allowed = [folder] + [w.resolve() for w in with_folders or []]
     root_dir = (folder / root).resolve()
@@ -208,6 +238,8 @@ def build(folder: Path, root: str, with_folders: list[Path] | None = None) -> Gr
                     sc.locals.update({k: v for k, v in group.items() if not str(k).startswith("__")})
             for name, body in deps._blocks(doc, "output"):
                 sc.outputs[name] = body.get("value")
+            for name, body in deps._blocks(doc, "variable"):
+                sc.variables[name] = body.get("default", _UNSET)
             for name, body in deps._blocks(doc, "module"):
                 sc.calls[name] = body
                 src = deps.unquote(body.get("source"))
@@ -228,6 +260,80 @@ def build(folder: Path, root: str, with_folders: list[Path] | None = None) -> Gr
         return sc
 
     top = load(root_dir, (), None)
+
+    # --- values known before apply: the root's inputs, then what each scope's variables and locals evaluate to
+    inputs: dict[str, object] = {}
+    auto = [root_dir / "terraform.tfvars", root_dir / "terraform.tfvars.json"]
+    auto += sorted(p for p in root_dir.iterdir() if _TFVARS_AUTO.search(p.name)) if root_dir.is_dir() else []
+    for f in [p for p in auto if p.exists()] + list(var_files or []):
+        try:
+            inputs.update(read_tfvars(Path(f)))
+        except (OSError, ValueError, RecursionError, Exception) as e:  # noqa: BLE001 - a bad file is a note
+            g.notes.append(
+                f"{label(Path(f).resolve().parent)}/{Path(f).name}: variables couldn't be read ({type(e).__name__})"
+            )
+    inputs.update(variables or {})
+    known: dict[tuple, object] = {}
+
+    def resolver(sc: _Scope):
+        def resolve(kind: str, name: str):
+            key = (sc.path, kind, name)
+            if key in known:
+                if known[key] is _UNSET:
+                    raise values.Unknown(f"{kind}.{name}")
+                return known[key]
+            known[key] = _UNSET  # in progress: a cycle is unknown
+            if kind == "local" and name in sc.locals:
+                v = evaluate(sc.locals[name], sc)
+            elif kind == "var" and sc.parent is None and name in inputs:
+                v = evaluate(inputs[name], sc)
+            elif kind == "var" and sc.parent is not None and name in sc.parent.calls.get(sc.path[-1], {}):
+                v = evaluate(sc.parent.calls[sc.path[-1]][name], sc.parent)
+            elif kind == "var" and sc.variables.get(name, _UNSET) is not _UNSET:
+                v = evaluate(sc.variables[name], sc)
+            else:
+                raise values.Unknown(f"{kind}.{name}")
+            known[key] = v
+            return v
+
+        return resolve
+
+    def evaluate(v, sc: _Scope):
+        return values.Evaluator(resolver(sc)).value(v)
+
+    def deployed(body: dict, sc: _Scope) -> bool:
+        """False when count is 0 or for_each is empty, with these values; True when it isn't, or can't be told."""
+        try:
+            if "count" in body:
+                return evaluate(body["count"], sc) not in (0, False)
+            if "for_each" in body:
+                return bool(evaluate(body["for_each"], sc))
+        except values.Unknown:
+            pass
+        return True
+
+    gone: list[str] = []
+
+    def prune(sc: _Scope) -> None:
+        for local, addr in list(sc.resources.items()):
+            if not deployed(g.resources[addr].body, sc):
+                gone.append(addr)
+                del sc.resources[local], g.resources[addr]
+        for name, call in list(sc.calls.items()):
+            if deployed(call, sc):
+                continue
+            child_addr = f"{sc.prefix}module.{name}"
+            gone.append(child_addr)
+            g.unknown.pop(child_addr, None)
+            child = sc.children.pop(name, None)
+            for c in scopes(child) if child else []:
+                g.module_dirs.pop(c.prefix.rstrip("."), None)
+                if c.prefix.rstrip(".") in g.modules:
+                    g.modules.remove(c.prefix.rstrip("."))
+                for addr in c.resources.values():
+                    g.resources.pop(addr, None)
+        for child in sc.children.values():
+            prune(child)
 
     cache: dict[tuple, frozenset[str]] = {}
 
@@ -277,6 +383,15 @@ def build(folder: Path, root: str, with_folders: list[Path] | None = None) -> Gr
         for c in sc.children.values():
             yield from scopes(c)
 
+    prune(top)
+    if gone:
+        g.info.append(
+            f"{len(gone)} resource or module block{'s' if len(gone) != 1 else ''} not deployed with these variables "
+            f"(count = 0 or an empty for_each): "
+            + ", ".join(gone[:6])
+            + (f" (+{len(gone) - 6} more)" if len(gone) > 6 else "")
+        )
+
     seen: set[tuple[str, str, str, str]] = set()
     for sc in scopes(top):
         for addr in sc.resources.values():
@@ -287,4 +402,21 @@ def build(folder: Path, root: str, with_folders: list[Path] | None = None) -> Gr
                     if target != addr and (addr, target, attr, idx) not in seen:
                         seen.add((addr, target, attr, idx))
                         g.edges.append(Edge(addr, target, attr, idx))
+
+    # known values in place of their expressions (after the edges, which read the references)
+    def substitute(v, sc: _Scope):
+        if isinstance(v, str) and "${" in v:
+            try:
+                return values.to_parser(evaluate(v, sc))
+            except values.Unknown:
+                return v
+        if isinstance(v, list):
+            return [substitute(x, sc) for x in v]
+        if isinstance(v, dict):
+            return {k: substitute(x, sc) if not str(k).startswith("__") else x for k, x in v.items()}
+        return v
+
+    for sc in scopes(top):
+        for addr in sc.resources.values():
+            g.resources[addr].body = substitute(g.resources[addr].body, sc)
     return g

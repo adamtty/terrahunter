@@ -84,6 +84,11 @@ connections and the diagram (stages 1 to 3): quick, and it needs neither trivy n
 full run, the same as plain `terrahunter`. Other options: `--with PATH` (another
 repository the code reads from), `--fetch-modules`, `--graph-json PATH`, `--no-scan`, `--no-diagram`.
 
+Variables are read the way Terraform reads them before talking to any cloud: defaults, `terraform.tfvars`,
+`*.auto.tfvars`, then `--var-file PATH` and `--var NAME=VALUE`. What they evaluate to (and the locals and module
+arguments built from them) replaces the expressions, so `cidr_blocks = [var.allowed]` is judged on its value, and a
+block or module with `count = 0` (or an empty `for_each`) isn't on the map.
+
 Exit codes: 0 done, 1 an attack path at or above `--fail-on`, 2 incomplete (something couldn't be read or scanned),
 3 error.
 

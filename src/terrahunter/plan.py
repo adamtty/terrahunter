@@ -182,7 +182,7 @@ def apply(g: graph.Graph, data: dict) -> graph.Graph:
             resources[a] = replace(r, address=a, name=name, module=".".join(mods), body=body)
             expanded[addr].append(a)
     if gone:
-        g.notes.append(
+        g.info.append(
             f"{len(gone)} resource block{'s' if len(gone) != 1 else ''} the plan creates no instance of (count = 0): "
             + ", ".join(gone[:5])
             + (f" (+{len(gone) - 5} more)" if len(gone) > 5 else "")
