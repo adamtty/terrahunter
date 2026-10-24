@@ -207,3 +207,34 @@ def test_the_diagram_without_paths_says_so(tmp_path):
     g = graph.build(tmp_path, ".")
     page = diagram.render(arch.build(g), "t")
     assert '"walked": false' in page and '"internet": false' in page
+
+
+@pytest.mark.parametrize(
+    ("own", "sinks"),
+    [
+        ('  managed_policy_arns = ["arn:aws:iam::aws:policy/AmazonS3FullAccess"]\n', ["aws_s3_bucket.logs"]),
+        (
+            (
+                '  inline_policy {\n    name = "i"\n    policy = jsonencode({Statement = [{Effect = "Allow", '
+                'Action = "dynamodb:*", Resource = "*"}]})\n  }\n'
+            ),
+            ["aws_dynamodb_table.orders"],
+        ),
+        ("", []),  # the trust policy alone grants nothing
+    ],
+)
+def test_a_role_s_own_policies(tmp_path, own, sinks):
+    role = (
+        'resource "aws_iam_role" "app" {\n  assume_role_policy = jsonencode({Statement = [{Effect = "Allow", '
+        'Principal = {Service = "ec2.amazonaws.com"}, Action = "sts:AssumeRole"}]})\n' + own + "}\n"
+        'resource "aws_iam_instance_profile" "app" {\n  role = aws_iam_role.app.name\n}\n'
+    )
+    r = paths(
+        tmp_path,
+        NET
+        + role
+        + 'resource "aws_s3_bucket" "logs" {}\nresource "aws_dynamodb_table" "orders" {}\n'
+        + sg("web", 80)
+        + instance("web", "pub", "web", "  iam_instance_profile = aws_iam_instance_profile.app.name\n"),
+    )
+    assert sorted(s for c in r.chains for s in c.sinks) == sinks
