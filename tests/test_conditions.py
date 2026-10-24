@@ -209,3 +209,38 @@ def test_kb_lookups():
     assert kb.azure_role("Owner")[0]["actions"] == ["*"]
     assert "storage.objects.get" in kb.gcp_role("roles/storage.objectViewer")
     assert kb.version()
+
+
+DOC = (
+    'resource "aws_s3_bucket" "b" {{ bucket = "b" }}\n'
+    'data "aws_iam_policy_document" "d" {{\n  statement {{\n    actions = ["s3:GetObject"]\n'
+    '    resources = ["*"]\n    principals {{\n      type = "AWS"\n      identifiers = [{who}]\n    }}\n  }}\n}}\n'
+    'resource "aws_s3_bucket_policy" "p" {{\n  bucket = aws_s3_bucket.b.id\n'
+    "  policy = data.aws_iam_policy_document.d.json\n}}\n"
+)
+
+
+@pytest.mark.parametrize(
+    ("who", "want"),
+    [
+        ('"*"', True),  # a data document reads as the JSON it produces; one principal in a list is that principal
+        ("aws_iam_role.r.arn", False),  # a resource's own ARN is never the wildcard
+        ('"arn:aws:iam::${data.aws_caller_identity.me.account_id}:root"', False),  # nor is a template with text
+        ("var.who", None),  # a variable with no value stays unknown
+    ],
+)
+def test_policy_documents_and_principals(tmp_path, who, want):
+    text = 'variable "who" {}\nresource "aws_iam_role" "r" {}\ndata "aws_caller_identity" "me" {}\n' + DOC.format(
+        who=who
+    )
+    assert ev(tmp_path, text, "aws_s3_bucket.b", exposure("aws_s3_bucket", 0)) is want
+
+
+def test_a_customer_policy_is_never_an_aws_managed_one(tmp_path):
+    text = (
+        'resource "aws_iam_role" "r" {}\nresource "aws_iam_policy" "mine" {}\n'
+        'resource "aws_iam_role_policy_attachment" "a" {\n  role = aws_iam_role.r.name\n'
+        "  policy_arn = aws_iam_policy.mine.arn\n}\n"
+    )
+    test = risky("aws_iam_role_policy_attachment", "administrator")
+    assert ev(tmp_path, text, "aws_iam_role_policy_attachment.a", test) is False

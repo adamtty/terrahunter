@@ -22,6 +22,27 @@ from . import deps, graph, policies
 
 OPS = ("is", "in", "not_in", "matches", "contains", "present", "gt", "ge", "lt", "le")
 _UNKNOWN = object()  # a value that's an expression terrahunter couldn't resolve
+# a value that is one attribute of a resource the configuration creates (aws_iam_user.bob.arn): unknown, but never a
+# wildcard, and never an ARN AWS owns (arn:aws:iam::aws:policy/…), so comparing it with those is settled
+_RESOURCE_REF = re.compile(
+    r"^\$\{(?!(var|local|data|module|each|count|path|terraform|self)\.)[a-z][a-z0-9_]*\.[A-Za-z0-9_-]+(\[[^\]]*\])?"
+    r"\.[A-Za-z0-9_]+\}$"
+)
+
+
+def _literal_text(v) -> str:
+    """The text a template has outside its ${…} expressions (the quotes aside)."""
+    if not isinstance(v, str):
+        return ""
+    t = v[1:-1] if len(v) >= 2 and v[0] == v[-1] == '"' else v
+    return re.sub(r"\$\{[^}]*\}", "", t).strip()
+
+
+def _never(want) -> bool:
+    """Whether a resource's own attribute can't be this literal."""
+    return isinstance(want, str) and (want == "*" or want.startswith("arn:aws:iam::aws:"))
+
+
 _PATH = re.compile(r'\.([A-Za-z0-9_\-:]+)|\["((?:[^"\\]|\\.)*)"\]|\[(\*|\d+)\]')
 
 
@@ -239,6 +260,14 @@ def look_inside(raw: list, inside: dict) -> list:
 def _compare(op: str, want, v) -> bool | None:
     s = scalar(v)
     if s is _UNKNOWN:
+        ref = isinstance(v, str) and bool(_RESOURCE_REF.match(v))
+        # a template with text of its own around the expression ("arn:aws:iam::${…}:root") isn't the wildcard either
+        if op == "is" and want == "*" and _literal_text(v):
+            return False
+        if ref and op == "is" and _never(want):
+            return False
+        if ref and op == "in" and all(_never(w) for w in want):
+            return False
         return None
     if op == "is":
         return _canon(s) == _canon(want)
@@ -333,11 +362,29 @@ def _start(ctx: _Ctx, path: str):
 def _raw(c: dict, ctx: _Ctx) -> list:
     attr = c.get("attr", "")
     if ctx.item:
-        return [v for v in _json_path(ctx.body, "$." + attr) if v is not None] if attr else [ctx.body]
+        if not attr:
+            return [ctx.body]
+        out = []
+        for v in _json_path(ctx.body, "$." + attr):  # a list is its elements (["*"] for one AWS principal)
+            out += [x for x in v if x is not None] if isinstance(v, list) else [] if v is None else [v]
+        return out
     if attr == "id" and ctx.addr in ctx.ix.g.resources:
         return ["(id)"]  # every resource has one, known or not
     base, rest = _start(ctx, attr)
     return values(base, rest)
+
+
+def _documents(c: dict, ctx: _Ctx, raw: list) -> list:
+    """A policy attribute that names a `data "aws_iam_policy_document"` reads as the JSON the document produces."""
+    R = ctx.ix.g.resources
+    docs = [
+        policies.render_document(R[e.target].body)
+        for e in ctx.ix.out_edges.get(ctx.addr, [])
+        if e.attr == c.get("attr") and e.target in R and R[e.target].type == "aws_iam_policy_document"
+    ]
+    if not docs:
+        return raw
+    return [v for v in raw if not (isinstance(v, str) and "aws_iam_policy_document" in v)] + docs
 
 
 def _check(c: dict, ctx: _Ctx) -> bool | None:
@@ -346,6 +393,8 @@ def _check(c: dict, ctx: _Ctx) -> bool | None:
         rest = {k: v for k, v in c.items() if k != "of"}
         return _hops(hops, rest, ctx.addr, ctx.ix)
     raw = _raw(c, ctx)
+    if c.get("inside", {}).get("format", "json") == "json" and "inside" in c and not ctx.item:
+        raw = _documents(c, ctx, raw)
     if "inside" in c:
         raw = look_inside(raw, c["inside"])
     present = bool(raw)

@@ -160,6 +160,46 @@ def document_statements(body: dict) -> list[dict]:
     return out
 
 
+def render_document(body: dict) -> dict:
+    """A `data "aws_iam_policy_document"` body as the IAM JSON it produces (its `json` attribute), so a policy that
+    names one can be read like a literal one. Values terrahunter couldn't resolve stay as their expressions."""
+
+    def v(x):
+        u = deps.unquote(x)
+        return u if u is not None else x
+
+    statements = []
+    for st in _list(body.get("statement")):
+        if not isinstance(st, dict):
+            continue
+        out: dict = {"Effect": v(st.get("effect")) or "Allow"}
+        if st.get("sid"):
+            out["Sid"] = v(st["sid"])
+        for hcl, key in (
+            ("actions", "Action"),
+            ("not_actions", "NotAction"),
+            ("resources", "Resource"),
+            ("not_resources", "NotResource"),
+        ):
+            if st.get(hcl) is not None:
+                out[key] = [v(x) for x in _list(st[hcl])]
+        for hcl, key in (("principals", "Principal"), ("not_principals", "NotPrincipal")):
+            blocks = [pr for pr in _list(st.get(hcl)) if isinstance(pr, dict)]
+            if blocks:
+                if any(v(pr.get("type")) == "*" for pr in blocks):
+                    out[key] = "*"
+                else:
+                    out[key] = {v(pr.get("type")): [v(i) for i in _list(pr.get("identifiers"))] for pr in blocks}
+        conds: dict = {}
+        for c in _list(st.get("condition")):
+            if isinstance(c, dict):
+                conds.setdefault(v(c.get("test")), {})[v(c.get("variable"))] = [v(x) for x in _list(c.get("values"))]
+        if conds:
+            out["Condition"] = conds
+        statements.append(out)
+    return {"Version": "2012-10-17", "Statement": statements}
+
+
 def is_public(st: dict) -> bool | None:
     """Whether a statement lets anyone in: True, False, or None when the only conditions that would restrict it are
     values terrahunter can't resolve (an address from a variable it has no value for): possibly public."""
