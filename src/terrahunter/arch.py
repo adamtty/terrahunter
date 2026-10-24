@@ -69,6 +69,8 @@ COMPONENTS = {
     "aws_iam_role": ("ROLE", "security", "IAM role"),
     "aws_iam_user": ("USER", "security", "IAM user"),
     "aws_iam_group": ("GRP", "security", "IAM group"),
+    "aws_cognito_user_pool": ("COG", "security", "Cognito user pool"),
+    "aws_cognito_identity_pool": ("CID", "security", "Cognito identity pool"),
 }
 REGIONAL = {  # never inside a VPC
     "aws_s3_bucket",
@@ -87,6 +89,7 @@ REGIONAL = {  # never inside a VPC
     "aws_ecs_cluster",
 }
 GLOBAL = {"aws_iam_role", "aws_iam_user", "aws_iam_group"}
+REGIONAL |= {"aws_cognito_user_pool", "aws_cognito_identity_pool"}
 COMPONENTS.update(clouds.COMPONENTS)
 REGIONAL |= clouds.SERVICES
 GLOBAL |= clouds.IDENTITIES
@@ -104,7 +107,7 @@ MEANING = [
     (r"kms|encryption", "encrypted with"),
     (r"log(ging|_destination)", "logs to"),
     (r"volume_id|(^|\.)bucket$", "stores in"),
-    (r"function_name|lambda_function_arn|(^|\.)function", "invokes"),
+    (r"function_name|lambda_function_arn|(^|\.)function|lambda_config", "invokes"),
 ]
 NOT_CONNECTIONS = re.compile(r"(^|\.)(tags(_all)?|name|description|identifier|bucket_prefix)(\.|$)")
 # what the meaning of a connection says, when it isn't worth drawing all the time
@@ -436,6 +439,20 @@ def build(g: graph.Graph, findings: list[scanners.Finding] = ()) -> Model:
                     # an integration with credentials calls AWS as that role: the API runs as it
                     label = {"aws_lambda_function": "invokes", "aws_iam_role": "runs as"}.get(R[t].type, "routes to")
                     connect(api, t, label)
+    # Cognito: a user pool signs in to the identity pools that trust it, which hand out their roles (the guest role
+    # too, when unauthenticated identities are allowed)
+    for idp in of("aws_cognito_identity_pool"):
+        pools = targets(idp, "aws_cognito_user_pool") + [
+            p for cl in targets(idp, "aws_cognito_user_pool_client") for p in targets(cl, "aws_cognito_user_pool")
+        ]
+        for pool in dict.fromkeys(pools):
+            connect(pool, idp, "signs in to")
+        for att in sources(idp, "aws_cognito_identity_pool_roles_attachment"):
+            for role in targets(att, "aws_iam_role", attr=r"(^|\.)authenticated$"):
+                connect(idp, role, "assumes")
+            if _bool(R[idp].body.get("allow_unauthenticated_identities")):  # guests only when it lets them in
+                for role in targets(att, "aws_iam_role", attr=r"unauthenticated$"):
+                    connect(idp, role, "assumes as guest")
     # ECS: a service runs as its task definition's task role, and (on EC2) on the hosts of its cluster: instances or
     # launch templates whose user data joins it, or the auto scaling groups of its capacity providers
     for svc in of("aws_ecs_service"):
