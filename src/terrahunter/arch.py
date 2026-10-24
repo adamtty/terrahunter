@@ -433,7 +433,9 @@ def build(g: graph.Graph, findings: list[scanners.Finding] = ()) -> Model:
         for api in targets(integ, "aws_api_gateway_rest_api", "aws_apigatewayv2_api"):
             for t in targets(integ, *COMPONENTS):
                 if t != api:
-                    connect(api, t, "invokes" if R[t].type == "aws_lambda_function" else "routes to")
+                    # an integration with credentials calls AWS as that role: the API runs as it
+                    label = {"aws_lambda_function": "invokes", "aws_iam_role": "runs as"}.get(R[t].type, "routes to")
+                    connect(api, t, label)
     # ECS: a service runs as its task definition's task role, and (on EC2) on the hosts of its cluster: instances or
     # launch templates whose user data joins it, or the auto scaling groups of its capacity providers
     for svc in of("aws_ecs_service"):

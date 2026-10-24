@@ -29,6 +29,8 @@ import re
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
+import hcl2
+
 from terrahunter import deps, sandbox, values
 
 MAX_DEPTH = 24  # resolution hops through vars, locals and outputs
@@ -409,7 +411,21 @@ def build(
             try:
                 return values.to_parser(evaluate(v, sc))
             except values.Unknown:
-                return v
+                pass
+            inner = v[2:-1].strip() if v.startswith("${") and v.endswith("}") else ""
+            if inner.startswith("jsonencode(") and inner.endswith(")"):
+                # a policy or definition written as jsonencode({…}): the object, with what's known in it evaluated
+                try:
+                    obj = hcl2.loads("x = " + inner[len("jsonencode(") : -1] + "\n").get("x")
+                except Exception:  # noqa: BLE001 - not an object the parser reads: leave it as written
+                    return v
+                return substitute(obj, sc) if isinstance(obj, (dict, list)) else v
+            if inner:
+                try:
+                    return values.partial(inner, values.Evaluator(resolver(sc)).expr)
+                except values.Unknown:
+                    pass
+            return v
         if isinstance(v, list):
             return [substitute(x, sc) for x in v]
         if isinstance(v, dict):

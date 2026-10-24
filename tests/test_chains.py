@@ -116,9 +116,12 @@ def test_through_a_load_balancer_and_once_per_workload(tmp_path):
         + sg("app", 22)
         + instance("app", "pub", "app", profile),
     )
+    # also reachable over SSH (possible: it needs a key), but web traffic into IMDSv1 with a role is likely: one
+    # chain, the likelier way in, with the other kept as an alternative
     (c,) = r.chains
-    assert c.steps == ["internet", "aws_instance.app", "aws_iam_role.app"]
-    assert "aws_instance.app is also reachable through aws_lb.front" in c.hops
+    assert c.steps == ["internet", "aws_lb.front", "aws_instance.app", "aws_iam_role.app"]
+    assert c.confidence == "likely" and c.also == ["aws_instance.app"]
+    assert "aws_instance.app is also reachable directly from the internet" in c.hops
 
 
 def test_exposed_data_stores_are_direct(tmp_path):

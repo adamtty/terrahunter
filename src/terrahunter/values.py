@@ -390,3 +390,57 @@ def to_parser(v):
     if isinstance(v, dict):
         return {k: to_parser(x) for k, x in v.items()}
     return v
+
+
+_CONCAT = re.compile(r"^concat\s*\((.*)\)$", re.DOTALL)
+
+
+def split_top(text: str, sep: str = ",") -> list[str]:
+    """Split an expression on `sep` where it's not inside brackets, braces, parentheses or a string."""
+    out, depth, start, i = [], 0, 0, 0
+    while i < len(text):
+        c = text[i]
+        if c == '"':
+            i = _string_end(text, i)
+            continue
+        if c in "([{":
+            depth += 1
+        elif c in ")]}":
+            depth -= 1
+        elif c == sep and depth == 0:
+            out.append(text[start:i])
+            start = i + 1
+        i += 1
+    tail = text[start:]
+    return out + ([tail] if tail.strip() else [])
+
+
+def partial(expr: str, whole: Callable[[str], object]) -> list:
+    """When a list expression as a whole is unknown, what of it is known, in the parser's shape: the items of a list
+    literal or a concat() that evaluate, and the others kept as `${…}`. `whole(text)` evaluates one piece (raising
+    Unknown); raises Unknown when the expression isn't a list or concat()."""
+    e = expr.strip()
+    m = _CONCAT.match(e)
+    if m:
+        out: list = []
+        for arg in split_top(m.group(1)):
+            try:
+                v = whole(arg)
+            except Unknown:
+                try:
+                    out += partial(arg, whole)
+                except Unknown:
+                    out.append("${" + arg.strip() + "}")
+                continue
+            out += to_parser(v) if isinstance(v, list) else [to_parser(v)]
+        return out
+    if e.startswith("[") and e.endswith("]"):
+        out = []
+        for item in split_top(e[1:-1]):
+            try:
+                out.append(to_parser(whole(item)))
+            except Unknown:
+                t = item.strip()
+                out.append(t if t.startswith('"') else "${" + t + "}")  # a template stays the string it is
+        return out
+    raise Unknown("not a list")

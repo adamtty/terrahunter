@@ -68,7 +68,8 @@ def score_root(folder: Path, key: dict, inputs: dict | None = None) -> dict:
         best, best_hit = None, -1
         for i, c in enumerate(found):
             on_path = {norm(x) for x in c.steps[1:]} | ({norm(c.sinks[0])} if c.steps == ["internet"] else set())
-            if norm(entry_of(c)) == e or first in on_path:
+            entries = {norm(entry_of(c)), *map(norm, c.also)}  # the path's entry, and its other ways in
+            if e in entries or first in on_path | entries:
                 hit = len(want & {norm(s) for s in c.sinks})
                 if hit > best_hit:
                     best, best_hit = i, hit
