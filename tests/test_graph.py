@@ -174,3 +174,17 @@ def test_graph_json_refuses_a_planted_symlink(tmp_path):
     with pytest.raises(SystemExit) as e:
         cli.main([str(tmp_path), "--graph-json", str(tmp_path / "graph.json")])
     assert e.value.code == cli.EXIT_ERROR and target.read_text() == "keep me"
+
+
+def test_a_heredoc_closed_with_trailing_spaces(tmp_path):
+    # Terraform accepts `POLICY ` as the closing marker; the parser alone rejects the whole file
+    write(
+        tmp_path,
+        {
+            "main.tf": 'resource "aws_sqs_queue" "q" {}\nresource "aws_sqs_queue_policy" "p" {\n'
+            '  queue_url = aws_sqs_queue.q.id\n  policy = <<POLICY\n{"Statement": []}\nPOLICY   \n}\n'
+        },
+    )
+    g = graph.build(tmp_path, ".")
+    assert not g.notes and ("aws_sqs_queue_policy.p", "aws_sqs_queue.q", "queue_url") in edges(g)
+    assert g.resources["aws_sqs_queue_policy.p"].line == 2

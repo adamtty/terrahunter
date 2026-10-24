@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import time
@@ -95,7 +96,7 @@ def load_dir(d: Path, notes: list[str], label: str) -> list[tuple[str, dict, str
         try:
             text = sandbox.read_regular(p).decode("utf-8", "replace")
             with sandbox.time_limit(min(sandbox.parse_limit(), left)):
-                doc = _requote(json.loads(text)) if p.name.endswith(".json") else hcl2.loads(text)
+                doc = _requote(json.loads(text)) if p.name.endswith(".json") else _hcl(text)
         except sandbox.ParseTimeout:
             notes.append(f"{label}/{p.name}: too slow to parse, not read")
             continue
@@ -105,6 +106,22 @@ def load_dir(d: Path, notes: list[str], label: str) -> list[tuple[str, dict, str
         if isinstance(doc, dict):
             out.append((p.name, doc, text))
     return out
+
+
+_TRAILING = re.compile(r"[ \t]+$", re.MULTILINE)
+
+
+def _hcl(text: str) -> dict:
+    """python-hcl2, with one retry: Terraform accepts a heredoc's closing marker followed by spaces (`POLICY `),
+    python-hcl2 rejects the whole file. The retry trims trailing whitespace from every line, which changes nothing
+    the analysis reads (line numbers stay the same)."""
+    try:
+        return hcl2.loads(text)
+    except Exception:
+        trimmed = _TRAILING.sub("", text)
+        if trimmed == text:
+            raise
+        return hcl2.loads(trimmed)
 
 
 def _requote(v):
