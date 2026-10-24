@@ -160,20 +160,27 @@ def document_statements(body: dict) -> list[dict]:
     return out
 
 
-def is_public(st: dict) -> bool:
+def is_public(st: dict) -> bool | None:
+    """Whether a statement lets anyone in: True, False, or None when the only conditions that would restrict it are
+    values terrahunter can't resolve (an address from a variable it has no value for): possibly public."""
     if st["effect"] != "Allow" or not ({"*", "AWS:*"} & st["principals"]):
         return False
+    unknown = False
     for k in st["conditions"] & RESTRICTING:
         vals = st["condition_values"].get(k, [])
         op = (st["condition_values"].get(f"{k}#op") or [""])[0]
         if k == "aws:sourceip" and op.startswith("IpAddress") and any(v in ("0.0.0.0/0", "::/0") for v in vals):
             continue  # the values are alternatives: one of them is every address, so it restricts nothing
+        if vals and all("${" in v for v in vals):
+            unknown = True  # restricted to something, but to what isn't known
+            continue
         return False
-    return True
+    return None if unknown else True
 
 
-def public_actions(R: dict, addr: str, attr: str, targets) -> list[str]:
-    """The actions a resource's policy attribute grants to anyone ([] when none, or when it can't be read)."""
+def public_actions(R: dict, addr: str, attr: str, targets, maybe: bool = False) -> list[str]:
+    """The actions a resource's policy attribute grants to anyone ([] when none, or when it can't be read); with
+    `maybe`, those it grants only through conditions terrahunter can't resolve."""
     r = R[addr]
     sts: list[dict] = []
     doc = document(r.body.get(attr))
@@ -182,19 +189,25 @@ def public_actions(R: dict, addr: str, attr: str, targets) -> list[str]:
     else:
         for d in targets(addr, "aws_iam_policy_document", attr=rf"^{attr}$"):
             sts += document_statements(R[d].body)
-    return sorted({a for st in sts if is_public(st) for a in st["actions"]})
+    want = None if maybe else True
+    return sorted({a for st in sts if is_public(st) is want for a in st["actions"]})
 
 
 def _bool(v) -> bool:
     return str(deps.unquote(v) if isinstance(v, str) else v).lower() == "true"
 
 
-def aws_exposure(R: dict, targets, sources, of) -> dict[str, list[tuple[str, str]]]:
-    """AWS resources a policy opens to anyone: resource → [(reason, the policy resource)]."""
+def aws_exposure(R: dict, targets, sources, of, maybe: dict | None = None) -> dict[str, list[tuple[str, str]]]:
+    """AWS resources a policy opens to anyone: resource → [(reason, the policy resource)]. Those a policy opens only
+    through a condition terrahunter can't resolve go in `maybe`, the same way."""
     exposed: dict[str, list[tuple[str, str]]] = {}
 
     def add(t: str, why: str, origin: str) -> None:
         exposed.setdefault(t, []).append((why, origin))
+
+    def possibly(t: str, why: str, origin: str) -> None:
+        if maybe is not None:
+            maybe.setdefault(t, []).append((why, origin))
 
     def short(actions: list[str]) -> str:
         return ", ".join(actions[:3]) + (" …" if len(actions) > 3 else "")
@@ -210,6 +223,8 @@ def aws_exposure(R: dict, targets, sources, of) -> dict[str, list[tuple[str, str
             acts = public_actions(R, pol, "policy", targets)
             if acts:
                 add(b, f"bucket policy lets anyone {short(acts)}", pol)
+            elif acts := public_actions(R, pol, "policy", targets, maybe=True):
+                possibly(b, f"bucket policy may let anyone {short(acts)} (a condition isn't known)", pol)
     for kind, pol_type, attr in (
         ("aws_sns_topic", "aws_sns_topic_policy", "policy"),
         ("aws_sqs_queue", "aws_sqs_queue_policy", "policy"),
@@ -221,6 +236,8 @@ def aws_exposure(R: dict, targets, sources, of) -> dict[str, list[tuple[str, str
                 acts = public_actions(R, pol, attr, targets)
                 if acts:
                     add(t, f"its policy lets any AWS account {short(acts)}", pol)
+                elif acts := public_actions(R, pol, attr, targets, maybe=True):
+                    possibly(t, f"its policy may let any AWS account {short(acts)} (a condition isn't known)", pol)
     for perm in of("aws_lambda_permission"):
         b = R[perm].body
         if deps.unquote(b.get("principal")) == "*" and not b.get("source_arn") and not b.get("source_account"):
