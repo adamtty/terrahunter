@@ -152,6 +152,8 @@ class Model:
     components: list[Component]
     connections: list[Connection]
     loose: list[dict] = field(default_factory=list)  # findings not on any component
+    # security group → [(port, the resource that opens it to the internet: the group, or its rule)], for the fixes
+    open_rules: dict[str, list[tuple[str, str]]] = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         return {
@@ -271,12 +273,12 @@ def build(g: graph.Graph, findings: list[scanners.Finding] = ()) -> Model:
         )
 
     # --- security groups → what they open (badges on what uses them)
-    sg_rules: dict[str, list[tuple[str, str]]] = {sg: [] for sg in of("aws_security_group")}
+    sg_rules: dict[str, list[tuple[str, str, str]]] = {sg: [] for sg in of("aws_security_group")}
     for sg, rules in sg_rules.items():
         for rule in _list(R[sg].body.get("ingress")):
             if isinstance(rule, dict):
                 for c in _list(rule.get("cidr_blocks")) or ["sg"]:
-                    rules.append((_ports(rule), _s(c)))
+                    rules.append((_ports(rule), _s(c), sg))
     for r in of("aws_security_group_rule", "aws_vpc_security_group_ingress_rule"):
         b = R[r].body
         if R[r].type == "aws_security_group_rule" and _s(b.get("type")) != "ingress":
@@ -288,7 +290,11 @@ def build(g: graph.Graph, findings: list[scanners.Finding] = ()) -> Model:
         )
         for sg in targets(r, "aws_security_group"):
             for c in cidrs:
-                sg_rules[sg].append((_ports(b), _s(c)))
+                sg_rules[sg].append((_ports(b), _s(c), r))
+    open_rules = {
+        sg: sorted({(p, origin) for p, c, origin in rules if c in ("0.0.0.0/0", "::/0")})
+        for sg, rules in sg_rules.items()
+    }
 
     # --- components, placed by their own references
     comps: dict[str, Component] = {}
@@ -315,11 +321,11 @@ def build(g: graph.Graph, findings: list[scanners.Finding] = ()) -> Model:
         badges = []
         for sg in targets(a, "aws_security_group"):
             rules = sg_rules.get(sg, [])
-            open_ = sorted({p for p, c in rules if c in ("0.0.0.0/0", "::/0")})
+            open_ = sorted({p for p, c, _ in rules if c in ("0.0.0.0/0", "::/0")})
             if open_:
                 badges.append(Badge(f"open to internet: {', '.join(open_)}", True))
             elif rules:
-                badges.append(Badge(f"SG {R[sg].name}: {', '.join(sorted({p for p, _ in rules}))}"))
+                badges.append(Badge(f"SG {R[sg].name}: {', '.join(sorted({p for p, _, _ in rules}))}"))
         b = r.body
         if _bool(b.get("associate_public_ip_address")):
             badges.append(Badge("public IP", True))
@@ -450,4 +456,4 @@ def build(g: graph.Graph, findings: list[scanners.Finding] = ()) -> Model:
 
     used = {c.parent for c in comps.values()} | {c.parent for c in containers if c.parent}
     containers = [c for c in containers if c.id in used or c.kind in ("vpc", "subnet")]
-    return Model(g.root, containers, list(comps.values()), list(conns.values()), loose)
+    return Model(g.root, containers, list(comps.values()), list(conns.values()), loose, open_rules)

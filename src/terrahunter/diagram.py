@@ -39,10 +39,15 @@ def render(model: arch.Model, title: str, scanned: bool = False, paths: chains.R
         e["kind"] = "quiet" if e["quiet"] else STYLE.get(e["label"], "other")
         if e["target"] in {c.id for c in model.components if c.unknown}:
             e["kind"] = "unknown"
-    found = paths.to_dict() if paths else {"chains": [], "edges": []}
+    found = paths.to_dict() if paths else {"chains": [], "edges": [], "fixes": []}
     data["edges"] += found["edges"]
     data.update(
-        target=title, chains=found["chains"], internet=bool(found["chains"]), scanned=scanned, walked=paths is not None
+        target=title,
+        chains=found["chains"],
+        fixes=found["fixes"],
+        internet=bool(found["chains"]),
+        scanned=scanned,
+        walked=paths is not None,
     )
     blob = json.dumps(data).replace("<", "\\u003c")  # nothing in the data can look like markup to the browser
     page = TEMPLATE.read_text(encoding="utf-8").replace("__DATA__", blob)
