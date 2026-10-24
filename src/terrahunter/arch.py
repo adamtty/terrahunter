@@ -2,11 +2,13 @@
 
 The graph has every resource and every reference; a diagram that drew them all would be unreadable. So:
 
-- **containers**: the AWS region, VPCs, and subnets (public when routed to an internet gateway or mapping public IPs on
-  launch), plus areas for regional services and IAM (global);
+- **containers**: per cloud (an AWS region, an Azure subscription, a Google Cloud project), its networks and subnets
+  (AWS subnets are public when routed to an internet gateway or mapping public IPs on launch), plus areas for services
+  outside any network and for identities;
 - **components**: the things an architect would draw (compute, load balancers, data stores, identities), each placed
   in the container its own references put it in;
-- **badges**: plumbing folded into what it affects: a security group's open ports on the instance that uses it, a
+- **badges**: plumbing folded into what it affects: what the internet reaches on it (a security group, a network
+  security group, a firewall rule, a database firewall rule, a public container or bucket binding: see `clouds`), a
   role's policies on the role, an access key on its user, settings worth knowing (public IP, IMDSv1, no encryption);
 - **connections**: the references that mean something between components, with plumbing collapsed into them
   (instance → instance profile → role is *runs as*; load balancer → listener → target group → attachment → target is
@@ -24,7 +26,7 @@ from __future__ import annotations
 import re
 from dataclasses import asdict, dataclass, field
 
-from terrahunter import deps, graph, scanners
+from terrahunter import clouds, deps, graph, scanners
 
 # drawable types: type → (glyph, category, short name). Anything else is plumbing (badges / hidden) or not drawn.
 COMPONENTS = {
@@ -85,13 +87,19 @@ REGIONAL = {  # never inside a VPC
     "aws_ecs_cluster",
 }
 GLOBAL = {"aws_iam_role", "aws_iam_user", "aws_iam_group"}
+COMPONENTS.update(clouds.COMPONENTS)
+REGIONAL |= clouds.SERVICES
+GLOBAL |= clouds.IDENTITIES
 # reference attribute → what the connection means (first match wins)
 MEANING = [
     (r"user_data|(^|\.)environment|container_definitions", "configured with"),
     (r"(^|\.)subnet", "runs in"),
     (r"security_group", "guarded by"),
-    (r"iam_instance_profile|(^|\.)role(_arn)?$|execution_role|task_role|iam_role", "runs as"),
-    (r"target_group|load_balancer|(^|\.)instances$", "routes to"),
+    (
+        r"iam_instance_profile|(^|\.)role(_arn)?$|execution_role|task_role|iam_role|identity_ids|service_account",
+        "runs as",
+    ),
+    (r"target_group|load_balancer|(^|\.)instances$|backend_address_pool|backend_http", "routes to"),
     (r"origin", "fronts"),
     (r"kms|encryption", "encrypted with"),
     (r"log(ging|_destination)", "logs to"),
@@ -152,8 +160,8 @@ class Model:
     components: list[Component]
     connections: list[Connection]
     loose: list[dict] = field(default_factory=list)  # findings not on any component
-    # security group → [(port, the resource that opens it to the internet: the group, or its rule)], for the fixes
-    open_rules: dict[str, list[tuple[str, str]]] = field(default_factory=dict)
+    # component → [(port or reason, the resource that opens it to the internet)], for the fixes
+    exposed: dict[str, list[tuple[str, str]]] = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         return {
@@ -242,29 +250,42 @@ def build(g: graph.Graph, findings: list[scanners.Finding] = ()) -> Model:
     }
     public |= {s for s in of("aws_subnet") if _bool(R[s].body.get("map_public_ip_on_launch"))}
 
-    containers = [
-        Container("region", "AWS region", "region", None),
-        Container("regional", "Regional services", "area", "region"),
-        Container("global", "IAM (global)", "area", None),
-    ]
-    vpcs = set(of("aws_vpc"))
-    for v in sorted(vpcs):
-        cidr = _s(R[v].body.get("cidr_block"))
-        containers.append(Container(v, f"VPC {R[v].name}" + (f" · {cidr}" if cidr else ""), "vpc", "region"))
+    present = sorted({clouds.cloud(r.type) for r in R.values()} - {""}) or ["aws"]
+    containers = []
+    area = {}  # cloud → (its container, services area, identities area)
+    for c in present:
+        (root, root_label), (svc, svc_label), (ids, ids_label) = clouds.AREAS[c]
+        containers += [
+            Container(root, root_label, "region", None),
+            Container(svc, svc_label, "area", root),
+            Container(ids, ids_label, "area", None),
+        ]
+        area[c] = (root, svc, ids)
+
+    def home(rtype: str, i: int) -> str:
+        return area.get(clouds.cloud(rtype), area[present[0]])[i]
+
+    for v in sorted(of(*clouds.NETWORKS)):
+        t = R[v].type
+        cidr = ", ".join(_s(x) for x in _list(R[v].body.get(clouds.NETWORK_CIDR.get(t, ""))))
+        containers.append(
+            Container(v, f"{clouds.NETWORKS[t]} {R[v].name}" + (f" · {cidr}" if cidr else ""), "vpc", home(t, 0))
+        )
     subnet_vpc = {}
-    for sn in sorted(of("aws_subnet")):
-        vpc = (targets(sn, "aws_vpc") or ["region"])[0]
+    for sn in sorted(of(*clouds.SUBNETS)):
+        t = R[sn].type
+        vpc = (targets(sn, *clouds.NETWORKS) or [home(t, 0)])[0]
         subnet_vpc[sn] = vpc
         az = _s(R[sn].body.get("availability_zone")).strip('"')
         if "${" in az:
             tail = re.sub(r"\$\{[^}]*\}", "", az)
             az = f"AZ {tail}" if tail else ""
-        cidr = _s(R[sn].body.get("cidr_block"))
+        cidr = ", ".join(_s(x) for x in _list(R[sn].body.get(clouds.SUBNETS[t])))
+        kind = ("Public subnet" if sn in public else "Private subnet") if t == "aws_subnet" else "Subnet"
         containers.append(
             Container(
                 sn,
-                f"{'Public' if sn in public else 'Private'} subnet {R[sn].name}"
-                + (f" · {cidr}" if cidr and "${" not in cidr else ""),
+                f"{kind} {R[sn].name}" + (f" · {cidr}" if cidr and "${" not in cidr else ""),
                 "subnet",
                 vpc,
                 sn in public,
@@ -291,10 +312,7 @@ def build(g: graph.Graph, findings: list[scanners.Finding] = ()) -> Model:
         for sg in targets(r, "aws_security_group"):
             for c in cidrs:
                 sg_rules[sg].append((_ports(b), _s(c), r))
-    open_rules = {
-        sg: sorted({(p, origin) for p, c, origin in rules if c in ("0.0.0.0/0", "::/0")})
-        for sg, rules in sg_rules.items()
-    }
+    exposed, public_ips = clouds.exposure(R, targets, sources, of)
 
     # --- components, placed by their own references
     comps: dict[str, Component] = {}
@@ -302,33 +320,43 @@ def build(g: graph.Graph, findings: list[scanners.Finding] = ()) -> Model:
         if r.mode != "managed" or r.type not in COMPONENTS:
             continue
         glyph, cat, tname = COMPONENTS[r.type]
-        subs = targets(a, "aws_subnet") + [
-            s for grp in targets(a, "aws_db_subnet_group") for s in targets(grp, "aws_subnet")
+        subs = targets(a, *clouds.SUBNETS) + [
+            s
+            for via in targets(a, "aws_db_subnet_group", "azurerm_network_interface")
+            for s in targets(via, *clouds.SUBNETS)
         ]
         if r.type in GLOBAL:
-            parent = "global"
+            parent = home(r.type, 2)
         elif r.type in REGIONAL:
-            parent = "regional"
+            parent = home(r.type, 1)
         elif len(set(subs)) == 1:
             parent = subs[0]
         elif subs:
-            parent = subnet_vpc.get(subs[0], "region")
+            parent = subnet_vpc.get(subs[0], home(r.type, 0))
         else:
-            vpc = targets(a, "aws_vpc") or [
+            vpc = targets(a, *clouds.NETWORKS) or [
                 v for sg in targets(a, "aws_security_group") for v in targets(sg, "aws_vpc")
             ]
-            parent = vpc[0] if vpc else "regional"
+            parent = vpc[0] if vpc else home(r.type, 1)
         badges = []
         for sg in targets(a, "aws_security_group"):
             rules = sg_rules.get(sg, [])
-            open_ = sorted({p for p, c, _ in rules if c in ("0.0.0.0/0", "::/0")})
-            if open_:
-                badges.append(Badge(f"open to internet: {', '.join(open_)}", True))
+            opened = sorted({(p, o) for p, c, o in rules if c in ("0.0.0.0/0", "::/0")})
+            if opened:
+                exposed.setdefault(a, []).extend(opened)
             elif rules:
                 badges.append(Badge(f"SG {R[sg].name}: {', '.join(sorted({p for p, _, _ in rules}))}"))
+        # what the internet reaches on it: ports through a firewall, or a reason (a public container, every address)
+        ports = sorted({w for w, _ in exposed.get(a, []) if w == "all" or w[:1].isdigit()})
+        reasons = sorted({w for w, _ in exposed.get(a, []) if w not in ports})
+        if ports:
+            badges.append(Badge(f"open to internet: {', '.join(ports)}", True))
+        if reasons:
+            badges.append(Badge(f"public: {'; '.join(reasons)}", True))
         b = r.body
-        if _bool(b.get("associate_public_ip_address")):
+        if _bool(b.get("associate_public_ip_address")) or a in public_ips:
             badges.append(Badge("public IP", True))
+        badges += [Badge(text, risky) for text, risky in clouds.badges(r.type, b)]
         if _bool(b.get("publicly_accessible")):
             badges.append(Badge("publicly accessible", True))
         if r.type == "aws_instance":
@@ -344,9 +372,10 @@ def build(g: graph.Graph, findings: list[scanners.Finding] = ()) -> Model:
         comps[a] = Component(a, r.type, r.name, glyph, cat, tname, parent, r.file, r.line, r.module, badges)
 
     # IAM plumbing as badges
-    for a in of("aws_iam_access_key"):
-        for u in targets(a, "aws_iam_user"):
-            comps[u].badges.append(Badge("long-lived access key", True))
+    for a in of("aws_iam_access_key", "google_service_account_key"):
+        for u in targets(a, "aws_iam_user", "google_service_account"):
+            if u in comps:
+                comps[u].badges.append(Badge("long-lived access key", True))
     for a in of(
         "aws_iam_role_policy",
         "aws_iam_user_policy",
@@ -437,7 +466,8 @@ def build(g: graph.Graph, findings: list[scanners.Finding] = ()) -> Model:
                 {
                     u
                     for t in targets(a)
-                    if R[t].mode == "managed" and R[t].type not in ("aws_vpc", "aws_subnet")
+                    if R[t].mode == "managed"
+                    and R[t].type not in {*clouds.NETWORKS, *clouds.SUBNETS, "azurerm_resource_group"}
                     for u in users(t)
                 }
             )
@@ -456,4 +486,5 @@ def build(g: graph.Graph, findings: list[scanners.Finding] = ()) -> Model:
 
     used = {c.parent for c in comps.values()} | {c.parent for c in containers if c.parent}
     containers = [c for c in containers if c.id in used or c.kind in ("vpc", "subnet")]
-    return Model(g.root, containers, list(comps.values()), list(conns.values()), loose, open_rules)
+    exposed = {a: sorted(set(v)) for a, v in exposed.items() if a in comps}
+    return Model(g.root, containers, list(comps.values()), list(conns.values()), loose, exposed)

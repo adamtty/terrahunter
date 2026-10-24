@@ -165,8 +165,8 @@ def render(folder: str, results: list[RootResult]) -> str:
         f"{total} attack path{'s' if total != 1 else ''}" + (f", {crit} critical" if crit else ""),
         "",
         (
-            "Paths are mapped from the configuration alone: AWS so far, and Deny statements, conditions and "
-            "permission boundaries aren't evaluated yet, so a grant may be narrower than it reads. Open the diagram "
+            "Paths are mapped from the configuration alone (AWS, Azure and Google Cloud), and deny statements, "
+            "conditions and permission boundaries aren't evaluated yet, so a grant may be narrower than it reads. Open the diagram "
             "(`terrahunter-diagram.html`) to walk through each path."
         ),
         "",

@@ -2,13 +2,15 @@
 
 Deterministic, from the architecture model (stage 3) and its findings (stage 4):
 
-- **entry points**: what the internet reaches directly: an internet-facing load balancer, an instance with a public
-  IP behind a security group open to the internet, a publicly accessible database, a public bucket, a function URL
-  with no auth, a search domain outside a VPC, a public Kubernetes API, and a long-lived access key (anyone who has
-  it can use it from anywhere);
+- **entry points**: what the internet reaches directly: an internet-facing load balancer or application gateway, a
+  VM with a public IP behind a security group, network security group or firewall rule open to the internet, a web
+  app, a function anyone may invoke, a publicly accessible database or one whose firewall admits every address, a
+  public bucket or container, a function URL with no auth, a search domain outside a VPC, a public Kubernetes API, and
+  a long-lived access key or service account key (anyone who has it can use it from anywhere);
 - **hops**: traffic goes where the entry *routes to*, *fronts* or *invokes*; compute it reaches can be compromised
   (how is the weakness at that hop: SSH open, IMDSv1 behind a web port, or the app itself); a compromised workload
-  hands over what it *runs as*; an identity reaches what its policies grant;
+  hands over what it *runs as* (an IAM role, a managed identity, a service account, or GCP's default compute service
+  account); an identity reaches what its policies, role assignments or IAM bindings grant, by service and scope;
 - **where it ends**: the data stores reachable at the end, sensitive ones marked.
 
 A chain is kept when it reaches data, or when it compromises something exposed. Severity follows what it reaches
@@ -23,16 +25,20 @@ import itertools
 import re
 from dataclasses import asdict, dataclass, field
 
-from terrahunter import arch, deps, graph
+from terrahunter import arch, clouds, deps, graph
 
-COMPUTE = {
-    "aws_instance",
-    "aws_launch_template",
-    "aws_autoscaling_group",
-    "aws_lambda_function",
-    "aws_ecs_service",
-    "aws_eks_node_group",
-}
+COMPUTE = (
+    {
+        "aws_instance",
+        "aws_launch_template",
+        "aws_autoscaling_group",
+        "aws_lambda_function",
+        "aws_ecs_service",
+        "aws_eks_node_group",
+    }
+    | {t for t, (_, cat, _) in clouds.COMPONENTS.items() if cat == "compute"}
+    | {"azurerm_container_group"}
+)
 # service prefix in an IAM action → the data stores it reaches
 SERVICE_SINKS = {
     "s3": {"aws_s3_bucket"},
@@ -49,7 +55,18 @@ SERVICE_SINKS = {
     "ecr": {"aws_ecr_repository"},
     "elasticfilesystem": {"aws_efs_file_system"},
 }
+SERVICE_SINKS.update(clouds.SERVICE_SINKS)
 SINKS = set().union(*SERVICE_SINKS.values()) | {"aws_ebs_volume"}
+SECRET_STORES = {"aws_secretsmanager_secret", "aws_ssm_parameter", "azurerm_key_vault", "google_secret_manager_secret"}
+FIREWALL = {  # the resource that opens a port → what to call it
+    "aws_security_group": "security group",
+    "aws_security_group_rule": "security group",
+    "aws_vpc_security_group_ingress_rule": "security group",
+    "azurerm_network_security_group": "network security group",
+    "azurerm_network_security_rule": "network security group",
+    "google_compute_firewall": "firewall rule",
+}
+LEAKABLE = {"aws_iam_user": "access key", "google_service_account": "service account key"}
 # AWS managed policies by name → the services they reach ("*": everything)
 MANAGED = {
     "AdministratorAccess": {"*"},
@@ -102,6 +119,8 @@ class Grant:
     actions: list[str]  # for the text: "s3:*", "AdministratorAccess"
     targets: set[str]  # resources the policies name (empty: by service, resource "*" or literal ARNs)
     wide: list[str] = field(default_factory=list)  # the policies granting on every resource (or a broad managed one)
+    # Azure / GCP: (services, scope) per role assignment or binding; scope None = the whole subscription or project
+    pairs: list[tuple[set[str], set[str] | None]] = field(default_factory=list)
 
 
 @dataclass
@@ -140,14 +159,28 @@ def _has(comp: arch.Component, text: str) -> bool:
     return any(b.text == text for b in comp.badges)
 
 
-def grants(g: graph.Graph, identity: str) -> Grant:
-    """What an IAM role, user or group's policies reach: the services in their actions, and the resources they name."""
-    R = g.resources
+def _edges(g: graph.Graph) -> tuple[dict[str, list[str]], dict[str, list[str]], dict[tuple[str, str], list[str]]]:
     out_e: dict[str, list[str]] = {}
     in_e: dict[str, list[str]] = {}
+    attrs: dict[tuple[str, str], list[str]] = {}
     for e in g.edges:
         out_e.setdefault(e.source, []).append(e.target)
         in_e.setdefault(e.target, []).append(e.source)
+        attrs.setdefault((e.source, e.target), []).append(e.attr)
+    return out_e, in_e, attrs
+
+
+def grants(g: graph.Graph, identity: str) -> Grant:
+    """What an identity reaches. AWS: an IAM role, user or group's policies (the services in their actions, the
+    resources they name). Azure: the role assignments (and key vault access policies) of a managed identity, or of a
+    workload's system-assigned one. GCP: a service account's IAM bindings, or the default compute service account."""
+    R = g.resources
+    kind = clouds.cloud(R[identity].type) if identity in R else ""
+    if kind == "azure":
+        return _azure_grants(g, identity)
+    if kind == "gcp":
+        return _gcp_grants(g, identity)
+    out_e, in_e, _ = _edges(g)
     policies = [p for p in in_e.get(identity, []) if R[p].type in POLICY_TYPES]
     # a user's or role's groups: their policies count too
     groups = [t for t in out_e.get(identity, []) if R.get(t) and R[t].type == "aws_iam_group"]
@@ -190,6 +223,74 @@ def grants(g: graph.Graph, identity: str) -> Grant:
     return Grant(services, actions, targets, wide)
 
 
+def _azure_grants(g: graph.Graph, principal: str) -> Grant:
+    R = g.resources
+    out_e, in_e, attrs = _edges(g)
+    gr = Grant(set(), [], set())
+    for a in in_e.get(principal, []):
+        if R[a].type == "azurerm_role_assignment":
+            b = R[a].body
+            role = deps.unquote(b.get("role_definition_name")) or ""
+            services = set(clouds.AZURE_ROLES.get(role, set()))
+            for d in out_e.get(a, []):  # a custom role: its actions
+                if R[d].type == "azurerm_role_definition":
+                    role = role or R[d].name
+                    for perm in arch._list(R[d].body.get("permissions")):
+                        for act in arch._list(perm.get("actions") if isinstance(perm, dict) else None):
+                            act = deps.unquote(act) or ""
+                            services |= {svc for rx, svc in clouds.AZURE_ACTIONS if rx.search(act)}
+            if not services:
+                continue
+            scope: set[str] | None = None
+            for t in out_e.get(a, []):
+                if "scope" not in attrs.get((a, t), []) or R[t].mode != "managed":
+                    continue  # a data source (the subscription) or no reference: the whole subscription
+                if R[t].type == "azurerm_resource_group":  # what lives in the group
+                    scope = {x for x in R if t in out_e.get(x, []) and "resource_group_name" in attrs.get((x, t), [])}
+                else:
+                    scope = {t}
+            gr.pairs.append((services, scope))
+            gr.services |= services
+            gr.actions.append(role or "a role")
+            if "*" in services:
+                gr.wide.append(a)
+        elif R[a].type == "azurerm_key_vault_access_policy":
+            vaults = {t for t in out_e.get(a, []) if R[t].type == "azurerm_key_vault"}
+            gr.pairs.append(({"azure-keyvault"}, vaults))
+            gr.services.add("azure-keyvault")
+            gr.actions.append("key vault access policy")
+        elif R[a].type == "azurerm_key_vault" and any("access_policy" in x for x in attrs.get((a, principal), [])):
+            gr.pairs.append(({"azure-keyvault"}, {a}))
+            gr.services.add("azure-keyvault")
+            gr.actions.append("key vault access policy")
+    return gr
+
+
+def _gcp_grants(g: graph.Graph, identity: str) -> Grant:
+    R = g.resources
+    out_e, in_e, attrs = _edges(g)
+    r = R[identity]
+    if r.type != "google_service_account":  # a workload on the default compute service account
+        services, text = clouds.default_sa_services(r.type, r.body)
+        return Grant(services, text, set(), [identity] if "*" in services else [], [(services, None)])
+    gr = Grant(set(), [], set())
+    for b in in_e.get(identity, []):
+        on = clouds.GCP_IAM.get(R[b].type)
+        if on is None:
+            continue
+        role = deps.unquote(R[b].body.get("role")) or ""
+        services = {svc for prefix, svc in clouds.GCP_ROLES if role.startswith(prefix)}
+        if not services:
+            continue
+        scope = None if on == "" else {t for t in out_e.get(b, []) if on in attrs.get((b, t), [])}
+        gr.pairs.append((services, scope))
+        gr.services |= services
+        gr.actions.append(role)
+        if "*" in services:
+            gr.wide.append(b)
+    return gr
+
+
 def build(g: graph.Graph, model: arch.Model) -> Result:
     comps = {c.id: c for c in model.components}
     R = g.resources
@@ -200,7 +301,17 @@ def build(g: graph.Graph, model: arch.Model) -> Result:
 
     def reach(identity: str) -> tuple[list[str], Grant]:
         gr = grants(g, identity)
-        if "*" in gr.services:
+        if gr.pairs:
+            hit = [
+                c.id
+                for c in stores
+                if any(
+                    ("*" in svcs or any(c.type in SERVICE_SINKS.get(x, ()) for x in svcs))
+                    and (scope is None or c.id in scope)
+                    for svcs, scope in gr.pairs
+                )
+            ]
+        elif "*" in gr.services:
             hit = [c.id for c in stores]
         else:
             hit = [c.id for c in stores if any(c.type in SERVICE_SINKS.get(s, ()) for s in gr.services)]
@@ -211,7 +322,7 @@ def build(g: graph.Graph, model: arch.Model) -> Result:
 
     def sensitive(cid: str) -> bool:
         c = comps[cid]
-        return c.type in ("aws_secretsmanager_secret", "aws_ssm_parameter") or bool(SENSITIVE.search(c.name))
+        return c.type in SECRET_STORES or bool(SENSITIVE.search(c.name))
 
     def public_ip(c: arch.Component) -> bool:
         if _has(c, "public IP"):
@@ -219,15 +330,32 @@ def build(g: graph.Graph, model: arch.Model) -> Result:
         sub = R.get(c.parent)  # launched into a subnet that hands out public IPs
         return bool(sub and arch._bool(sub.body.get("map_public_ip_on_launch")))
 
+    def firewall(cid: str) -> str:
+        kinds = sorted({FIREWALL[R[o].type] for _, o in model.exposed.get(cid, []) if o in R and R[o].type in FIREWALL})
+        return " and ".join(kinds) or "firewall"
+
     # --- entry points: (component, why the internet reaches it, the ports)
     entries: list[tuple[str, str]] = []
     for c in model.components:
         b = R[c.id].body if c.id in R else {}
         ports = _ports(c)
+        reasons = next((x.text.removeprefix("public: ") for x in c.badges if x.text.startswith("public: ")), "")
         if c.type in ("aws_lb", "aws_alb", "aws_elb") and not arch._bool(b.get("internal")):
             entries.append((c.id, "internet-facing load balancer" + (f", open on {', '.join(ports)}" if ports else "")))
-        elif c.type in ("aws_instance",) and ports and public_ip(c):
-            entries.append((c.id, f"public IP, security group open to the internet on {', '.join(ports)}"))
+        elif c.type in ("azurerm_application_gateway", "azurerm_lb") and "public_ip_address_id" in str(
+            b.get("frontend_ip_configuration")
+        ):
+            entries.append((c.id, f"internet-facing {c.tname} (a public frontend IP)"))
+        elif c.type in clouds.VMS and ports and public_ip(c):
+            entries.append((c.id, f"public IP, {firewall(c.id)} open to the internet on {', '.join(ports)}"))
+        elif c.type in clouds.WEB_APPS and deps.unquote(b.get("public_network_access_enabled")) != "false":
+            entries.append((c.id, f"{c.tname} on the internet" + (", HTTP allowed" if _has(c, "HTTP allowed") else "")))
+        elif c.type in clouds.SERVERLESS and reasons:
+            entries.append((c.id, f"{c.tname}: {reasons}"))
+        elif c.type in SINKS and reasons:
+            entries.append((c.id, f"public {c.tname}: {reasons}"))
+        elif c.type in ("azurerm_kubernetes_cluster", "google_container_cluster") and clouds.public_k8s(c.type, b):
+            entries.append((c.id, "Kubernetes API endpoint open to the internet"))
         elif c.type in ("aws_db_instance", "aws_rds_cluster") and _has(c, "publicly accessible"):
             entries.append((c.id, "publicly accessible database" + (f", open on {', '.join(ports)}" if ports else "")))
         elif c.type == "aws_s3_bucket" and any(b.text.startswith("ACL public") for b in c.badges):
@@ -241,8 +369,8 @@ def build(g: graph.Graph, model: arch.Model) -> Result:
             pub = not vc or not isinstance(vc[0], dict) or deps.unquote(vc[0].get("endpoint_public_access")) != "false"
             if pub:
                 entries.append((c.id, "Kubernetes API endpoint open to the internet"))
-        elif c.type == "aws_iam_user" and _has(c, "long-lived access key"):
-            entries.append((c.id, "long-lived access key: whoever holds it can use it from anywhere"))
+        elif c.type in LEAKABLE and _has(c, "long-lived access key"):
+            entries.append((c.id, f"long-lived {LEAKABLE[c.type]}: whoever holds it can use it from anywhere"))
 
     chains: list[Chain] = []
     edges: list[dict] = []
@@ -276,7 +404,11 @@ def build(g: graph.Graph, model: arch.Model) -> Result:
         """What an identity reaches, with its grant (and the access edges) added to the chain."""
         sinks, gr = reach(identity)
         if gr.actions:
-            scope = "the resources it names" if gr.targets and "*" not in gr.services else "every resource"
+            if gr.pairs:
+                whole = clouds.cloud(R[identity].type) == "azure" and "the subscription" or "the project"
+                scope = whole if any(sc is None for _, sc in gr.pairs) else "the resources it's scoped to"
+            else:
+                scope = "the resources it names" if gr.targets and "*" not in gr.services else "every resource"
             more = " …" if len(gr.actions) > 6 else ""
             hops.append(f"{identity} grants {', '.join(gr.actions[:6])}{more} on {scope}")
         for t in sinks:  # each edge names the actions for that store's service
@@ -298,7 +430,7 @@ def build(g: graph.Graph, model: arch.Model) -> Result:
                 Chain("critical", "exposed data store", "direct", f"{c.name}: {why}", ["internet"], [eid], hops)
             )
             continue
-        if c.type == "aws_iam_user":
+        if c.type in LEAKABLE:
             hops = list(base)
             sinks = via_identity(eid, hops)
             if sinks:
@@ -318,7 +450,10 @@ def build(g: graph.Graph, model: arch.Model) -> Result:
             if node is None or node.type not in COMPUTE:
                 continue
             roles = [x.target for x in out.get(node.id, []) if x.label == "runs as" and x.target in comps]
-            text, conf = compromise(node, len(path) > 1, bool(roles))
+            # an Azure workload with a system-assigned identity, or a GCP one on the default service account, is its
+            # own identity: no extra step, its grants come from itself
+            own = clouds.system_identity(node.type, R[node.id].body) if node.id in R else ""
+            text, conf = compromise(node, len(path) > 1, bool(roles or own))
             hops = base + [
                 f"{a} {next(x.label for x in out[a] if x.target == b)} {b}" for a, b in itertools.pairwise(path)
             ]
@@ -327,12 +462,15 @@ def build(g: graph.Graph, model: arch.Model) -> Result:
             direct = [x.target for x in out.get(node.id, []) if x.target in comps and comps[x.target].type in SINKS]
             for d in direct:
                 add_edge(node.id, d, next(x.label for x in out[node.id] if x.target == d), "access")
-            for role in roles or [None]:
+            where = "the instance metadata service" if node.type in clouds.VMS else "its environment"
+            for role in roles + ([node.id] if own else []) or [None]:
                 h, steps, sinks = list(hops), ["internet", *path], list(direct)
-                if role:
+                if role == node.id:
+                    h.append(f"{node.id} runs as {own}: its credentials come from {where}")
+                    sinks += [t for t in via_identity(role, h) if t not in sinks]
+                elif role:
                     steps.append(role)
-                    where = "the instance metadata service" if node.type != "aws_lambda_function" else "its environment"
-                    h.append(f"{node.id} runs as {role}: the role's credentials come from {where}")
+                    h.append(f"{node.id} runs as {role}: the identity's credentials come from {where}")
                     sinks += [t for t in via_identity(role, h) if t not in sinks]
                 if sinks:
                     h.append(reached(sinks))
@@ -341,7 +479,7 @@ def build(g: graph.Graph, model: arch.Model) -> Result:
                 kind = " → ".join(
                     ["internet"]
                     + [comps[p].tname for p in path]
-                    + (["role"] if role else [])
+                    + (["identity"] if role else [])
                     + (["data"] if sinks else [])
                 )
                 key = (node.id, role, tuple(sinks))
@@ -357,7 +495,11 @@ def build(g: graph.Graph, model: arch.Model) -> Result:
     for ch in chains:
         if ch.severity:
             continue
-        admin = any("grants" in h and re.search(r"AdministratorAccess|PowerUserAccess|grants \*", h) for h in ch.hops)
+        admin = any(
+            "grants" in h
+            and re.search(r"AdministratorAccess|PowerUserAccess|grants \*|Owner|Contributor|roles/(owner|editor)", h)
+            for h in ch.hops
+        )
         if ch.sinks and (ch.confidence == "likely" or admin or any(sensitive(s) for s in ch.sinks)):
             ch.severity = "critical"
         elif ch.sinks or admin:
@@ -375,6 +517,45 @@ def build(g: graph.Graph, model: arch.Model) -> Result:
 
 
 EFFECT = {"breaks": 0, "narrows": 1, "hardens": 2}
+_PUBLIC_FIX = [  # the resource that makes something public → what to change there
+    (clouds.DB_FIREWALLS, "Remove the firewall rule that admits every address (use private endpoints)"),
+    ({"azurerm_storage_container"}, 'Set container_access_type = "private"'),
+    ({"google_sql_database_instance"}, "Remove 0.0.0.0/0 from authorized_networks (or turn off the public IP)"),
+    ({"google_bigquery_dataset"}, "Remove the allUsers / allAuthenticatedUsers access entry"),
+    (set(clouds.GCP_IAM), "Remove allUsers / allAuthenticatedUsers from the IAM binding"),
+]
+
+
+def _owner_name(g: graph.Graph, origin: str) -> str:
+    """What to call the resource that opens a port: a separate rule goes by the group it belongs to."""
+    R = g.resources
+    if R[origin].type in (
+        "aws_security_group_rule",
+        "aws_vpc_security_group_ingress_rule",
+        "azurerm_network_security_rule",
+    ):
+        groups = [
+            e.target
+            for e in g.edges
+            if e.source == origin
+            and R.get(e.target)
+            and R[e.target].type in ("aws_security_group", "azurerm_network_security_group")
+        ]
+        if groups:
+            return R[groups[0]].name
+    return R[origin].name
+
+
+def _scope_fix(x: arch.Component, own: str) -> str:
+    if "default compute service account" in own:
+        return f"Give {x.name} its own service account with only the roles it needs (not the default one)"
+    if clouds.cloud(x.type) == "azure":
+        return f"Scope {x.name}'s role assignments to the roles and resources it needs"
+    if clouds.cloud(x.type) == "gcp":
+        return f"Grant {x.name} narrower roles than project-wide owner / editor"
+    return f"Scope {x.name}'s policies to the actions and resources it needs"
+
+
 _ENTRY_FIX = {  # entry type → (what to change, the attribute it's about)
     "aws_db_instance": "Set publicly_accessible = false (reach it from inside the VPC)",
     "aws_rds_cluster": "Set publicly_accessible = false on its instances (reach them from inside the VPC)",
@@ -408,29 +589,39 @@ def fixes(g: graph.Graph, model: arch.Model, chains: list[Chain]) -> list[Fix]:
         c = comps.get(entry)
         if c is None:
             continue
-        if c.type == "aws_instance":
-            groups = sorted({e.target for e in g.edges if e.source == entry and e.target in model.open_rules})
-            opened = [(p, o) for sg in groups for p, o in model.open_rules[sg]]
-            if opened:  # one fix per set of rules: instances sharing a group share it
-                ports = ", ".join(sorted({p for p, _ in opened}))
-                names = ", ".join(R[sg].name for sg in groups if model.open_rules[sg])
-                origins = sorted({o for _, o in opened})
-                add(
-                    "close:" + ",".join(origins),
-                    f"Close {ports} to the internet in security group {names}",
-                    "breaks",
-                    origins,
-                    i,
-                )
-        elif c.type == "aws_iam_user":
-            keys = [e.source for e in g.edges if e.target == entry and R[e.source].type == "aws_iam_access_key"]
+        exposed = model.exposed.get(entry, [])
+        opened = [(p, o) for p, o in exposed if o in R and R[o].type in FIREWALL]
+        public = [(w, o) for w, o in exposed if o in R and R[o].type not in FIREWALL]
+        if c.type in clouds.VMS and opened:  # one fix per set of rules: instances sharing a group share it
+            ports = ", ".join(sorted({p for p, _ in opened}))
+            ports = "every port" if ports == "all" else ports
+            origins = sorted({o for _, o in opened})
+            kinds = sorted({FIREWALL[R[o].type] for o in origins})
+            names = ", ".join(sorted({_owner_name(g, o) for o in origins}))
+            add(
+                "close:" + ",".join(origins),
+                f"Close {ports} to the internet in {' / '.join(kinds)} {names}",
+                "breaks",
+                origins,
+                i,
+            )
+        elif c.type in LEAKABLE:
+            keys = [
+                e.source
+                for e in g.edges
+                if e.target == entry and R[e.source].type in ("aws_iam_access_key", "google_service_account_key")
+            ]
             add(
                 f"key:{entry}",
-                f"Delete {c.name}'s long-lived access key; use short-lived credentials (SSO, OIDC)",
+                f"Delete {c.name}'s long-lived {LEAKABLE[c.type]}; use short-lived credentials (SSO, OIDC, workload identity)",
                 "breaks",
                 keys or [entry],
                 i,
             )
+        elif public:
+            for _, o in public:
+                action = next((text for types, text in _PUBLIC_FIX if R[o].type in types), "Make it private")
+                add(f"public:{o}", f"{c.name}: {action}", "breaks", [o], i)
         elif c.type in _ENTRY_FIX:
             add(f"public:{entry}", f"{c.name}: {_ENTRY_FIX[c.type]}", "breaks", [entry], i)
         for s in ch.steps[1:]:
@@ -445,16 +636,11 @@ def fixes(g: graph.Graph, model: arch.Model, chains: list[Chain]) -> list[Fix]:
                     [s],
                     i,
                 )
-            if x.cat == "security":
+            own = clouds.system_identity(x.type, R[s].body) if s in R else ""
+            if (x.cat == "security" or own) and ch.sinks:
                 wide = grants(g, s).wide
-                if wide and ch.sinks:
-                    add(
-                        f"scope:{s}",
-                        f"Scope {x.name}'s policies to the actions and resources it needs",
-                        "narrows",
-                        wide,
-                        i,
-                    )
+                if wide:
+                    add(f"scope:{s}", _scope_fix(x, own), "narrows", wide, i)
     rank = {"critical": 0, "high": 1, "medium": 2}
     for f in found.values():
         f.severity = min((chains[i].severity for i in f.chains), key=rank.__getitem__)
