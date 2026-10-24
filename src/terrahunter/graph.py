@@ -28,7 +28,8 @@ from terrahunter import deps, sandbox
 MAX_DEPTH = 24  # resolution hops through vars, locals and outputs
 _SKIP_ATTRS = {"count", "for_each", "depends_on", "lifecycle", "provider", "provisioner", "connection"}
 _SKIP_HEADS = {"var", "local", "module", "each", "count", "path", "terraform", "self", "data"}
-_RES = re.compile(r"(?<![\w.])(data\.)?([a-z][a-z0-9_]*)\.([A-Za-z0-9_-]+)")
+# a literal index after it (`aws_subnet.pub[0]`, `aws_subnet.q["k"]`) is kept: a plan maps it to that one instance
+_RES = re.compile(r'(?<![\w.])(data\.)?([a-z][a-z0-9_]*)\.([A-Za-z0-9_-]+)(?:\[(\d+|"[^"\]]*")\])?')
 _VAR = re.compile(r"(?<![\w.])var\.([A-Za-z0-9_-]+)")
 _LOCAL = re.compile(r"(?<![\w.])local\.([A-Za-z0-9_-]+)")
 _MOD = re.compile(r"(?<![\w.])module\.([A-Za-z0-9_-]+)(?:\[[^\]]*\])?\.([A-Za-z0-9_-]+)")
@@ -55,6 +56,7 @@ class Edge:
     source: str
     target: str
     attr: str  # the attribute of the source the reference is in (dotted path)
+    index: str = ""  # a literal index the reference names on the target (`0`, `k`), else ""
 
 
 @dataclass
@@ -84,7 +86,7 @@ class Graph:
         return {
             "root": self.root,
             "resources": [{k: v for k, v in asdict(r).items() if k != "body"} for r in self.resources.values()],
-            "edges": [asdict(e) for e in self.edges],
+            "edges": [{k: v for k, v in asdict(e).items() if k != "index" or v} for e in self.edges],
             "unknown": [asdict(u) for u in self.unknown.values()],
             "modules": self.modules,
             "notes": self.notes,
@@ -240,7 +242,8 @@ def build(folder: Path, root: str, with_folders: list[Path] | None = None) -> Gr
                     continue
                 local = f"{'data.' if m.group(1) else ''}{head}.{m.group(3)}"
                 if local in sc.resources:
-                    out.add(sc.resources[local])
+                    idx = (m.group(4) or "").strip('"')
+                    out.add(sc.resources[local] + (f"[{idx}]" if m.group(4) else ""))
             for m in _VAR.finditer(e):
                 out |= lookup(("var", m.group(1)), sc, depth)
             for m in _LOCAL.finditer(e):
@@ -274,12 +277,14 @@ def build(folder: Path, root: str, with_folders: list[Path] | None = None) -> Gr
         for c in sc.children.values():
             yield from scopes(c)
 
-    seen: set[tuple[str, str, str]] = set()
+    seen: set[tuple[str, str, str, str]] = set()
     for sc in scopes(top):
         for addr in sc.resources.values():
             for attr, value in _attrs(g.resources[addr].body):
-                for target in sorted(resolve(value, sc, 0)):
-                    if target != addr and (addr, target, attr) not in seen:
-                        seen.add((addr, target, attr))
-                        g.edges.append(Edge(addr, target, attr))
+                for found in sorted(resolve(value, sc, 0)):
+                    target, _, idx = found.partition("[")
+                    idx = idx[:-1]
+                    if target != addr and (addr, target, attr, idx) not in seen:
+                        seen.add((addr, target, attr, idx))
+                        g.edges.append(Edge(addr, target, attr, idx))
     return g

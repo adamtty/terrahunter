@@ -13,7 +13,7 @@ import os
 import sys
 from pathlib import Path
 
-from terrahunter import __version__, arch, chains, deps, diagram, graph, report, roots, sandbox, scanners
+from terrahunter import __version__, arch, chains, deps, diagram, graph, plan, report, roots, sandbox, scanners
 
 # 1: an attack path at or above --fail-on (it wins over 2: the paths found are real even when some code was unseen)
 EXIT_OK, EXIT_PATHS, EXIT_INCOMPLETE, EXIT_ERROR = 0, 1, 2, 3
@@ -73,6 +73,12 @@ def build_parser(mode: str = "hunt") -> argparse.ArgumentParser:
         help="where to write the diagram (default: terrahunter-diagram.html here; one file per root with --all-roots)",
     )
     ap.add_argument("--no-diagram", action="store_true", help="don't write the diagram")
+    ap.add_argument(
+        "--plan",
+        metavar="PATH",
+        help="a plan for the root, as JSON (`terraform show -json tf.plan > plan.json`; a state works too): every "
+        "instance, with the values that will really be deployed; needs --root (one root)",
+    )
     if mode == "map":
         return ap
     ap.add_argument("--no-scan", action="store_true", help="don't run trivy and checkov")
@@ -293,12 +299,24 @@ def _main(argv: list[str] | None) -> int:
             raise TerrahunterError(f"--with {w}: not a directory")
         withs.append(Path(w))
     complete = not d.notes
+    planned = None
+    if a.plan:
+        if len(chosen) != 1:
+            raise TerrahunterError("--plan is for one root module: pick it with --root")
+        try:
+            planned = plan.load(Path(a.plan))
+        except plan.PlanError as e:
+            raise TerrahunterError(f"--plan {a.plan}: {e}") from None
     graphs = []
     results: list[report.RootResult] = []
     for c in chosen:
         s = resolve(d.folder, c.path, withs, a.fetch_modules)
         show_needs(s)
         g = graph.build(d.folder, c.path, withs)
+        if planned is not None:
+            n = len(g.resources)
+            g = plan.apply(g, planned)
+            print(f"\nPlan: {n} resource blocks → {len(g.resources)} instances")
         show_graph(g)
         scan = None
         if not mapping and not a.no_scan:  # (map has no --no-scan: it never scans)
