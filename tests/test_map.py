@@ -6,7 +6,7 @@ import json
 import pytest
 from test_chains import BUCKETS, NET, ROLE, WILDCARD_S3, instance, sg
 
-from terrahunter import cli, scanners
+from terrahunter import cli, kb, scanners
 
 EXPOSED = (
     NET
@@ -59,3 +59,16 @@ def test_a_folder_called_map(tmp_path, monkeypatch, capsys):
     monkeypatch.chdir(tmp_path)
     _, text = run(["map"], capsys)  # nothing after it: the folder, and the full run
     assert "Attack paths: 1" in text
+
+
+def test_kb_points_at_another_bundle(tmp_path, capsys):
+    (tmp_path / "main.tf").write_text(EXPOSED)
+    try:
+        code, _ = run(["map", str(tmp_path), "--kb", str(kb.PACKAGED)], capsys)  # the shipped one, by path
+        assert code == cli.EXIT_OK
+        with pytest.raises(SystemExit) as e:  # a folder with no dist/ bundle
+            cli.main(["map", str(tmp_path), "--kb", str(tmp_path)])
+        assert e.value.code == cli.EXIT_ERROR
+        assert "can't read the knowledge base" in capsys.readouterr().err
+    finally:
+        kb.use(None)

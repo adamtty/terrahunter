@@ -92,13 +92,22 @@ block or module with `count = 0` (or an empty `for_each`) isn't on the map.
 Exit codes: 0 done, 1 an attack path at or above `--fail-on`, 2 incomplete (something couldn't be read or scanned),
 3 error.
 
+## Where the knowledge comes from
+
+What each resource type is, where it sits, what it connects to, when it's exposed and which settings are risky comes
+from the terrahunter knowledge base, shipped as one file (`src/terrahunter/data/terrahunter-kb.json.gz`): 1,478
+curated AWS, Azure and Google Cloud types with machine-readable conditions, the attack technique rules, AWS actions
+and every AWS managed policy, and the Azure and Google Cloud roles. Its entries cite the providers' and the clouds'
+own documentation; `src/terrahunter/data/NOTICE` lists the sources. `--kb PATH` (or `TERRAHUNTER_KB`) reads another
+bundle, or a knowledge base checkout's `dist/`.
+
 ## Measuring it
 
 `scripts/bench.py` scores the attack paths against the labelled benchmark in
 [terrahunter-kb](https://github.com/adamtty/terrahunter-kb): deliberately vulnerable Terraform (TerraGoat, AWSGoat,
-CloudGoat, IAM Vulnerable, CloudFoxable) with hand-written answer keys. It reports recall (expected paths found, and
-how much of their data), precision (paths that match; those the key contradicts, with its reason) and confidence
-side by side.
+CloudGoat, IAM Vulnerable, CloudFoxable, sadcloud, AzureGoat, GCPGoat) with hand-written answer keys. It reports
+recall (expected paths found, and how much of their data), precision (paths that match; those the key contradicts,
+with its reason) and confidence side by side. Currently: recall 91% of the 67 internet paths, precision 75%.
 
 ```sh
 (cd ../terrahunter-kb && python scripts/bench/fetch.py)   # the projects, at their pinned commits
@@ -121,4 +130,4 @@ report a problem privately.
 
 ## License
 
-[MIT](LICENSE)
+[MIT](LICENSE). The knowledge base bundle's sources are listed in [its NOTICE](src/terrahunter/data/NOTICE).

@@ -18,7 +18,9 @@ The graph has every resource and every reference; a diagram that drew them all w
   bucket's public access block, a group's rule) goes to the components that use it, that it belongs to, or that use
   what it belongs to; one with no component (a provider block, a VPC) stays in the list not on the diagram.
 
-The resource-type knowledge here is a built-in table for now, to be replaced by the knowledge-base catalogue.
+What each type is, where it sits, how it connects, when it's exposed and what's risky comes from the knowledge base's
+catalogue (`kb`). The built-in rules that remain compute what the catalogue leaves to terrahunter (the ports a
+security group opens, the collapsed connections) or judge exposure more finely (`JUDGED`).
 """
 
 from __future__ import annotations
@@ -28,7 +30,8 @@ from dataclasses import asdict, dataclass, field
 
 from terrahunter import clouds, conditions, deps, graph, kb, policies, scanners
 
-# drawable types: type → (glyph, category, short name). Anything else is plumbing (badges / hidden) or not drawn.
+# how terrahunter draws the types it has its own rules for: type → (glyph, category, short name); the catalogue's
+# components are drawn too, named after their service
 COMPONENTS = {
     "aws_instance": ("EC2", "compute", "EC2 instance"),
     "aws_launch_template": ("LT", "compute", "launch template"),
@@ -72,27 +75,7 @@ COMPONENTS = {
     "aws_cognito_user_pool": ("COG", "security", "Cognito user pool"),
     "aws_cognito_identity_pool": ("CID", "security", "Cognito identity pool"),
 }
-REGIONAL = {  # never inside a VPC
-    "aws_s3_bucket",
-    "aws_ecr_repository",
-    "aws_kms_key",
-    "aws_secretsmanager_secret",
-    "aws_ssm_parameter",
-    "aws_sqs_queue",
-    "aws_sns_topic",
-    "aws_dynamodb_table",
-    "aws_cloudfront_distribution",
-    "aws_kinesis_stream",
-    "aws_api_gateway_rest_api",
-    "aws_apigatewayv2_api",
-    "aws_lambda_function_url",
-    "aws_ecs_cluster",
-}
-GLOBAL = {"aws_iam_role", "aws_iam_user", "aws_iam_group"}
-REGIONAL |= {"aws_cognito_user_pool", "aws_cognito_identity_pool"}
 COMPONENTS.update(clouds.COMPONENTS)
-REGIONAL |= clouds.SERVICES
-GLOBAL |= clouds.IDENTITIES
 # reference attribute → what the connection means (first match wins)
 MEANING = [
     (r"user_data|(^|\.)environment|container_definitions", "configured with"),
@@ -493,18 +476,24 @@ def build(g: graph.Graph, findings: list[scanners.Finding] = ()) -> Model:
             for via in targets(a, "aws_db_subnet_group", "azurerm_network_interface")
             for s in targets(via, *clouds.SUBNETS)
         ]
-        e = {} if r.type in COMPONENTS else _kb(r.type)
+        e = _kb(r.type)  # the catalogue's placement; the built-in sets only for types it hasn't curated
         where, placement = e.get("sits_in"), e.get("placement") or []
         for pw in e.get("placement_when") or []:
             if conditions.evaluate(pw.get("test"), a, ix):
                 where, placement = pw.get("sits_in", where), pw.get("placement", placement)
                 break
-        for attr in placement:  # the subnets its placement attributes name, directly or through one resource
+        nets = []
+        for attr in placement:  # the subnets (or networks) its placement attributes name, directly or through one
             for t in targets(a, attr=rf"^{re.escape(attr)}(\.|$)"):
                 subs += [t] if R[t].type in clouds.SUBNETS else targets(t, *clouds.SUBNETS)
-        if r.type in GLOBAL or where == "global" or where == "account" and e.get("category") == "identity":
+                nets += [t] if R[t].type in clouds.NETWORKS else []
+        # subnets its placement names win over a regional default (a search domain in a VPC)
+        regional = where in ("global", "account", "region") or e and where != "vpc"
+        if e.get("category") == "identity" and r.type not in ("aws_cognito_user_pool", "aws_cognito_identity_pool"):
             parent = home(r.type, 2)
-        elif r.type in REGIONAL or where in ("account", "region") or e and not subs and where not in ("vpc", "subnet"):
+        elif not subs and nets and where in ("vpc", "subnet"):
+            parent = nets[0]
+        elif not subs and regional:
             parent = home(r.type, 1)
         elif len(set(subs)) == 1:
             parent = subs[0]

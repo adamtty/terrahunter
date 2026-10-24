@@ -68,19 +68,6 @@ FIREWALL = {  # the resource that opens a port → what to call it
     "azurerm_network_security_rule": "network security group",
     "google_compute_firewall": "firewall rule",
 }
-# AWS managed policies by name → the services they reach ("*": everything)
-MANAGED = {
-    "AdministratorAccess": {"*"},
-    "PowerUserAccess": {"*"},
-    "ReadOnlyAccess": {"*"},
-    "AmazonS3FullAccess": {"s3"},
-    "AmazonS3ReadOnlyAccess": {"s3"},
-    "AmazonDynamoDBFullAccess": {"dynamodb"},
-    "AmazonRDSFullAccess": {"rds"},
-    "SecretsManagerReadWrite": {"secretsmanager"},
-    "AmazonSSMFullAccess": {"ssm"},
-    "AmazonSSMReadOnlyAccess": {"ssm"},
-}
 SENSITIVE = re.compile(
     r"financ|customer|pii|secret|cred|passw|backup|payment|card|personal|patient|payroll|billing|invoice", re.IGNORECASE
 )
@@ -296,7 +283,7 @@ def grants(g: graph.Graph, identity: str) -> Grant:
         docs += [t for d in docs[1:] for t in out_e.get(d, []) if R[t].type == "aws_iam_policy_document"]
         arn = deps.unquote(R[p].body.get("policy_arn")) or ""
         name = arn.rsplit("/", 1)[-1] if arn.startswith("arn:") else ""
-        known = MANAGED.get(name) or (managed_services(name) if name else set())
+        known = managed_services(name) if name else set()
         if known:
             services |= known
             actions.append(name)
@@ -326,7 +313,7 @@ def _azure_grants(g: graph.Graph, principal: str) -> Grant:
         if R[a].type == "azurerm_role_assignment":
             b = R[a].body
             role = deps.unquote(b.get("role_definition_name")) or ""
-            services = set(clouds.AZURE_ROLES.get(role) or role_services(kb.azure_role(role) or []))
+            services = role_services(kb.azure_role(role) or [])
             for d in out_e.get(a, []):  # a custom role: its actions
                 if R[d].type == "azurerm_role_definition":
                     role = role or R[d].name
@@ -374,7 +361,7 @@ def _gcp_grants(g: graph.Graph, identity: str) -> Grant:
         if on is None:
             continue
         role = deps.unquote(R[b].body.get("role")) or ""
-        services = {svc for prefix, svc in clouds.GCP_ROLES if role.startswith(prefix)} or gcp_services(role)
+        services = gcp_services(role)
         if not services:
             continue
         scope = None if on == "" else {t for t in out_e.get(b, []) if on in attrs.get((b, t), [])}

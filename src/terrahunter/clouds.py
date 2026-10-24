@@ -10,7 +10,7 @@ The same model for each cloud:
 - **identities**: what a workload runs as (an IAM role, a managed identity, a service account, or GCP's default
   compute service account) and what its role assignments or IAM bindings reach, by service and by scope.
 
-Like the AWS tables, this is a built-in catalogue for now, to be replaced by the knowledge base.
+Roles and their permissions come from the knowledge base; what's here is the exposure logic terrahunter judges itself.
 """
 
 from __future__ import annotations
@@ -64,31 +64,6 @@ COMPONENTS = {
     "google_kms_crypto_key": ("KMS", "security", "KMS key"),
     "google_service_account": ("SA", "security", "service account"),
 }
-IDENTITIES = {"azurerm_user_assigned_identity", "google_service_account"}
-# never inside a network
-SERVICES = {
-    "azurerm_app_service",
-    "azurerm_linux_web_app",
-    "azurerm_windows_web_app",
-    "azurerm_function_app",
-    "azurerm_linux_function_app",
-    "azurerm_windows_function_app",
-    "azurerm_storage_account",
-    "azurerm_key_vault",
-    "azurerm_sql_server",
-    "azurerm_mssql_server",
-    "azurerm_mysql_server",
-    "azurerm_postgresql_server",
-    "azurerm_cosmosdb_account",
-    "google_cloud_run_service",
-    "google_cloud_run_v2_service",
-    "google_cloudfunctions_function",
-    "google_cloudfunctions2_function",
-    "google_storage_bucket",
-    "google_bigquery_dataset",
-    "google_secret_manager_secret",
-    "google_kms_crypto_key",
-}
 NETWORKS = {"aws_vpc": "VPC", "azurerm_virtual_network": "VNet", "google_compute_network": "VPC network"}
 SUBNETS = {
     "aws_subnet": "cidr_block",
@@ -136,21 +111,7 @@ SERVICE_SINKS = {
     "bigquery": {"google_bigquery_dataset"},
     "gcp-disk": {"google_compute_disk"},
 }
-AZURE_ROLES = {
-    "Owner": {"*"},
-    "Contributor": {"*"},
-    "Storage Blob Data Owner": {"azure-storage"},
-    "Storage Blob Data Contributor": {"azure-storage"},
-    "Storage Blob Data Reader": {"azure-storage"},
-    "Storage Account Contributor": {"azure-storage"},
-    "Key Vault Administrator": {"azure-keyvault"},
-    "Key Vault Secrets Officer": {"azure-keyvault"},
-    "Key Vault Secrets User": {"azure-keyvault"},
-    "SQL Server Contributor": {"azure-sql"},
-    "SQL DB Contributor": {"azure-sql"},
-    "Virtual Machine Contributor": {"azure-disk"},
-}
-AZURE_ACTIONS = [  # custom role action prefix → service
+AZURE_ACTIONS = [  # a role's action or data action (built-in roles from the knowledge base, custom ones) → service
     (re.compile(r"^\*$"), "*"),
     (re.compile(r"^Microsoft\.Storage/", re.IGNORECASE), "azure-storage"),
     (re.compile(r"^Microsoft\.KeyVault/", re.IGNORECASE), "azure-keyvault"),
@@ -158,16 +119,6 @@ AZURE_ACTIONS = [  # custom role action prefix → service
     (re.compile(r"^Microsoft\.DBfor(MySQL|PostgreSQL)/", re.IGNORECASE), "azure-db"),
     (re.compile(r"^Microsoft\.DocumentDB/", re.IGNORECASE), "azure-cosmos"),
     (re.compile(r"^Microsoft\.Compute/disks/", re.IGNORECASE), "azure-disk"),
-]
-GCP_ROLES = [  # role prefix → service
-    ("roles/owner", "*"),
-    ("roles/editor", "*"),
-    ("roles/storage.", "gcs"),
-    ("roles/cloudsql.", "cloudsql"),
-    ("roles/secretmanager.", "gcp-secrets"),
-    ("roles/bigquery.", "bigquery"),
-    ("roles/compute.admin", "gcp-disk"),
-    ("roles/compute.storageAdmin", "gcp-disk"),
 ]
 GCP_PERMISSIONS = [  # a predefined role's permission (from the knowledge base) → the data it reads
     ("storage.objects.", "gcs"),
