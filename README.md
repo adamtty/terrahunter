@@ -63,6 +63,21 @@ terrahunter . --root envs/prod --report terrahunter-report.md
 terrahunter . --all-roots --fail-on critical  # in CI: exit 1 when a critical attack path exists
 ```
 
+### With a plan
+
+Read from the code alone, terrahunter sees one node per resource block, and anything that depends on variables,
+tfvars, conditionals or data sources stays an expression it can't judge. Give it a plan and it sees what will really
+be deployed: every `count` and `for_each` instance (and none of a `count = 0` block), the resolved values (so a
+security group opened by `var.public ? "0.0.0.0/0" : …` shows as open), and connections between instances.
+
+```sh
+terraform plan -out tf.plan && terraform show -json tf.plan > plan.json
+terrahunter . --root envs/prod --plan plan.json     # or: terrahunter map . --root envs/prod --plan plan.json
+```
+
+A state works too (`terraform show -json > state.json`). Making a plan needs the provider's credentials and the
+backend, so it's optional: everything works without one. Values the plan marks sensitive are never used.
+
 Each run prints what each root needs, the scanner findings, the attack paths and what to fix first, and writes
 `terrahunter-diagram.html` (one self-contained page: open it in a browser). `terrahunter map` stops after the
 connections and the diagram (stages 1 to 3): quick, and it needs neither trivy nor checkov. `terrahunter hunt` is the
