@@ -134,20 +134,18 @@ def test_exposed_data_stores_are_direct(tmp_path):
     assert ("internet", "aws_db_instance.billing") in {(e["source"], e["target"]) for e in r.edges}
 
 
-def test_a_long_lived_key_with_admin_through_a_group(tmp_path):
-    r = paths(
-        tmp_path,
-        BUCKETS + 'resource "aws_dynamodb_table" "orders" {}\n'
-        'resource "aws_iam_user" "ci" {}\nresource "aws_iam_access_key" "k" {\n  user = aws_iam_user.ci.name\n}\n'
-        'resource "aws_iam_group" "ops" {}\n'
-        'resource "aws_iam_user_group_membership" "m" {\n  user = aws_iam_user.ci.name\n  groups = [aws_iam_group.ops.name]\n}\n'
-        'resource "aws_iam_group_policy_attachment" "a" {\n  group = aws_iam_group.ops.name\n'
-        '  policy_arn = "arn:aws:iam::aws:policy/AdministratorAccess"\n}\n',
+def test_a_long_lived_key_is_a_badge_not_a_path(tmp_path):
+    (tmp_path / "main.tf").write_text(
+        BUCKETS
+        + 'resource "aws_iam_user" "ci" {}\nresource "aws_iam_access_key" "k" {\n  user = aws_iam_user.ci.name\n}\n'
+        'resource "aws_iam_user_policy_attachment" "a" {\n  user = aws_iam_user.ci.name\n'
+        '  policy_arn = "arn:aws:iam::aws:policy/AdministratorAccess"\n}\n'
     )
-    (c,) = r.chains
-    assert c.kind == "leaked key → data" and c.steps == ["internet", "aws_iam_user.ci"]
-    assert len(c.sinks) == 3 and c.severity == "critical"
-    assert "aws_iam_user.ci grants AdministratorAccess on every resource" in c.hops
+    g = graph.build(tmp_path, ".")
+    m = arch.build(g)
+    user = next(c for c in m.components if c.id == "aws_iam_user.ci")
+    assert any(b.text == "long-lived access key" and b.risk for b in user.badges)
+    assert chains.build(g, m).chains == []  # a key only in Terraform state isn't reachable
 
 
 def test_a_function_url_with_no_auth(tmp_path):

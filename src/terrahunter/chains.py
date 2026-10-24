@@ -5,8 +5,9 @@ Deterministic, from the architecture model (stage 3) and its findings (stage 4):
 - **entry points**: what the internet reaches directly: an internet-facing load balancer or application gateway, a
   VM with a public IP behind a security group, network security group or firewall rule open to the internet, a web
   app, a function anyone may invoke, a publicly accessible database or one whose firewall admits every address, a
-  public bucket or container, a function URL with no auth, a search domain outside a VPC, a public Kubernetes API, and
-  a long-lived access key or service account key (anyone who has it can use it from anywhere);
+  public bucket or container, a function URL with no auth, a search domain outside a VPC, and a public Kubernetes API.
+  A long-lived access key or service account key is a badge, not an entry: a key that exists only in Terraform state
+  isn't something an attacker can reach;
 - **hops**: traffic goes where the entry *routes to*, *fronts* or *invokes*; compute it reaches can be compromised
   (how is the weakness at that hop: SSH open, IMDSv1 behind a web port, or the app itself); a compromised workload
   hands over what it *runs as* (an IAM role, a managed identity, a service account, or GCP's default compute service
@@ -66,7 +67,6 @@ FIREWALL = {  # the resource that opens a port → what to call it
     "azurerm_network_security_rule": "network security group",
     "google_compute_firewall": "firewall rule",
 }
-LEAKABLE = {"aws_iam_user": "access key", "google_service_account": "service account key"}
 # AWS managed policies by name → the services they reach ("*": everything)
 MANAGED = {
     "AdministratorAccess": {"*"},
@@ -369,8 +369,6 @@ def build(g: graph.Graph, model: arch.Model) -> Result:
             pub = not vc or not isinstance(vc[0], dict) or deps.unquote(vc[0].get("endpoint_public_access")) != "false"
             if pub:
                 entries.append((c.id, "Kubernetes API endpoint open to the internet"))
-        elif c.type in LEAKABLE and _has(c, "long-lived access key"):
-            entries.append((c.id, f"long-lived {LEAKABLE[c.type]}: whoever holds it can use it from anywhere"))
 
     chains: list[Chain] = []
     edges: list[dict] = []
@@ -429,15 +427,6 @@ def build(g: graph.Graph, model: arch.Model) -> Result:
             chains.append(
                 Chain("critical", "exposed data store", "direct", f"{c.name}: {why}", ["internet"], [eid], hops)
             )
-            continue
-        if c.type in LEAKABLE:
-            hops = list(base)
-            sinks = via_identity(eid, hops)
-            if sinks:
-                hops.append(reached(sinks))
-                chains.append(
-                    Chain("", "leaked key → data", "possible", f"{c.name}: {why}", ["internet", eid], sinks, hops)
-                )
             continue
         # where the traffic goes: the entry itself, and what it routes to / fronts / invokes (two hops)
         paths = [[eid]]
@@ -603,19 +592,6 @@ def fixes(g: graph.Graph, model: arch.Model, chains: list[Chain]) -> list[Fix]:
                 f"Close {ports} to the internet in {' / '.join(kinds)} {names}",
                 "breaks",
                 origins,
-                i,
-            )
-        elif c.type in LEAKABLE:
-            keys = [
-                e.source
-                for e in g.edges
-                if e.target == entry and R[e.source].type in ("aws_iam_access_key", "google_service_account_key")
-            ]
-            add(
-                f"key:{entry}",
-                f"Delete {c.name}'s long-lived {LEAKABLE[c.type]}; use short-lived credentials (SSO, OIDC, workload identity)",
-                "breaks",
-                keys or [entry],
                 i,
             )
         elif public:

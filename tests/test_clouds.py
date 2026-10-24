@@ -228,14 +228,13 @@ def test_gcp_cloud_run_anyone_can_invoke_to_a_secret(tmp_path):
     assert "anyone may invoke it" in c.entry
 
 
-def test_gcp_service_account_key(tmp_path):
-    _, _, r = build(
+def test_gcp_service_account_key_is_a_badge_not_a_path(tmp_path):
+    _, m, r = build(
         tmp_path,
         'resource "google_service_account" "ci" {}\nresource "google_service_account_key" "k" {\n'
         "  service_account_id = google_service_account.ci.name\n}\n"
         'resource "google_storage_bucket" "b" {}\nresource "google_project_iam_member" "ed" {\n'
         '  role = "roles/editor"\n  member = "serviceAccount:${google_service_account.ci.email}"\n}\n',
     )
-    (c,) = r.chains
-    assert c.kind == "leaked key → data" and c.sinks == ["google_storage_bucket.b"]
-    assert r.fixes[0].where[0]["address"] == "google_service_account_key.k"
+    assert "long-lived access key" in {b.text for b in comp(m, "google_service_account.ci").badges}
+    assert r.chains == []

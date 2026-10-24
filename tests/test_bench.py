@@ -21,9 +21,7 @@ def kb(tmp_path, key: list[dict]) -> Path:
         + WILDCARD_S3
         + sg("web", 80)
         + instance("web", "pub", "web", "  iam_instance_profile = aws_iam_instance_profile.app.name\n")
-        + 'resource "aws_iam_user" "ci" {}\nresource "aws_iam_access_key" "k" {\n  user = aws_iam_user.ci.name\n}\n'
-        'resource "aws_iam_user_policy" "p" {\n  user = aws_iam_user.ci.name\n  policy = <<EOF\n'
-        '{"Statement": [{"Effect": "Allow", "Action": "s3:*", "Resource": "*"}]}\nEOF\n}\n'
+        + 'resource "aws_s3_bucket" "site" {\n  acl = "public-read"\n}\n'
     )
     (tmp_path / "kb" / "bench" / "demo").mkdir(parents=True)
     (tmp_path / "kb" / "bench" / "demo" / "expected.json").write_text(json.dumps(key))
@@ -50,7 +48,7 @@ def test_recall_precision_and_contradictions(tmp_path, capsys):
                 path("D-02", "aws_lb.missing", ["aws_s3_bucket.logs"]),
                 path("D-03", "aws_iam_role.app", [], steps=["attacker-principal", "aws_iam_role.app"]),
             ],
-            "not_paths": [{"resource": "aws_iam_user.ci", "why": "its key is only in state"}],
+            "not_paths": [{"resource": "aws_s3_bucket.site", "why": "public, but it holds nothing"}],
         }
     ]
     folder = kb(tmp_path, key)
@@ -59,9 +57,9 @@ def test_recall_precision_and_contradictions(tmp_path, capsys):
     t = json.loads(out.read_text())["totals"]
     assert (t["expected"], t["found"], t["given_credentials"]) == (2, 1, 1)
     assert t["reach_recall"] == 1.0  # both buckets
-    assert t["contradicted"] == 1 and t["matched"] == 1  # the access-key path is the key's not_path
+    assert t["contradicted"] == 1 and t["matched"] == 1  # the public bucket is the key's not_path
     text = capsys.readouterr().out
-    assert "**missed** D-02" in text and "its key is only in state" in text
+    assert "**missed** D-02" in text and "public, but it holds nothing" in text
 
 
 def test_nothing_fetched(tmp_path, capsys):
