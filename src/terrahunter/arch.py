@@ -431,7 +431,8 @@ def build(g: graph.Graph, findings: list[scanners.Finding] = ()) -> Model:
             for c in cidrs:
                 sg_rules[sg].append((_ports(b), _s(c), r))
     exposed, public_ips = clouds.exposure(R, targets, sources, of)
-    for a, why in policies.aws_exposure(R, targets, sources, of).items():
+    maybe: dict[str, list[tuple[str, str]]] = {}  # possibly exposed: a test or a condition terrahunter can't settle
+    for a, why in policies.aws_exposure(R, targets, sources, of, maybe).items():
         exposed.setdefault(a, []).extend(why)
 
     # --- the catalogue's exposures, where the built-in rules found none: on the component itself, or (for plumbing,
@@ -445,7 +446,6 @@ def build(g: graph.Graph, findings: list[scanners.Finding] = ()) -> Model:
         near = [x for x in targets(a) + [e.source for e in in_edges.get(a, [])] if x in drawn]
         return sorted({x for x in near if not to or R[x].type in to or kb.canonical(R[x].type) in to})
 
-    maybe: dict[str, list[tuple[str, str]]] = {}
     reachable: dict[str, set[str]] = {}  # endpoints every network reaches, that still ask who's calling
     reasoned = {c for c, v in exposed.items() if any(not (w == "all" or w[:1].isdigit()) for w, _ in v)}
     for a, r in R.items():

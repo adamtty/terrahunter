@@ -170,3 +170,16 @@ def test_an_api_that_calls_aws_as_its_role(tmp_path):
     (c,) = r.chains
     assert c.steps == ["internet", "aws_api_gateway_rest_api.api", "aws_iam_role.apigw"]
     assert (c.sinks, c.confidence) == (["aws_s3_bucket.site"], "direct")
+
+
+def test_a_condition_on_an_unknown_value_is_possibly_public(tmp_path):
+    # the policy admits only an address from a variable terrahunter has no value for: not dropped, possible
+    topic = (
+        'variable "ip" {}\nresource "aws_sns_topic" "t" {}\n'
+        'resource "aws_sns_topic_policy" "p" {\n  arn = aws_sns_topic.t.arn\n  policy = jsonencode({\n'
+        '    Statement = [{Effect = "Allow", Principal = "*", Action = ["sns:Subscribe"], Resource = "*",\n'
+        '      Condition = {IpAddress = {"aws:SourceIp" = "${var.ip}/32"}}}]\n  })\n}\n'
+    )
+    (c,) = build(tmp_path, topic).chains
+    assert (c.sinks, c.confidence) == (["aws_sns_topic.t"], "possible")
+    assert "may let any AWS account sns:Subscribe" in c.entry
