@@ -238,3 +238,21 @@ def test_gcp_service_account_key_is_a_badge_not_a_path(tmp_path):
     )
     assert "long-lived access key" in {b.text for b in comp(m, "google_service_account.ci").badges}
     assert r.chains == []
+
+
+@pytest.mark.parametrize(("private", "found"), [("", True), ("true", False)])
+def test_gke_node_pool_nodes_are_instances(tmp_path, private, found):
+    cfg = f"  private_cluster_config {{\n    enable_private_nodes = {private}\n  }}\n" if private else ""
+    _, _, r = build(
+        tmp_path,
+        'resource "google_compute_network" "vpc" {}\nresource "google_compute_subnetwork" "s" {\n'
+        "  network = google_compute_network.vpc.id\n}\n"
+        'resource "google_compute_firewall" "all" {\n  network = google_compute_network.vpc.id\n'
+        '  source_ranges = ["0.0.0.0/0"]\n  allow {\n    protocol = "tcp"\n  }\n}\n'
+        f'resource "google_container_cluster" "c" {{\n  subnetwork = google_compute_subnetwork.s.id\n{cfg}}}\n'
+        'resource "google_container_node_pool" "p" {\n  cluster = google_container_cluster.c.id\n'
+        '  node_config {\n    machine_type = "e2-small"\n  }\n}\n'
+        'resource "google_storage_bucket" "data" {}\n',
+    )
+    entries = {c.steps[1] for c in r.chains if len(c.steps) > 1}
+    assert ("google_container_node_pool.p" in entries) is found

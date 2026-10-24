@@ -38,7 +38,7 @@ COMPUTE = (
         "aws_eks_node_group",
     }
     | {t for t, (_, cat, _) in clouds.COMPONENTS.items() if cat == "compute"}
-    | {"azurerm_container_group"}
+    | {"azurerm_container_group", "google_container_node_pool"}
 )
 # service prefix in an IAM action → the data stores it reaches
 SERVICE_SINKS = {
