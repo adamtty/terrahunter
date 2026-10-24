@@ -109,12 +109,16 @@ def load_dir(d: Path, notes: list[str], label: str) -> list[tuple[str, dict, str
 
 
 _TRAILING = re.compile(r"[ \t]+$", re.MULTILINE)
+_MARKER_SPACES = re.compile(r"^([ \t]*[A-Za-z_][A-Za-z0-9_-]*)[ \t]+$", re.MULTILINE)  # `EOF ` alone on a line
 
 
 def _hcl(text: str) -> dict:
-    """python-hcl2, with one retry: Terraform accepts a heredoc's closing marker followed by spaces (`POLICY `),
-    python-hcl2 rejects the whole file. The retry trims trailing whitespace from every line, which changes nothing
-    the analysis reads (line numbers stay the same)."""
+    """python-hcl2, with one retry. Terraform accepts a heredoc's closing marker followed by spaces (`POLICY `);
+    python-hcl2 doesn't see it as the end, so it either rejects the file or, worse, reads on to a later line that is
+    the same marker and silently swallows every block in between. So a line that is only a marker word and spaces is
+    trimmed first; if the file still doesn't parse, the retry trims trailing whitespace from every line. Neither
+    changes what the analysis reads (line numbers stay the same)."""
+    text = _MARKER_SPACES.sub(r"\1", text)
     try:
         return hcl2.loads(text)
     except Exception:
