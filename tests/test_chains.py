@@ -222,3 +222,34 @@ def test_what_is_stored_in_a_store_comes_with_it(tmp_path):
     )
     (c,) = r.chains
     assert "aws_s3_bucket.customer_exports" in c.sinks and c.within == ["aws_s3_object.report"]
+
+
+@pytest.mark.parametrize(
+    ("own", "sinks"),
+    [
+        ('  managed_policy_arns = ["arn:aws:iam::aws:policy/AmazonS3FullAccess"]\n', ["aws_s3_bucket.logs"]),
+        (
+            (
+                '  inline_policy {\n    name = "i"\n    policy = jsonencode({Statement = [{Effect = "Allow", '
+                'Action = "dynamodb:*", Resource = "*"}]})\n  }\n'
+            ),
+            ["aws_dynamodb_table.orders"],
+        ),
+        ("", []),  # the trust policy alone grants nothing
+    ],
+)
+def test_a_role_s_own_policies(tmp_path, own, sinks):
+    role = (
+        'resource "aws_iam_role" "app" {\n  assume_role_policy = jsonencode({Statement = [{Effect = "Allow", '
+        'Principal = {Service = "ec2.amazonaws.com"}, Action = "sts:AssumeRole"}]})\n' + own + "}\n"
+        'resource "aws_iam_instance_profile" "app" {\n  role = aws_iam_role.app.name\n}\n'
+    )
+    r = paths(
+        tmp_path,
+        NET
+        + role
+        + 'resource "aws_s3_bucket" "logs" {}\nresource "aws_dynamodb_table" "orders" {}\n'
+        + sg("web", 80)
+        + instance("web", "pub", "web", "  iam_instance_profile = aws_iam_instance_profile.app.name\n"),
+    )
+    assert sorted(s for c in r.chains for s in c.sinks) == sinks

@@ -85,7 +85,12 @@ POLICY_TYPES = (
     "aws_iam_user_policy_attachment",
     "aws_iam_group_policy_attachment",
     "aws_iam_policy_attachment",
+    "aws_iam_role_policy_attachments_exclusive",
+    "aws_iam_user_policy_attachments_exclusive",
+    "aws_iam_group_policy_attachments_exclusive",
 )
+# an identity's own attributes that hold or name its policies (not its trust policy)
+OWN_POLICIES = re.compile(r"^(inline_policy|managed_policy_arns)(\.|$)")
 
 
 # --- the knowledge base: data stores beyond the built-in table, managed policies and roles by their permissions
@@ -271,7 +276,7 @@ def grants(g: graph.Graph, identity: str) -> Grant:
         return _azure_grants(g, identity)
     if kind == "gcp":
         return _gcp_grants(g, identity)
-    out_e, in_e, _ = _edges(g)
+    out_e, in_e, attrs = _edges(g)
     policies = [p for p in in_e.get(identity, []) if R[p].type in POLICY_TYPES]
     # a user's or role's groups: their policies count too
     groups = [t for t in out_e.get(identity, []) if R.get(t) and R[t].type == "aws_iam_group"]
@@ -288,18 +293,32 @@ def grants(g: graph.Graph, identity: str) -> Grant:
     actions: list[str] = []
     targets: set[str] = set()
     wide: list[str] = []
+    # the identity's (and its groups') own inline_policy blocks and managed_policy_arns count as well
+    policies += [x for x in [identity, *groups] if x in R]
     for p in policies:
-        docs = [p] + [t for t in out_e.get(p, []) if R[t].type in ("aws_iam_policy", "aws_iam_policy_document")]
-        docs += [t for d in docs[1:] for t in out_e.get(d, []) if R[t].type == "aws_iam_policy_document"]
-        arn = deps.unquote(R[p].body.get("policy_arn")) or ""
-        name = arn.rsplit("/", 1)[-1] if arn.startswith("arn:") else ""
-        known = managed_services(name) if name else set()
-        if known:
-            services |= known
-            actions.append(name)
-            wide.append(p)
-        for d in docs:
-            text = str(R[d].body)
+        b = R[p].body
+        own = p == identity or p in groups
+        refs = [
+            t
+            for t in out_e.get(p, [])
+            if R[t].type in ("aws_iam_policy", "aws_iam_policy_document")
+            and (not own or any(OWN_POLICIES.search(a) for a in attrs.get((p, t), [])))
+        ]
+        docs = ([] if own else [p]) + refs
+        docs += [t for d in refs for t in out_e.get(d, []) if R[t].type == "aws_iam_policy_document"]
+        arns = [b.get("policy_arn")] + arch._list(b.get("policy_arns")) + arch._list(b.get("managed_policy_arns"))
+        for arn in (deps.unquote(x) or "" for x in arns if x):
+            name = arn.rsplit("/", 1)[-1] if arn.startswith("arn:") else ""
+            known = managed_services(name) if name else set()
+            if known:
+                services |= known
+                actions.append(name)
+                if p not in wide:
+                    wide.append(p)
+        texts = [(d, str(R[d].body)) for d in docs]
+        if own:
+            texts += [(p, str(blk)) for blk in arch._list(b.get("inline_policy")) if isinstance(blk, dict)]
+        for d, text in texts:
             if _ANY_ACTION.search(text):
                 services.add("*")
                 actions.append("*")
@@ -311,7 +330,15 @@ def grants(g: graph.Graph, identity: str) -> Grant:
                 if f"{svc}:{act}" not in actions:
                     actions.append(f"{svc}:{act}")
             if not _ANY_RESOURCE.search(text):
-                targets |= {t for t in out_e.get(d, []) if R.get(t) and kb_store(R[t].type)}
+                # the stores a document names (an inline block's references are the identity's, mixed with others)
+                named = (
+                    out_e.get(d, [])
+                    if d != p or not own
+                    else [
+                        t for t in out_e.get(p, []) if any(a.startswith("inline_policy") for a in attrs.get((p, t), []))
+                    ]
+                )
+                targets |= {t for t in named if R.get(t) and kb_store(R[t].type)}
     return Grant(services, actions, targets, wide)
 
 
