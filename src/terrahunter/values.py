@@ -101,8 +101,9 @@ def _balanced(s: str, start: int) -> int:
 class Evaluator:
     """Evaluates expressions with `resolve(kind, name)` supplying var.x / local.x (raise Unknown when unset)."""
 
-    def __init__(self, resolve: Callable[[str, str], object]):
+    def __init__(self, resolve: Callable[[str, str], object], read: Callable[[str], str] | None = None):
         self.resolve = resolve
+        self.read = read  # file(path) → its text (raise Unknown when it can't be read); None: file() is unknown
         self.depth = 0
 
     # --- the parser's values
@@ -261,7 +262,7 @@ class Evaluator:
         if kind == "num":
             return float(tok) if "." in tok else int(tok)
         if kind == "str":
-            return Evaluator(self.resolve).template(tok) if "${" in tok else tok.replace('\\"', '"')
+            return Evaluator(self.resolve, self.read).template(tok) if "${" in tok else tok.replace('\\"', '"')
         if kind == "op" and tok == "(":
             v = self._ternary()
             self._take(")")
@@ -296,7 +297,7 @@ class Evaluator:
                 return tok == "true"
             if tok == "null":
                 return None
-            if tok in ("var", "local") and self._peek("."):
+            if tok in ("var", "local", "path") and self._peek("."):
                 self.pos += 1
                 name = self.toks[self.pos][1]
                 self.pos += 1
@@ -315,6 +316,18 @@ class Evaluator:
             elif self._peek("..."):
                 raise Unknown("expansion")
         self._take(")")
+        if fn in ("file", "templatefile") and args and isinstance(args[0], str):
+            if self.read is None:
+                raise Unknown(f"{fn}()")
+            text = self.read(args[0])
+            if fn == "templatefile":  # ${name} for the variables given; anything else stays an expression
+                given = args[1] if len(args) > 1 and isinstance(args[1], dict) else {}
+                text = re.sub(
+                    r"\$\{\s*([A-Za-z_][A-Za-z0-9_]*)\s*\}",
+                    lambda m: _tostring(given[m.group(1)]) if m.group(1) in given else m.group(0),
+                    text,
+                )
+            return text
         f = FUNCTIONS.get(fn)
         if f is None:
             raise Unknown(f"function {fn}")

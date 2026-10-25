@@ -43,11 +43,12 @@ def render(model: arch.Model, title: str, scanned: bool = False, paths: chains.R
         e["kind"] = "quiet" if e["quiet"] else STYLE.get(e["label"], "other")
         if e["target"] in {c.id for c in model.components if c.unknown}:
             e["kind"] = "unknown"
-    found = paths.to_dict() if paths else {"chains": [], "edges": [], "fixes": []}
+    found = paths.to_dict() if paths else {"chains": [], "edges": [], "fixes": [], "leaks": []}
     data["edges"] += found["edges"]
+    leaks = [{**c, "leak": True} for c in found.get("leaks", [])]  # after the paths, so fixes' indexes still hold
     data.update(
         target=title,
-        chains=found["chains"],
+        chains=found["chains"] + leaks,
         fixes=found["fixes"],
         internet=bool(found["chains"]),
         scanned=scanned,

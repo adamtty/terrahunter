@@ -23,6 +23,7 @@ from terrahunter import (
     clouds,
     deps,
     diagram,
+    escalate,
     graph,
     kb,
     plan,
@@ -116,6 +117,18 @@ def build_parser(mode: str = "hunt") -> argparse.ArgumentParser:
     if mode == "map":
         return ap
     ap.add_argument("--no-scan", action="store_true", help="don't run trivy and checkov")
+    ap.add_argument(
+        "--as",
+        dest="as_",
+        action="append",
+        default=[],
+        metavar="ADDRESS",
+        help="if these credentials leak: start only from this IAM user or role (its address); repeatable. By default "
+        "every user and role is tried",
+    )
+    ap.add_argument(
+        "--no-credentials", action="store_true", help="don't work out what each identity's credentials would give"
+    )
     ap.add_argument(
         "--report", metavar="PATH", help="write the results as Markdown: the fix list, every path hop by hop, findings"
     )
@@ -296,6 +309,15 @@ def show_chains(r: chains.Result, g: graph.Graph) -> None:
             print(f"       … and {len(r.fixes) - 5} more (--report)")
 
 
+def show_leaks(r: chains.Result) -> None:
+    n = len(r.leaks)
+    print(f"\nIf these credentials leak: {n} identit{'ies' if n != 1 else 'y'} would give an attacker more")
+    for c in r.leaks[:10]:
+        print(f"  {c.severity:<8} {c.confidence:<8} {sandbox.one_line(c.entry, 130)}")
+    if n > 10:
+        print(f"           … and {n - 10} more (--report)")
+
+
 def parse_vars(pairs: list[str]) -> dict:
     """--var NAME=VALUE → {name: value in the parser's shape}. VALUE is read as HCL; if it isn't valid HCL, it's a
     string (as terraform takes `-var region=eu-west-1`)."""
@@ -391,6 +413,12 @@ def _main(argv: list[str] | None) -> int:
         if not mapping:
             paths = chains.build(g, model)
             show_chains(paths, g)
+            if not a.no_credentials:
+                missing = [x for x in a.as_ if x not in g.resources]
+                if missing:
+                    print(f"  --as: not in this root: {', '.join(missing)}")
+                paths.leaks = escalate.leaks(g, model, [x for x in a.as_ if x in g.resources] or None)
+                show_leaks(paths)
         graphs.append((g, scan, paths))
         if paths:
             results.append(report.RootResult(c.path, s, g, model, scan, paths))
@@ -412,7 +440,15 @@ def _main(argv: list[str] | None) -> int:
                     "graphs": [
                         g.to_dict()
                         | ({"scan": sc.to_dict()} if sc else {})
-                        | ({"attack_paths": p.to_dict()["chains"], "fixes": p.to_dict()["fixes"]} if p else {})
+                        | (
+                            {
+                                "attack_paths": p.to_dict()["chains"],
+                                "fixes": p.to_dict()["fixes"],
+                                "if_credentials_leak": p.to_dict()["leaks"],
+                            }
+                            if p
+                            else {}
+                        )
                         for g, sc, p in graphs
                     ],
                 },

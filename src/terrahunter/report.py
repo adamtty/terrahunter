@@ -117,6 +117,25 @@ def _root(r: RootResult) -> list[str]:
             out += ["", f"Fixes: {refs}"]
         out.append("")
 
+    if p.leaks:
+        out += [
+            "### If these credentials leak",
+            "",
+            (
+                "What an attacker holding each identity's credentials could become and reach, worst first: its own "
+                "permissions, roles it can assume, and the privilege-escalation and lateral-movement techniques it has "
+                "the permissions for (the rule ids are the knowledge base's)."
+            ),
+            "",
+        ]
+        for n, c in enumerate(p.leaks, 1):
+            out += [f"#### {n}. {c.severity.upper()} · {c.confidence} · {md(c.entry)}", ""]
+            out += [f"- {md(h)}" for h in c.hops if not h.startswith("reaches:")]
+            reach = next((h for h in c.hops if h.startswith("reaches:")), "")
+            if reach:
+                out.append(f"- **{md(reach)}**")
+            out.append("")
+
     if r.scan:
         out += ["### Findings", ""]
         st = ", ".join(

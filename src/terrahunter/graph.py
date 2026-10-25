@@ -34,6 +34,7 @@ import hcl2
 from terrahunter import deps, sandbox, values
 
 MAX_DEPTH = 24  # resolution hops through vars, locals and outputs
+MAX_FILE_BYTES = 1024 * 1024  # file() / templatefile(): a policy or a template, not a dataset
 _SKIP_ATTRS = {"count", "for_each", "depends_on", "lifecycle", "provider", "provisioner", "connection"}
 _SKIP_HEADS = {"var", "local", "module", "each", "count", "path", "terraform", "self", "data"}
 # a literal index after it (`aws_subnet.pub[0]`, `aws_subnet.q["k"]`) is kept: a plan maps it to that one instance
@@ -293,6 +294,11 @@ def build(
                 v = evaluate(sc.parent.calls[sc.path[-1]][name], sc.parent)
             elif kind == "var" and sc.variables.get(name, _UNSET) is not _UNSET:
                 v = evaluate(sc.variables[name], sc)
+            elif kind == "path" and name in ("module", "root", "cwd"):
+                top = sc
+                while top.parent is not None:
+                    top = top.parent
+                v = str(sc.dir if name == "module" else top.dir)
             else:
                 raise values.Unknown(f"{kind}.{name}")
             known[key] = v
@@ -300,8 +306,22 @@ def build(
 
         return resolve
 
+    def reader(sc: _Scope):
+        def read(p: str) -> str:
+            """file(): a regular file inside the folders under analysis, relative to the module's directory."""
+            path = Path(p) if Path(p).is_absolute() else sc.dir / p
+            try:
+                real = path.resolve()
+                if deps._inside_any(real, allowed) is None:
+                    raise values.Unknown(f"file {p} is outside the folders under analysis")
+                return sandbox.read_regular(real, MAX_FILE_BYTES).decode("utf-8")
+            except (OSError, UnicodeDecodeError) as e:
+                raise values.Unknown(f"file {p}") from e
+
+        return read
+
     def evaluate(v, sc: _Scope):
-        return values.Evaluator(resolver(sc)).value(v)
+        return values.Evaluator(resolver(sc), reader(sc)).value(v)
 
     def deployed(body: dict, sc: _Scope) -> bool:
         """False when count is 0 or for_each is empty, with these values; True when it isn't, or can't be told."""
@@ -422,7 +442,7 @@ def build(
                 return substitute(obj, sc) if isinstance(obj, (dict, list)) else v
             if inner:
                 try:
-                    return values.partial(inner, values.Evaluator(resolver(sc)).expr)
+                    return values.partial(inner, values.Evaluator(resolver(sc), reader(sc)).expr)
                 except values.Unknown:
                     pass
             return v

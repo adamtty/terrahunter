@@ -42,6 +42,7 @@ svg:active{cursor:grabbing}
 <div class="toggle"><button id="b2d" class="on">2D</button><button id="b3d">3D</button></div>
 <button id="all" style="margin-left:8px;border:1px solid var(--line);background:#fff;border-radius:8px;padding:6px 10px;font-size:12px;cursor:pointer">show everything</button>
 <h2>Attack paths</h2><div id="chains"></div>
+<h2>If these credentials leak</h2><div id="leaks"></div>
 <h2>Fix first</h2><div id="fixes"></div>
 <h2>Findings</h2><div id="findings"></div>
 <h2>Selected</h2><div id="info"><span class="meta">Click a chain to walk through it, or a component.</span></div>
@@ -327,8 +328,9 @@ function findList(fs) {
     ((G.loose || []).length ? `<details><summary class="meta">${G.loose.length} not on the diagram</summary>${findList(G.loose)}</details>` : '');
 })();
 // ---------- walkthrough ----------
-const nameOf = id => id === 'internet' ? 'The internet' : (byId[id] ? byId[id].name : id);
+const nameOf = id => id === 'internet' ? 'The internet' : id === 'attacker-principal' ? 'The attacker' : (byId[id] ? byId[id].name : id);
 function hopsAbout(c, id) { if (id === 'internet') return c.hops.filter(x => /^Internet/.test(x));
+  if (id === 'attacker-principal') return c.hops.slice(0, 1);
   const own = c.hops.filter(x => x.includes(id) && !/^reaches:/.test(x));
   // what the identity can do: the chain's "grants" line belongs on the role / user step
   const last = c.steps[c.steps.length - 1];
@@ -378,15 +380,16 @@ function zoomTo(ids) { const bs = ids.map(boxOf).filter(Boolean); if (!bs.length
     view = {k:from.k + (to.k - from.k) * e, x:from.x + (to.x - from.x) * e, y:from.y + (to.y - from.y) * e}; applyView(); if (u < 1) requestAnimationFrame(tick); };
   requestAnimationFrame(tick); }
 
-const list = document.getElementById('chains');
-if (!G.chains.length) list.innerHTML = G.walked ? '<span class="meta">No path from the internet reaches data or a workload an attacker could take over. Click a component to see what it exposes.</span>'
+const list = document.getElementById('chains'), leakBox = document.getElementById('leaks');
+if (!G.chains.some(c => c.leak)) leakBox.innerHTML = G.walked ? '<span class="meta">No identity\'s credentials give more than they should, or credentials weren\'t looked at on this run.</span>' : '';
+if (!G.chains.filter(c => !c.leak).length) list.innerHTML = G.walked ? '<span class="meta">No path from the internet reaches data or a workload an attacker could take over. Click a component to see what it exposes.</span>'
   : '<span class="meta">Attack paths weren\'t mapped on this run. Click a component to see what it exposes.</span>';
 G.chains.forEach((c, i) => {
   const d = document.createElement('div'); d.className = 'chain' + (c.drawn ? '' : ' off');
   d.innerHTML = `<span class="sev ${esc(c.severity)}">${esc(c.severity)}</span><span class="meta">${esc(c.kind)} · ${esc(c.confidence)}</span><div class="entry">${esc(c.entry)}</div>` + (c.drawn ? '' : '<div class="meta">not on the diagram (provider block)</div>');
   d.onclick = () => { if (!c.drawn) return; SEL = i; FOCUS = null; STEP = 0;
     document.querySelectorAll('.chain').forEach(x => x.classList.remove('on')); d.classList.add('on'); showStep(); };
-  list.appendChild(d);
+  (c.leak ? leakBox : list).appendChild(d);
 });
 // the fixes, most valuable first: clicking one walks the worst path it breaks
 const EFF = {breaks:'removes', narrows:'narrows', hardens:'hardens'};

@@ -198,7 +198,10 @@ def test_the_cli_and_the_diagram(tmp_path, capsys):
     assert json.loads(out.read_text())["graphs"][0]["attack_paths"][0]["confidence"] == "likely"
     html = page.read_text()
     blob = json.loads(html.split('type="application/json">', 1)[1].split("</script>", 1)[0])
-    assert blob["internet"] and blob["walked"] and len(blob["chains"]) == 1
+    assert blob["internet"] and blob["walked"] and len([c for c in blob["chains"] if not c.get("leak")]) == 1
+    # and what the role's credentials would give, listed after the paths
+    assert [c["steps"] for c in blob["chains"] if c.get("leak")] == [["attacker-principal", "aws_iam_role.app"]]
+    assert "If these credentials leak: 1 identity" in text
     assert {"internet", "aws_iam_role.app"} <= {e["source"] for e in blob["edges"]}
 
 

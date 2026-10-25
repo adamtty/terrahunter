@@ -198,3 +198,20 @@ def test_a_heredoc_marker_with_spaces_does_not_swallow_what_follows(tmp_path):
     write(tmp_path, {"main.tf": text})
     g = graph.build(tmp_path, ".")
     assert {"null_resource.a", "aws_instance.vm", "null_resource.b"} <= set(g.resources)
+
+
+def test_file_reads_a_policy_inside_the_folder_only(tmp_path):
+    root = tmp_path / "infra"
+    (root / "policies").mkdir(parents=True)
+    (root / "policies" / "p.json").write_text('{"Statement": []}')
+    (tmp_path / "secret.json").write_text('{"leak": true}')
+    write(
+        root,
+        {
+            "main.tf": 'resource "aws_iam_policy" "in" {\n  policy = file("${path.module}/policies/p.json")\n}\n'
+            'resource "aws_iam_policy" "out" {\n  policy = file("../secret.json")\n}\n'
+        },
+    )
+    g = graph.build(root, ".")
+    assert '"Statement"' in g.resources["aws_iam_policy.in"].body["policy"]
+    assert "leak" not in str(g.resources["aws_iam_policy.out"].body["policy"])  # outside the folder: not read
