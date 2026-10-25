@@ -62,7 +62,18 @@ terrahunter map path/to/terraform             # just the map: connections and th
 terrahunter . --root envs/prod --report terrahunter-report.md
 terrahunter . --all-roots --fail-on critical  # in CI: exit 1 when a critical attack path exists
 terrahunter . --as aws_iam_user.ci            # if these credentials leak: only from this identity
+terrahunter ~/estate --estate                 # every root of every repository, analysed as one
 ```
+
+### An estate: many roots as one
+
+Real infrastructure is split across roots and repositories: a bucket in one, the role that reads it in another.
+`--estate` reads every root as usual, then analyses them together, so a path can start in one repository and end
+in another. Each root's resources keep its name (`data-vault/prod: aws_s3_bucket.drop`). Accounts and projects are
+kept apart: a role's `"*"` grant, or a project-wide binding, only reaches resources in its own account or project
+(from the provider's `allowed_account_ids`, an `account_id` local or variable, or the resources' `project`), and a
+resource in another account only when its own policy names the role or its account. Roots that don't say which
+account they're in are treated as separate ones. Give each root its plan as `--plan ROOT=plan.json`.
 
 ### If these credentials leak
 

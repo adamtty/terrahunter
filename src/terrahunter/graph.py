@@ -88,6 +88,7 @@ class Graph:
     info: list[str] = field(default_factory=list)  # worth knowing, not a gap (blocks not deployed)
     module_dirs: dict[str, Path] = field(default_factory=dict, repr=False)  # module address ("" root) → its directory
     folders: list[Path] = field(default_factory=list, repr=False)  # the folders under analysis (the folder, --with)
+    accounts: dict[str, str] = field(default_factory=dict, repr=False)  # an estate: root → its account / project
 
     @property
     def dirs(self) -> list[Path]:
