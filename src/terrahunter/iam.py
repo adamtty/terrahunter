@@ -22,7 +22,7 @@ import re
 from dataclasses import dataclass, field
 from functools import cached_property
 
-from terrahunter import deps, graph, kb, policies
+from terrahunter import clouds, deps, graph, kb, policies
 
 POLICY_TYPES = (
     "aws_iam_role_policy",
@@ -385,6 +385,16 @@ class Assignment:
     actions: list[str]  # lower case patterns (Azure operations / GCP permissions)
     not_actions: list[str]
     scope: set[str] | None  # the resources it covers; None: the whole subscription / project
+    implied: bool = False  # not in the configuration: a grant the cloud adds by default (the default compute account)
+
+    def __post_init__(
+        self,
+    ):  # a role has thousands of literal permissions: a set lookup for those, fnmatch for the rest
+        self._literal = frozenset(p for p in self.actions if not set(p) & set("*?["))
+        self._wild = [p for p in self.actions if set(p) & set("*?[")]
+
+    def grants(self, act: str) -> bool:
+        return act in self._literal or _matches(act, self._wild)
 
 
 class _CloudModel:
@@ -404,10 +414,11 @@ class _CloudModel:
 
     def _covers(self, a: Assignment, action: str, resource: str | None) -> bool:
         act = action.lower()
-        ok = any(fnmatch.fnmatchcase(act, p) for p in a.actions) and not any(
-            fnmatch.fnmatchcase(act, p) for p in a.not_actions
+        return (
+            a.grants(act)
+            and not _matches(act, a.not_actions)
+            and (a.scope is None or resource is None or resource in a.scope)
         )
-        return ok and (a.scope is None or resource is None or resource in a.scope)
 
     def allowed(self, identity: str, action: str, resource: str | None = None) -> bool | None:
         return any(self._covers(a, action, resource) for a in self.assignments(identity))
@@ -499,7 +510,8 @@ class AzureModel(_CloudModel):
 class GcpModel(_CloudModel):
     """Google Cloud IAM: project and resource IAM members and bindings that name a service account, with the role's
     permissions; holding roles/iam.serviceAccountTokenCreator or serviceAccountUser on another service account lets
-    it act as that one."""
+    it act as that one. A workload running as the default compute service account also holds the Editor role Google
+    grants that account (implied, so likely), within its access scopes."""
 
     def assignments(self, identity: str) -> list[Assignment]:
         if identity in self._assignments:
@@ -520,26 +532,52 @@ class GcpModel(_CloudModel):
                     if R.get(x.target) and R[x.target].type.endswith("_iam_custom_role")
                     for p in _list(R[x.target].body.get("permissions"))
                 ]
-            acts = ["*"] if role in ("roles/owner", "roles/editor") else [p.lower() for p in perms]
+            acts = (
+                ["*"] if role == "roles/owner" or role == "roles/editor" and not perms else [p.lower() for p in perms]
+            )
             scope = None
             if not t.startswith(("google_project_iam", "google_organization_iam", "google_folder_iam")):
                 scope = {x.target for x in self.out_e.get(b, []) if not x.attr.startswith(_MEMBER_ATTRS)}
             out.append(Assignment(b, role, acts, [], scope))
+        if identity in R and clouds.system_identity(R[identity].type, R[identity].body) and not self._deprivileged():
+            out.append(self._default_editor(R[identity]))
         self._assignments[identity] = out
         return out
 
+    def _deprivileged(self) -> bool:
+        """The configuration takes the default compute account's automatic Editor grant away."""
+        return any(
+            r.type == "google_project_default_service_accounts"
+            and (deps.unquote(r.body.get("action")) or "").upper() in ("DEPRIVILEGE", "DELETE", "DISABLE")
+            for r in self.g.resources.values()
+        )
+
+    def _default_editor(self, r: graph.Resource) -> Assignment:
+        """The default compute service account's Editor role, which Google grants it when the project is created
+        (unless an organization policy stops it), cut down to what the workload's access scopes let its token call."""
+        perms = [p.lower() for p in kb.gcp_role("roles/editor") or ["*"]]
+        if r.type in ("google_compute_instance", "google_compute_instance_template", "google_container_node_pool"):
+            sa = clouds._block(r.body, "node_config" if r.type == "google_container_node_pool" else "service_account")
+            scopes = [clouds._s(x).rsplit("/", 1)[-1] for x in _list(sa.get("scopes") or sa.get("oauth_scopes"))]
+            if "cloud-platform" not in scopes:
+                allowed = [p for x in scopes for p in _SCOPES.get(x, [])]
+                perms = [p for p in perms if any(fnmatch.fnmatchcase(p, a) for a in allowed)]
+        return Assignment(IMPLIED, "roles/editor", perms, [], None, True)
+
     def access(self, identity: str, resource: str, service: str = "") -> str:
+        return self.access_via(identity, resource)[0]
+
+    def access_via(self, identity: str, resource: str) -> tuple[str, str]:
+        """The access level on a resource, and the binding (or implied grant) that gives it; explicit bindings win
+        a tie."""
         R = self.g.resources
         svc = R[resource].type.split("_")[1] if "_" in R[resource].type else ""
-        best = ""
+        svc = _GCP_PERMISSION_SERVICE.get(svc, svc)
+        best, source = "", ""
         for a in self.assignments(identity):
             if a.scope is not None and resource not in a.scope:
                 continue
-            mine = [
-                p
-                for p in a.actions
-                if p == "*" or p.startswith(f"{svc}.") or svc == "storage" and p.startswith("storage.")
-            ]
+            mine = [p for p in a.actions if p == "*" or p.startswith(f"{svc}.")]
             if not mine:
                 continue
             if "*" in mine or any(p.endswith((".setiampolicy", ".delete")) for p in mine):
@@ -549,8 +587,8 @@ class GcpModel(_CloudModel):
             else:
                 level = "read"
             if LEVELS.get(level, 0) > LEVELS.get(best, 0):
-                best = level
-        return best
+                best, source = level, a.source
+        return best, source
 
     def can_assume(self, principal: str, role: str) -> bool | None:
         """Acting as another service account: token creator or service account user on it, or project-wide."""
@@ -607,7 +645,38 @@ def _azure_writes(op: str) -> bool:
 
 
 def _system_identity(r: graph.Resource) -> bool:
-    """An Azure workload with a system-assigned identity is an identity too."""
+    """A workload that is its own identity: an Azure system-assigned identity, or a Google Cloud workload running as
+    the default compute service account."""
+    if r.type.startswith("google_"):
+        return bool(clouds.system_identity(r.type, r.body))
     if not r.type.startswith("azurerm_"):
         return False
     return any("SystemAssigned" in str(b.get("type", "")) for b in _list(r.body.get("identity")) if isinstance(b, dict))
+
+
+# a resource type's service (google_<service>_…) → the prefix of its permissions, where they differ
+_GCP_PERMISSION_SERVICE = {"firestore": "datastore", "sql": "cloudsql"}
+IMPLIED = "automatic roles/editor grant (default compute service account)"
+# a Google OAuth access scope (its alias, or the tail of its URL) → the permissions a token with it may use
+_SCOPES = {
+    "compute": ["compute.*"],
+    "compute-rw": ["compute.*"],
+    "compute-ro": ["compute.*.get", "compute.*.list"],
+    "compute.readonly": ["compute.*.get", "compute.*.list"],
+    "storage-full": ["storage.*"],
+    "storage-rw": ["storage.*"],
+    "devstorage.full_control": ["storage.*"],
+    "devstorage.read_write": ["storage.*"],
+    "storage-ro": ["storage.*.get", "storage.*.list"],
+    "devstorage.read_only": ["storage.*.get", "storage.*.list"],
+    "datastore": ["datastore.*"],
+    "sql-admin": ["cloudsql.*"],
+    "sqlservice.admin": ["cloudsql.*"],
+    "bigquery": ["bigquery.*"],
+    "pubsub": ["pubsub.*"],
+    "cloud-source-repos": ["source.*"],
+}
+
+
+def _matches(act: str, patterns: list[str] | frozenset[str]) -> bool:
+    return any(fnmatch.fnmatchcase(act, p) for p in patterns)

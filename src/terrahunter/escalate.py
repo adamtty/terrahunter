@@ -158,6 +158,11 @@ def search(g: graph.Graph, model: arch.Model, start: str, im: iam.Models | None 
             return im.allowed(who, action, None)
         return im.allowed(who, action, target)
 
+    def implied(who: str, action: str, target: str | None) -> bool:
+        """Allowed only by a grant the cloud adds by default (the default compute account's Editor role), not one
+        in the configuration: someone may have taken it away."""
+        return not R[who].type.startswith("aws_") and im.why(who, action, target).startswith(iam.IMPLIED)
+
     def identity_of(t: str) -> list[str]:
         """The identity a resource gives whoever controls it: itself for a role, else what it runs as."""
         if R[t].type in ("aws_iam_role", "aws_iam_user", "azurerm_user_assigned_identity", "google_service_account"):
@@ -191,6 +196,8 @@ def search(g: graph.Graph, model: arch.Model, start: str, im: iam.Models | None 
             if any(x is False for x in oks):
                 continue
             conf = base if all(x is True for x in oks) else _min(base, "possible")
+            if not admin and any(implied(who, a, t) for a in acts):
+                conf = _min(conf, "likely")
             if t is not None:
                 ok = _attr_ok(req.get("attributes"), R[t].body)
                 if ok is False:
@@ -289,8 +296,12 @@ def search(g: graph.Graph, model: arch.Model, start: str, im: iam.Models | None 
             for s in [x for x in stores if R[x].type.split("_")[0] == R[who].type.split("_")[0]]:
                 level = "admin" if admin else im.access(who, s, _service(R[s].type))
                 if level:
-                    src = im.why(who, f"{_service(R[s].type)}:*", s) or who
-                    changed |= gain("data", s, who, "grant", f"{who} grants {level} on {s} ({src})", base, level)
+                    if R[who].type.startswith("google_"):
+                        src = im.gcp.access_via(who, s)[1] or who
+                    else:
+                        src = im.why(who, f"{_service(R[s].type)}:*", s) or who
+                    conf = _min(base, "likely") if src.startswith(iam.IMPLIED) else base
+                    changed |= gain("data", s, who, "grant", f"{who} grants {level} on {s} ({src})", conf, level)
             # stores whose own resource policy lets any AWS account in
             for s, why in public.items():
                 changed |= gain("data", s, who, "resource-policy", f"{s}: {why}, so {who} can too", base, "read")
@@ -349,6 +360,8 @@ def search(g: graph.Graph, model: arch.Model, start: str, im: iam.Models | None 
             if r.mode == "managed"
             and re.search(r"^(azurerm_role_assignment|google_project|google_project_iam_\w+)$", r.type)
         ]
+        # and the data kept inside them that isn't drawn: documents, objects, secret versions
+        owned += [a for a, r in R.items() if r.mode == "managed" and (kb.entry(r.type) or {}).get("category") == "data"]
         for s in dict.fromkeys(x for x in owned if R[x].type.startswith(prefix)):
             gain("data", s, g0.via, "admin", f"{g0.via} is the account's administrator", g0.confidence, "admin")
     return res

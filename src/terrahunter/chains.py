@@ -709,6 +709,7 @@ def build(g: graph.Graph, model: arch.Model) -> Result:
         return f"{c.id}: reachable by traffic: a flaw in the application gets code running here", "possible"
 
     controls_of: dict[str, list[str]] = {}
+    held: dict[str, list[str]] = {}  # data an identity reaches that isn't on the diagram (an administrator's documents)
 
     def via_identity(identity: str, hops: list[str]) -> list[str]:
         """What an identity reaches, with its grant (and the access edges) added to the chain."""
@@ -738,7 +739,8 @@ def build(g: graph.Graph, model: arch.Model) -> Result:
                 hops.append(f"with {identity}'s credentials: … and {len(took) - 4} more")
             data = r.data()
             # what it takes over: the identities and compute it becomes, and (as the administrator) the rest
-            others = [a for a, lvl in data.items() if lvl == "admin" and not (a in comps and kb_store(comps[a].type))]
+            others = [a for a, lvl in data.items() if lvl == "admin" and a in comps and not kb_store(comps[a].type)]
+            held[identity] = [a for a in data if a not in comps and a not in controls_of.get(identity, [])]
             controls_of[identity] = list(dict.fromkeys([a for a in took if a != "account"] + others))
             more = [a for a in data if a in comps and kb_store(comps[a].type) and a not in sinks]
             sinks = sinks + sorted(more)
@@ -921,7 +923,9 @@ def build(g: graph.Graph, model: arch.Model) -> Result:
             chains.append(Chain("", "exposed API", conf, f"{comps[eid].name}: {why}", ["internet", eid], [], hops))
 
     for ch in chains:
-        ch.within = sorted({x for s in ch.sinks for x in stored.get(s, [])})
+        ch.within = sorted(
+            {x for s in ch.sinks for x in stored.get(s, [])} | {x for s in ch.steps for x in held.get(s, [])}
+        )
     for ch in chains:
         if ch.severity:
             continue

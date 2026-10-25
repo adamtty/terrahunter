@@ -173,3 +173,23 @@ def test_ssh_with_a_password_set_in_user_data(tmp_path):
         "aws_iam_user.u",
     )
     assert r.path("identity", "aws_iam_role.box")[-1].rule == "ssh-found-password"
+
+
+def test_the_default_compute_account_adds_an_ssh_key_to_an_owner_s_vm(tmp_path):
+    r = search(
+        tmp_path,
+        'data "google_compute_default_service_account" "default" {}\nresource "google_project" "p" {}\n'
+        'resource "google_compute_instance" "dev" {\n  service_account {\n'
+        '    email = data.google_compute_default_service_account.default.email\n    scopes = ["compute-rw"]\n  }\n}\n'
+        'resource "google_service_account" "sa" {}\n'
+        'resource "google_compute_instance" "admin" {\n  service_account {\n'
+        '    email = google_service_account.sa.email\n    scopes = ["cloud-platform"]\n  }\n}\n'
+        'resource "google_project_iam_member" "owner" {\n  role = "roles/owner"\n'
+        '  member = "serviceAccount:${google_service_account.sa.email}"\n}\n'
+        'resource "google_firestore_document" "user" {\n  database = "(default)"\n}\n',
+        "google_compute_instance.dev",
+    )
+    (hop,) = r.path("identity", "google_service_account.sa")
+    assert (hop.rule, hop.confidence) == ("gcp-lat-compute-instance-ssh-key-metadata", "likely")
+    assert r.gains[("admin", "account")].confidence == "likely"
+    assert r.data()["google_firestore_document.user"] == "admin"  # the owner's data, drawn or not
