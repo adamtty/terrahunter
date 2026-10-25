@@ -20,6 +20,7 @@ action on every resource is the account's administrator and reaches everything.
 
 from __future__ import annotations
 
+import fnmatch
 import re
 from dataclasses import dataclass, field
 
@@ -437,7 +438,34 @@ _NARROWING = {  # condition keys that narrow who outside may assume it, and what
 }
 
 
-def _outsiders(im: iam.Models, role: str) -> list[tuple[str, str, str]]:
+_ACCOUNT_NAMES = {"account_id", "aws_account_id", "account", "account_number"}
+
+
+def own_accounts(g: graph.Graph) -> set[str]:
+    """The accounts the configuration is in, where it says so: a provider's allowed_account_ids or the account of
+    the role it assumes, or a local or variable named account_id (or aws_account_id, account) that's a literal id.
+    Ids read from aws_caller_identity are this account wherever they appear."""
+    from terrahunter import deps
+
+    out: set[str] = set()
+    for d in dict.fromkeys(g.module_dirs.values()):
+        for _, doc, _ in deps.load_dir(d, [], str(d)):
+            for block in doc.get("provider") or []:
+                for _, body in block.items() if isinstance(block, dict) else []:
+                    for b in body if isinstance(body, list) else [body]:
+                        if not isinstance(b, dict):
+                            continue
+                        out |= set(re.findall(r"\b\d{12}\b", str(b.get("allowed_account_ids", ""))))
+                        out |= set(re.findall(r"arn:aws[\w-]*:iam::(\d{12}):", str(b.get("assume_role", ""))))
+            for group in [*(doc.get("locals") or []), *(doc.get("variable") or [])]:
+                for name, v in group.items() if isinstance(group, dict) else []:
+                    v = v.get("default") if isinstance(v, dict) else v
+                    if deps._key(name) in _ACCOUNT_NAMES and re.fullmatch(r'"?\d{12}"?', str(v or "")):
+                        out.add(str(v).strip('"'))
+    return out
+
+
+def _outsiders(im: iam.Models, role: str, own: set[str] = frozenset()) -> list[tuple[str, str, str]]:
     """Who outside the configuration a role's trust admits: (who, what narrows it, confidence)."""
     out = []
     for st in im.aws.trust(role):
@@ -450,7 +478,7 @@ def _outsiders(im: iam.Models, role: str) -> list[tuple[str, str, str]]:
             value = value.strip('"')
             if kind == "AWS" and value == "*":
                 who = "any AWS account"
-            elif kind == "AWS" and (m := _OTHER_ACCOUNT.match(value)):
+            elif kind == "AWS" and (m := _OTHER_ACCOUNT.match(value)) and m.group(1) not in own:
                 who = f"account {m.group(1)}" + (
                     f" ({value.rsplit(':', 1)[-1]})" if ":" in value and not value.endswith(":root") else ""
                 )
@@ -464,6 +492,94 @@ def _outsiders(im: iam.Models, role: str) -> list[tuple[str, str, str]]:
     return out
 
 
+# resource policies an outside account may be granted in: (the policy's type, its attribute, the resource's type)
+_RESOURCE_POLICIES = [
+    ("aws_s3_bucket_policy", "policy", "aws_s3_bucket"),
+    ("aws_kms_key", "policy", "aws_kms_key"),
+    ("aws_kms_key_policy", "policy", "aws_kms_key"),
+    ("aws_sns_topic_policy", "policy", "aws_sns_topic"),
+    ("aws_sns_topic", "policy", "aws_sns_topic"),
+    ("aws_sqs_queue_policy", "policy", "aws_sqs_queue"),
+    ("aws_sqs_queue", "policy", "aws_sqs_queue"),
+    ("aws_secretsmanager_secret_policy", "policy", "aws_secretsmanager_secret"),
+    ("aws_ecr_repository_policy", "policy", "aws_ecr_repository"),
+]
+_TRIGGERS = {"aws_lambda_event_source_mapping", "aws_s3_bucket_notification", "aws_sns_topic_subscription"}
+
+
+def resource_grants(g: graph.Graph, own: set[str]) -> list[tuple[str, str, list[str], str, str]]:
+    """What resource policies grant accounts outside the configuration: (resource, who, actions, what narrows it,
+    the policy). A Lambda permission whose principal is another account counts too."""
+    from terrahunter import policies
+
+    R = g.resources
+    out = []
+    for pol_type, attr, kind in _RESOURCE_POLICIES:
+        for a, r in R.items():
+            if r.mode != "managed" or r.type != pol_type or not r.body.get(attr):
+                continue
+            target = (
+                a
+                if pol_type == kind
+                else next(
+                    (e.target for e in g.edges if e.source == a and R.get(e.target) and R[e.target].type == kind), None
+                )
+            )
+            doc = policies.document(r.body.get(attr))
+            sts = policies.statements(doc) if doc else []
+            if not sts:
+                sts = [
+                    st
+                    for e in g.edges
+                    if e.source == a and R.get(e.target) and R[e.target].type == "aws_iam_policy_document"
+                    for st in policies.document_statements(R[e.target].body)
+                ]
+            for st in sts:
+                if st["effect"] != "Allow" or target is None:
+                    continue
+                accts = {
+                    m.group(1)
+                    for p in st["principals"]
+                    if p.startswith("AWS:") and (m := _OTHER_ACCOUNT.match(p[4:].strip('"')))
+                } - own
+                narrowed = ", ".join(sorted({v for k, v in _NARROWING.items() if k in st["conditions"]}))
+                for acct in sorted(accts):
+                    out.append((target, f"account {acct}", sorted(st["actions"]), narrowed, a))
+    for a, r in R.items():
+        if r.mode == "managed" and r.type == "aws_lambda_permission":
+            m = _OTHER_ACCOUNT.match(str(deps_unquote(r.body.get("principal"))))
+            fn = next(
+                (
+                    e.target
+                    for e in g.edges
+                    if e.source == a and R.get(e.target) and R[e.target].type == "aws_lambda_function"
+                ),
+                None,
+            )
+            if m and fn and m.group(1) not in own:
+                out.append((fn, f"account {m.group(1)}", [str(deps_unquote(r.body.get("action")))], "", a))
+    return out
+
+
+def deps_unquote(v):
+    from terrahunter import deps
+
+    return deps.unquote(v) if isinstance(v, str) else v
+
+
+def _level(actions: list[str]) -> str:
+    """The strongest access a list of actions gives, by the knowledge base's access levels."""
+    best = ""
+    for p in actions:
+        if p in ("*", "s3:*", "kms:*", "sns:*", "sqs:*") or p.endswith(":*"):
+            return "admin"
+        for _, lvl in kb.aws_actions(p):
+            mine = iam._KB_LEVEL.get(lvl, "")
+            if iam.LEVELS.get(mine, 0) > iam.LEVELS.get(best, 0):
+                best = mine
+    return best or "read"
+
+
 def outside(g: graph.Graph, model: arch.Model) -> list:
     """From other accounts: each role whose trust policy admits principals outside the configuration (another
     account, any account, a federated identity provider), and what becoming it gives. Worst first."""
@@ -472,9 +588,12 @@ def outside(g: graph.Graph, model: arch.Model) -> list:
     im = iam.Models(g)
     R = g.resources
     comps = {c.id for c in model.components}
+    own = own_accounts(g)
     out = []
+    for target, chain in _granted_paths(g, model, im, own):
+        out.append((RANK[chain.severity], CONF[chain.confidence], -len(chain.sinks), target, chain))
     for role in [a for a, r in R.items() if r.mode == "managed" and r.type == "aws_iam_role"]:
-        who = _outsiders(im, role)
+        who = _outsiders(im, role, own)
         if not who:
             continue
         conf = min((c for _, _, c in who), key=lambda c: CONF[c])
@@ -512,6 +631,114 @@ def outside(g: graph.Graph, model: arch.Model) -> list:
         ch.drawn = role in comps
         out.append((RANK[severity], CONF[conf], -len(stores), role, ch))
     return [x[-1] for x in sorted(out, key=lambda x: x[:4])]
+
+
+def _public_policy_restricted(g: graph.Graph, bucket: str, account_restricts: bool) -> bool:
+    """Whether S3 refuses every cross-account request to the bucket: RestrictPublicBuckets (on the account or the
+    bucket) and a policy that's public. Only the owner's account and AWS services get in then."""
+    from terrahunter import policies
+
+    R = g.resources
+    srcs = [e.source for e in g.edges if e.target == bucket and R.get(e.source)]
+    restricts = account_restricts or any(
+        R[x].type == "aws_s3_bucket_public_access_block" and policies._bool(R[x].body.get("restrict_public_buckets"))
+        for x in srcs
+    )
+    pols = [x for x in srcs if R[x].type == "aws_s3_bucket_policy"]
+    return restricts and any(policies.public_actions(R, x, "policy", lambda *a, **k: []) for x in pols)
+
+
+def _granted_paths(g: graph.Graph, model: arch.Model, im: iam.Models, own: set[str]):
+    """The paths a resource policy opens to another account: the store itself (with the key that encrypts it), or
+    the compute a topic, a queue or a permission lets it feed, and that compute's role."""
+    from terrahunter import chains, policies
+
+    R = g.resources
+    comps = {c.id for c in model.components}
+    by_target: dict[str, list[tuple[str, list[str], str, str]]] = {}
+    for target, who, actions, narrowed, pol in resource_grants(g, own):
+        by_target.setdefault(target, []).append((who, actions, narrowed, pol))
+    restricts_all = any(
+        policies._bool(r.body.get("restrict_public_buckets"))
+        for r in R.values()
+        if r.type == "aws_s3_account_public_access_block"
+    )
+    for target, grants in by_target.items():
+        if R[target].type == "aws_kms_key":
+            continue  # a key is reached with what it encrypts
+        if R[target].type == "aws_s3_bucket" and _public_policy_restricted(g, target, restricts_all):
+            continue  # Block Public Access: a bucket with a public policy takes no cross-account requests at all
+        who = ", ".join(dict.fromkeys(w for w, _, _, _ in grants))
+        actions = sorted({x for _, acts, _, _ in grants for x in acts})
+        narrowed = ", ".join(dict.fromkeys(n for _, _, n, _ in grants if n))
+        conf = "possible" if narrowed else "certain"
+        hops = [
+            f"{who} may {', '.join(actions[:4])} on {target} ({grants[0][3]})"
+            + (f", given {narrowed}" if narrowed else "")
+        ]
+        steps, sinks, controls = ["attacker-principal", target], [], []
+        if _is_store(R[target].type):
+            sinks = [target]
+            # objects encrypted with a customer key: the key must let the same account decrypt
+            keys = [
+                e.target
+                for cfg in (
+                    e.source
+                    for e in g.edges
+                    if e.target == target and R.get(e.source) and "encryption" in R[e.source].type
+                )
+                for e in g.edges
+                if e.source == cfg and R.get(e.target) and R[e.target].type == "aws_kms_key"
+            ]
+            for key in dict.fromkeys(keys):
+                granted = {
+                    w
+                    for t, w, acts, _, _ in resource_grants(g, own)
+                    if t == key and any(fnmatch.fnmatchcase("kms:decrypt", x.lower()) for x in acts)
+                }
+                if any(w in granted for w, _, _, _ in grants):
+                    steps.append(key)
+                    hops.append(f"{key} lets {who} decrypt what it encrypts")
+                else:
+                    conf = "possible"
+                    hops.append(f"{target}'s objects are encrypted with {key}, which doesn't let {who} decrypt them")
+        fed = [
+            fn
+            for t in g.edges
+            if t.target == target and R.get(t.source) and R[t.source].type in _TRIGGERS
+            for fn in (
+                e.target
+                for e in g.edges
+                if e.source == t.source and R.get(e.target) and R[e.target].type == "aws_lambda_function"
+            )
+        ]
+        if R[target].type == "aws_lambda_function":
+            fed = [target]
+        for fn in dict.fromkeys(fed):
+            if fn != target:
+                steps.append(fn)
+                hops.append(f"{target} triggers {fn}: what {who} sends is its input")
+            roles = [c.target for c in model.connections if c.source == fn and c.label == "runs as"]
+            for role in roles[:1]:
+                steps.append(role)
+                r = search(g, model, role, im)
+                data = r.data()
+                sinks += [a for a in sorted(data) if _is_store(R[a].type) and a not in sinks]
+                controls += [a for (k, a) in r.gains if k in ("identity", "control") and a != role]
+                hops.append(f"{fn} runs as {role}: what it's allowed, the input may make it do")
+            conf = conf if R[target].type != "aws_lambda_function" else "possible"
+        if not sinks and not fed:
+            continue
+        if sinks:
+            hops.append("reaches: " + ", ".join(s + (" ⚠sensitive" if _sensitive(R[s]) else "") for s in sinks))
+        sens = any(_sensitive(R[s]) for s in sinks)
+        severity = "critical" if sens and conf == "certain" else "high" if sens or conf == "certain" else "medium"
+        ch = chains.Chain(
+            severity, "from another account", conf, f"{R[target].name}: {who} granted by its policy", steps, sinks, hops
+        )
+        ch.controls = list(dict.fromkeys(controls))
+        ch.drawn = target in comps
+        yield target, ch
 
 
 def leaks(g: graph.Graph, model: arch.Model, starts: list[str] | None = None):

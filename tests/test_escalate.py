@@ -1,5 +1,7 @@
 """If these credentials leak: what an attacker holding one identity can become and reach."""
 
+import pytest
+
 from terrahunter import arch, escalate, graph
 
 
@@ -280,3 +282,57 @@ def test_roles_other_accounts_may_assume(tmp_path):
     assert (
         out["aws_iam_role.vendor"].confidence == "possible" and "the external ID" in out["aws_iam_role.vendor"].hops[0]
     )
+
+
+OUTSIDE_BUCKET = (
+    'locals {\n  account_id = "111111111111"\n}\n'
+    'resource "aws_kms_key" "k" {\n  policy = jsonencode({Statement = [\n'
+    '    {Effect = "Allow", Principal = {AWS = "arn:aws:iam::${local.account_id}:root"}, Action = "kms:*", Resource = "*"},\n'
+    "KEYGRANT  ]})\n}\n"
+    'resource "aws_s3_bucket" "archive" {}\n'
+    'resource "aws_s3_bucket_server_side_encryption_configuration" "e" {\n  bucket = aws_s3_bucket.archive.id\n'
+    '  rule {\n    apply_server_side_encryption_by_default {\n      sse_algorithm = "aws:kms"\n'
+    "      kms_master_key_id = aws_kms_key.k.arn\n    }\n  }\n}\n"
+    'resource "aws_s3_bucket_policy" "p" {\n  bucket = aws_s3_bucket.archive.id\n'
+    '  policy = jsonencode({Statement = [{Effect = "Allow", Principal = {AWS = "arn:aws:iam::444455556666:root"}, '
+    'Action = "s3:GetObject", Resource = "${aws_s3_bucket.archive.arn}/*"}EXTRA]})\n}\n'
+)
+DECRYPT = '    {Effect = "Allow", Principal = {AWS = "arn:aws:iam::444455556666:root"}, Action = "kms:Decrypt", Resource = "*"},\n'
+
+
+@pytest.mark.parametrize(
+    ("key", "extra", "bpa", "want"),
+    [
+        (DECRYPT, "", "", ("certain", ["attacker-principal", "aws_s3_bucket.archive", "aws_kms_key.k"])),
+        ("", "", "", ("possible", ["attacker-principal", "aws_s3_bucket.archive"])),  # can't decrypt what it reads
+        # a public statement too, with RestrictPublicBuckets: S3 takes no cross-account request at all
+        (
+            DECRYPT,
+            ', {Effect = "Allow", Principal = "*", Action = "s3:GetObject", Resource = "*"}',
+            'resource "aws_s3_account_public_access_block" "a" {\n  restrict_public_buckets = true\n}\n',
+            None,
+        ),
+    ],
+)
+def test_a_bucket_policy_that_grants_another_account(tmp_path, key, extra, bpa, want):
+    (tmp_path / "main.tf").write_text(OUTSIDE_BUCKET.replace("KEYGRANT", key).replace("EXTRA", extra) + bpa)
+    g = graph.build(tmp_path, ".")
+    got = [(c.confidence, c.steps) for c in escalate.outside(g, arch.build(g))]
+    assert got == ([want] if want else [])  # and the key's own-account statement is never an outsider
+
+
+def test_a_topic_another_account_may_publish_to_feeds_its_function(tmp_path):
+    (tmp_path / "main.tf").write_text(
+        role("fn", "lambda.amazonaws.com", READ) + 'resource "aws_s3_bucket" "secrets" {}\n'
+        'resource "aws_lambda_function" "writer" {\n  function_name = "w"\n  role = aws_iam_role.fn.arn\n}\n'
+        'resource "aws_sns_topic" "t" {}\n'
+        'resource "aws_sns_topic_subscription" "s" {\n  topic_arn = aws_sns_topic.t.arn\n  protocol = "lambda"\n'
+        "  endpoint = aws_lambda_function.writer.arn\n}\n"
+        'resource "aws_sns_topic_policy" "p" {\n  arn = aws_sns_topic.t.arn\n'
+        '  policy = jsonencode({Statement = [{Effect = "Allow", Principal = {AWS = "arn:aws:iam::444455556666:root"}, '
+        'Action = "sns:Publish", Resource = aws_sns_topic.t.arn}]})\n}\n'
+    )
+    g = graph.build(tmp_path, ".")
+    (c,) = escalate.outside(g, arch.build(g))
+    assert c.steps == ["attacker-principal", "aws_sns_topic.t", "aws_lambda_function.writer", "aws_iam_role.fn"]
+    assert "aws_s3_bucket.secrets" in c.sinks
