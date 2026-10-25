@@ -73,7 +73,10 @@ in another. Each root's resources keep its name (`data-vault/prod: aws_s3_bucket
 kept apart: a role's `"*"` grant, or a project-wide binding, only reaches resources in its own account or project
 (from the provider's `allowed_account_ids`, an `account_id` local or variable, or the resources' `project`), and a
 resource in another account only when its own policy names the role or its account. Roots that don't say which
-account they're in are treated as separate ones. Give each root its plan as `--plan ROOT=plan.json`.
+account they're in are treated as separate ones. Roots that name each other indirectly are linked: a
+`terraform_remote_state` output is the resource the other root's output names, a data source that looks a resource
+up by name (`data "aws_s3_bucket"`, `data "aws_iam_role"`, a secret, a parameter…) is that resource, and a trust
+that names another root's role or account by ARN admits it. Give each root its plan as `--plan ROOT=plan.json`.
 
 ### If these credentials leak
 

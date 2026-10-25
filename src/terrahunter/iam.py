@@ -41,9 +41,15 @@ POLICY_TYPES = (
 IDENTITIES = ("aws_iam_user", "aws_iam_role")
 # a reference in a policy string: ${aws_s3_bucket.data.arn}, ${module.x.aws_iam_role.r.arn}
 _REF = re.compile(r"\$\{(?:data\.)?([a-z][a-z0-9_]*)\.([A-Za-z0-9_-]+)(?:\[[^\]]*\])?\.[A-Za-z0-9_]+\}")
-# the account itself as a principal: its root ARN, its id, or the id read from aws_caller_identity
+# a variable or local in a policy string: ${var.secret_arn}
 _VAR_REF = re.compile(r"\$\{(var|local)\.[A-Za-z0-9_-]+")
+# a data source's attribute, or a remote state's output (${data.terraform_remote_state.core.outputs.bucket_arn})
+_DATA_REF = re.compile(
+    r"\$\{data\.([a-z][a-z0-9_]*)\.([A-Za-z0-9_-]+)(?:\[[^\]]*\])?\."
+    r"(?:(?:outputs|values|nonsensitive_values)\.([A-Za-z0-9_-]+)|[A-Za-z0-9_]+)"
+)
 _MOD_REF = re.compile(r"\$\{module\.([A-Za-z0-9_-]+)(?:\[[^\]]*\])?\.[A-Za-z0-9_-]+\}")
+# the account itself as a principal: its root ARN, its id, or the id read from aws_caller_identity
 _ROOT = re.compile(r":root$|^\d{12}$|^\$\{data\.aws_caller_identity\.[\w-]+\.account_id\}$")
 LEVELS = {"list": 1, "read": 2, "write": 3, "admin": 4}
 _KB_LEVEL = {"List": "list", "Read": "read", "Write": "write", "Tagging": "write", "Permissions management": "admin"}
@@ -243,6 +249,18 @@ class Model:
         r = self.g.resources.get(addr)
         return f"{r.module}." if r and r.module else ""
 
+    def _linked(self, source: str, text: str) -> set[str]:
+        """In an estate, the resources in other roots that the data sources and remote state outputs in a policy's
+        text stand for."""
+        if not self.g.links:
+            return set()
+        out = set()
+        for t, n, output in _DATA_REF.findall(text):
+            for a, o in self.g.links.get(f"{self._module(source)}data.{t}.{n}", []):
+                if not output or not o or o == output:
+                    out.add(a)
+        return out
+
     def _doc(self, addr: str, attr: str, value) -> dict | None:
         """A policy attribute's document: literal JSON or jsonencode, or the data document it names."""
         doc = policies.document(value)
@@ -291,6 +309,7 @@ class Model:
                         if e.target in R
                         and (R[e.target].type.split("_") + [""])[1] in {str(x).lower() for x in services}
                     }
+                targets |= self._linked(source, r)
                 # a module's output (${module.data.secret_arn}): what the reference resolves to, from the edges
                 for name in _MOD_REF.findall(r):
                     inside = f"{self._module(source)}module.{name}"
@@ -447,7 +466,7 @@ class Model:
         R = self.g.resources
         acct = self.g.accounts.get(estate.root_of(identity), "")
         name = self.names.get(identity, set())
-        docs = [R[resource].body.get("policy")] + [
+        docs = [R[resource].body.get("policy"), R[resource].body.get("assume_role_policy")] + [
             R[e.source].body.get("policy") or R[e.source].body.get("principal")
             for e in self.in_e.get(resource, [])
             if R.get(e.source)
@@ -586,6 +605,33 @@ class Model:
         """The services a role trusts (lambda.amazonaws.com)."""
         return {p.split(":", 1)[1].lower() for s in self.trust(role) for p in s.resources if p.startswith("Service:")}
 
+    def _in_account(self, principal: str, role: str, value: str) -> bool:
+        """Whether a principal is in the account a trust's root names. Outside an estate, every principal is; in
+        one, a principal whose root names its account must be in that one, and one whose root doesn't must be in the
+        role's own root. The caller's identity (aws_caller_identity) is the role's own account."""
+        if not self.g.accounts:
+            return True
+        from terrahunter import estate
+
+        m = re.search(r"\b(\d{12})\b", value)
+        if not m:
+            return estate.same_account(self.g, principal, role)
+        acct = self.g.accounts.get(estate.root_of(principal), "")
+        return acct == m.group(1) if acct else estate.root_of(principal) == estate.root_of(role)
+
+    def _named_by_arn(self, principal: str, role: str, value: str) -> bool:
+        """In an estate, whether a trust names a user or role of another root by a literal ARN, in its account."""
+        if not self.g.accounts:
+            return False
+        from terrahunter import estate
+
+        m = re.fullmatch(r'"?arn:aws[\w-]*:iam::(\d{12}):(role|user)/(?:[\w+=,.@-]+/)*([\w+=,.@-]+)"?', value.strip())
+        r = self.g.resources.get(principal)
+        if not m or not r or r.type != f"aws_iam_{m.group(2)}" or estate.root_of(principal) == estate.root_of(role):
+            return False
+        acct = self.g.accounts.get(estate.root_of(principal), "")
+        return m.group(3) in self.names.get(principal, set()) and (not acct or acct == m.group(1))
+
     def can_assume(self, principal: str, role: str) -> bool | None:
         """Whether a user or role can become the role: the trust policy names it, `*`, or the account root and its
         own policies allow sts:AssumeRole on the role. None when only a conditional statement admits it."""
@@ -598,12 +644,24 @@ class Model:
                 if kind != "AWS":
                     continue
                 named = {f"{mod}{t}.{n}" for t, n in _REF.findall(value) if f"{mod}{t}.{n}" in R}
+                named |= self._linked(role, value)
                 if principal in named or value == "*":
                     ok: bool | None = True if not s.conditional else None
                     if value == "*":  # anyone's trust still needs the caller's own permission
                         ok = self.allowed(principal, "sts:AssumeRole", role) if ok else ok
-                elif _ROOT.search(value):  # the account root, written as an ARN or an account id
+                elif _ROOT.search(value) and self._in_account(principal, role, value):
+                    # the account root, written as an ARN or an account id
                     ok = self.allowed(principal, "sts:AssumeRole", role)
+                    ok = None if ok and s.conditional else ok
+                elif self._named_by_arn(principal, role, value):
+                    # another root's identity by its ARN: across accounts its own policy must allow it too
+                    from terrahunter import estate
+
+                    ok = (
+                        True
+                        if estate.same_account(self.g, principal, role)
+                        else self.allowed(principal, "sts:AssumeRole", role)
+                    )
                     ok = None if ok and s.conditional else ok
                 else:
                     continue

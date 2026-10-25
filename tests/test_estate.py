@@ -2,7 +2,7 @@
 
 import pytest
 
-from terrahunter import cli, estate, graph, iam
+from terrahunter import cli, deps, estate, graph, iam
 
 
 def build(tmp_path, roots):
@@ -105,3 +105,97 @@ def test_cli_analyses_the_estate_as_one(tmp_path, monkeypatch, capsys):
     out = capsys.readouterr().out
     assert "Estate: 2 roots analysed together" in out
     assert {p.name for p in tmp_path.glob("*.html")} == {"terrahunter-diagram.html"}
+
+
+def linked(tmp_path, roots):
+    for root, text in roots.items():
+        (tmp_path / root).mkdir(parents=True)
+        (tmp_path / root / "main.tf").write_text(text)
+    graphs = {r: graph.build(tmp_path, r) for r in roots}
+    g = estate.merge(graphs)
+    return g, estate.link(g, {r: deps.survey(tmp_path, r) for r in roots})
+
+
+def reader(resource):
+    return f"""
+resource "aws_iam_role" "app" {{
+  name = "app"
+}}
+resource "aws_iam_role_policy" "read" {{
+  role   = aws_iam_role.app.id
+  policy = jsonencode({{Statement = [{{Effect = "Allow", Action = "s3:GetObject", Resource = "${{{resource}}}/*"}}]}})
+}}
+"""
+
+
+APP = 'module.root["app"].aws_iam_role.app'
+
+
+def test_a_remote_state_output_is_the_other_roots_resource(tmp_path):
+    net = """
+terraform {
+  backend "s3" {
+    bucket = "state"
+    key    = "data.tfstate"
+  }
+}
+resource "aws_s3_bucket" "d" {}
+resource "aws_s3_bucket" "other" {}
+output "bucket_arn" {
+  value = aws_s3_bucket.d.arn
+}
+"""
+    state = (
+        'data "terraform_remote_state" "data" {\n  backend = "s3"\n'
+        '  config = {\n    bucket = "state"\n    key    = "data.tfstate"\n  }\n}\n'
+    )
+    app = aws("111111111111", state + reader("data.terraform_remote_state.data.outputs.bucket_arn"))
+    g, links = linked(tmp_path, {"data": aws("111111111111", net), "app": app})
+    assert links == ["app: data.terraform_remote_state.data → data: aws_s3_bucket.d"]
+    assert {e.output for e in g.edges if e.target.endswith("terraform_remote_state.data")} == {"bucket_arn"}
+    m = iam.Model(g)
+    assert m.access(APP, 'module.root["data"].aws_s3_bucket.d', "s3") == "read"
+    assert m.access(APP, 'module.root["data"].aws_s3_bucket.other', "s3") == ""
+
+
+def test_a_lookup_by_name_is_the_other_roots_resource(tmp_path):
+    app = aws(
+        "111111111111",
+        'data "aws_s3_bucket" "d" {\n  bucket = "partner-drop"\n}\n' + reader("data.aws_s3_bucket.d.arn"),
+    )
+    vault = aws("111111111111", BUCKET + 'resource "aws_s3_bucket" "x" {\n  bucket = "another"\n}\n')
+    g, links = linked(tmp_path, {"app": app, "vault": vault})
+    assert links == ["app: data.aws_s3_bucket.d → vault: aws_s3_bucket.drop"]
+    assert any(e.source.endswith("aws_iam_role_policy.read") and e.target == DROP for e in g.edges)
+    m = iam.Model(g)
+    assert m.access(APP, DROP, "s3") == "read"
+    assert m.access(APP, 'module.root["vault"].aws_s3_bucket.x', "s3") == ""
+
+
+def test_trusts_across_accounts(tmp_path):
+    def target(principal):
+        return aws(
+            "222222222222",
+            'resource "aws_iam_role" "target" {\n  assume_role_policy = jsonencode({Statement = [{Effect = "Allow", '
+            f'Action = "sts:AssumeRole", Principal = {{AWS = "{principal}"}}}}]}})\n}}\n',
+        )
+
+    assume = """
+resource "aws_iam_role_policy" "assume" {
+  role   = aws_iam_role.intake.id
+  policy = jsonencode({Statement = [{Effect = "Allow", Action = "sts:AssumeRole", Resource = "*"}]})
+}
+"""
+    role = 'resource "aws_iam_role" "intake" {\n  name = "intake"\n}\n'
+    tgt = 'module.root["vault"].aws_iam_role.target'
+    for i, (principal, grant, expected) in enumerate(
+        [
+            ("arn:aws:iam::111111111111:role/intake", assume, True),
+            ("arn:aws:iam::111111111111:role/intake", "", False),  # across accounts, its own policy must allow it
+            ("arn:aws:iam::111111111111:root", assume, True),
+            ("arn:aws:iam::333333333333:root", assume, False),  # another account's root
+            ("arn:aws:iam::333333333333:role/intake", assume, False),  # same name, another account
+        ]
+    ):
+        g = build(tmp_path / str(i), {"edge": aws("111111111111", role + grant), "vault": target(principal)})
+        assert iam.Model(g).can_assume(ROLE, tgt) is expected, principal

@@ -440,15 +440,17 @@ def _main(argv: list[str] | None) -> int:
         for path, s, _, _ in built:
             merged_s.needs += s.needs
             merged_s.notes += [f"{path}: {n}" for n in s.notes]
-        units = [
-            (
-                "(estate)",
-                merged_s,
-                estate.merge({p: g for p, _, g, _ in built}),
-                estate.merge({p: w for p, _, _, w in built}),
-            )
-        ]
+        merged = estate.merge({p: g for p, _, g, _ in built})
+        surveys = {p: s for p, s, _, _ in built}
+        links = estate.link(merged, surveys)
+        units = [("(estate)", merged_s, merged, estate.merge({p: w for p, _, _, w in built}))]
         print(f"\nEstate: {len(built)} roots analysed together")
+        if links:
+            print(f"  linked across roots: {len(links)} remote state{'s' if len(links) != 1 else ''} and lookups")
+            for line in links[:12]:
+                print(f"    {line}")
+            if len(links) > 12:
+                print(f"    (+{len(links) - 12} more)")
     else:
         units = built
     for label, s, g, written in units:
