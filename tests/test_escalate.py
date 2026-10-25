@@ -371,3 +371,53 @@ def test_a_new_schedule_passing_a_role_then_the_function_it_invokes(tmp_path):
     assert r.path("identity", "aws_iam_role.sched")[0].rule == "privesc-scheduler-001"  # a schedule it may create
     assert r.gains[("identity", "aws_iam_role.fn")].confidence == "possible"  # it sends the function its input
     assert "aws_dynamodb_table.routes" in r.data()
+
+
+EVENTS = (
+    role("fn", "lambda.amazonaws.com") + 'resource "aws_s3_bucket" "orders" {}\n'
+    'resource "aws_iam_role_policy" "f" {\n  role = aws_iam_role.fn.id\n'
+    '  policy = jsonencode({Statement = [{Effect = "Allow", Action = "s3:*", Resource = "*"}]})\n}\n'
+    'resource "aws_lambda_function" "handler" {\n  function_name = "h"\n  role = aws_iam_role.fn.arn\n}\n'
+    'resource "aws_cloudwatch_event_bus" "bus" {\n  name = "partners"\n}\n'
+    'resource "aws_cloudwatch_event_rule" "r" {\n  event_bus_name = aws_cloudwatch_event_bus.bus.name\n'
+    '  event_pattern = jsonencode({source = ["partner"]})\n}\n'
+    'resource "aws_cloudwatch_event_target" "t" {\n  rule = aws_cloudwatch_event_rule.r.name\n'
+    "  event_bus_name = aws_cloudwatch_event_bus.bus.name\n  arn = aws_lambda_function.handler.arn\n}\n"
+)
+
+
+def test_an_event_bus_feeds_its_rules_targets(tmp_path):
+    (tmp_path / "main.tf").write_text(EVENTS)
+    assert escalate.feeds(graph.build(tmp_path, "."), "aws_cloudwatch_event_bus.bus") == ["aws_lambda_function.handler"]
+
+
+def test_putting_events_on_a_bus_reaches_what_its_targets_run_as(tmp_path):
+    r = search(
+        tmp_path,
+        'resource "aws_iam_user" "u" {}\n'
+        + EVENTS
+        + user_policy(
+            "u", '{Effect = "Allow", Action = "events:PutEvents", Resource = aws_cloudwatch_event_bus.bus.arn}'
+        ),
+        "aws_iam_user.u",
+    )
+    assert ("control", "aws_lambda_function.handler") in r.gains
+    assert r.gains[("identity", "aws_iam_role.fn")].confidence == "possible"
+
+
+def test_a_bus_another_account_may_put_events_on(tmp_path):
+    (tmp_path / "main.tf").write_text(
+        EVENTS
+        + 'resource "aws_cloudwatch_event_bus_policy" "p" {\n  event_bus_name = aws_cloudwatch_event_bus.bus.name\n'
+        '  policy = jsonencode({Statement = [{Effect = "Allow", Principal = {AWS = "arn:aws:iam::444455556666:root"}, '
+        'Action = "events:PutEvents", Resource = aws_cloudwatch_event_bus.bus.arn}]})\n}\n'
+    )
+    g = graph.build(tmp_path, ".")
+    (c,) = escalate.outside(g, arch.build(g))
+    assert c.steps == [
+        "attacker-principal",
+        "aws_cloudwatch_event_bus.bus",
+        "aws_lambda_function.handler",
+        "aws_iam_role.fn",
+    ]
+    assert "aws_s3_bucket.orders" in c.sinks

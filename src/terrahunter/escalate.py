@@ -233,9 +233,10 @@ def search(g: graph.Graph, model: arch.Model, start: str, im: iam.Models | None 
                 changed |= gain("data", t, who, rule["id"], f"{who}: {title} on {t}", conf, da.get("access", "read"))
             ci = becomes.get("controls_input_of")
             if ci:
-                for e in g.edges:  # the compute this resource feeds (a queue's function, a topic's subscriber)
-                    other = e.source if e.target == t else e.target if e.source == t else None
-                    if other and R.get(other) and R[other].type == ci:
+                # the compute this resource feeds: a queue's function, a topic's subscriber, an event bus's targets
+                near = {e.source if e.target == t else e.target for e in g.edges if t in (e.source, e.target)}
+                for other in sorted(near | set(feeds(g, t))):
+                    if R.get(other) and R[other].type == ci:
                         changed |= gain("control", other, who, rule["id"], f"{who}: {title} on {t} feeds {other}", conf)
                         for ident in identity_of(other):
                             changed |= gain(
@@ -520,8 +521,49 @@ _RESOURCE_POLICIES = [
     ("aws_sqs_queue", "policy", "aws_sqs_queue"),
     ("aws_secretsmanager_secret_policy", "policy", "aws_secretsmanager_secret"),
     ("aws_ecr_repository_policy", "policy", "aws_ecr_repository"),
+    ("aws_cloudwatch_event_bus_policy", "policy", "aws_cloudwatch_event_bus"),
 ]
 _TRIGGERS = {"aws_lambda_event_source_mapping", "aws_s3_bucket_notification", "aws_sns_topic_subscription"}
+
+
+_COMPUTE_TARGETS = {
+    "aws_lambda_function", "aws_sfn_state_machine", "aws_ecs_task_definition", "aws_codebuild_project",
+    "aws_batch_job_queue", "aws_glue_job",
+}  # fmt: skip
+
+
+def feeds(g: graph.Graph, source: str) -> list[str]:
+    """The compute a resource hands its input to: through an event source mapping, a bucket notification or a topic
+    subscription that names both; an EventBridge bus through its rules' targets, a rule through its targets; a
+    Scheduler schedule through its target."""
+    R = g.resources
+    out_e: dict[str, set[str]] = {}
+    in_e: dict[str, set[str]] = {}
+    for e in g.edges:
+        out_e.setdefault(e.source, set()).add(e.target)
+        in_e.setdefault(e.target, set()).add(e.source)
+
+    def compute(addrs) -> list[str]:
+        return [a for a in addrs if R.get(a) and R[a].type in _COMPUTE_TARGETS]
+
+    found: list[str] = []
+    for p in in_e.get(source, set()):  # plumbing that names the source and the compute
+        if R.get(p) and R[p].type in _TRIGGERS:
+            found += compute(out_e.get(p, ()))
+    t = R.get(source)
+    if t is not None and t.type == "aws_cloudwatch_event_bus":
+        rules = [x for x in in_e.get(source, set()) if R.get(x) and R[x].type == "aws_cloudwatch_event_rule"]
+    elif t is not None and t.type == "aws_cloudwatch_event_rule":
+        rules = [source]
+    else:
+        rules = []
+    for rule in rules:
+        for tgt in in_e.get(rule, set()):
+            if R.get(tgt) and R[tgt].type == "aws_cloudwatch_event_target":
+                found += compute(out_e.get(tgt, ()))
+    if t is not None and t.type in ("aws_scheduler_schedule", "aws_cloudwatch_event_target"):
+        found += compute(out_e.get(source, ()))
+    return sorted(dict.fromkeys(found))
 
 
 def resource_grants(g: graph.Graph, own: set[str]) -> list[tuple[str, str, list[str], str, str]]:
@@ -719,16 +761,7 @@ def _granted_paths(g: graph.Graph, model: arch.Model, im: iam.Models, own: set[s
                 else:
                     conf = "possible"
                     hops.append(f"{target}'s objects are encrypted with {key}, which doesn't let {who} decrypt them")
-        fed = [
-            fn
-            for t in g.edges
-            if t.target == target and R.get(t.source) and R[t.source].type in _TRIGGERS
-            for fn in (
-                e.target
-                for e in g.edges
-                if e.source == t.source and R.get(e.target) and R[e.target].type == "aws_lambda_function"
-            )
-        ]
+        fed = feeds(g, target)
         if R[target].type == "aws_lambda_function":
             fed = [target]
         for fn in dict.fromkeys(fed):
