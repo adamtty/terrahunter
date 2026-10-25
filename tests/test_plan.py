@@ -194,3 +194,31 @@ def test_a_jsonencoded_policy_takes_its_planned_value(tmp_path):
     }
     g = plan.apply(graph.build(tmp_path, "."), data)
     assert g.resources["aws_iam_role_policy.p"].body["policy"] == f'"{planned}"'  # the object with an expression in it
+
+
+def test_a_value_only_known_after_apply_keeps_its_expression(tmp_path):
+    (tmp_path / "main.tf").write_text(
+        'resource "aws_s3_bucket" "b" {}\ndata "aws_iam_policy_document" "d" {\n  statement {\n'
+        '    actions = ["s3:GetObject"]\n    resources = [aws_s3_bucket.b.arn]\n  }\n}\n'
+    )
+    data = {
+        "planned_values": {
+            "root_module": {
+                "resources": [
+                    {"address": "aws_s3_bucket.b", "values": {}},
+                    # the plan writes null for an element it knows only after apply
+                    {
+                        "address": "data.aws_iam_policy_document.d",
+                        "values": {"statement": [{"actions": ["s3:GetObject"], "resources": [None]}]},
+                    },
+                ]
+            }
+        },
+        "configuration": {
+            "root_module": {
+                "resources": [{"address": "aws_s3_bucket.b"}, {"address": "data.aws_iam_policy_document.d"}]
+            }
+        },
+    }
+    g = plan.apply(graph.build(tmp_path, "."), data)
+    assert g.resources["data.aws_iam_policy_document.d"].body["statement"][0]["resources"] == ["${aws_s3_bucket.b.arn}"]

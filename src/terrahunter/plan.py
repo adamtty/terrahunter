@@ -130,9 +130,21 @@ def overlay(body: dict, values: dict, sensitive) -> dict:
                 ]
             elif not _contains_sensitive(sens.get(k)):
                 out[k] = _hcl(pv)
-        elif (bv is None or _expr(bv)) and not _contains_sensitive(sens.get(k)):
+        elif (bv is None or _expr(bv)) and not _contains_sensitive(sens.get(k)) and _known(pv):
             out[k] = _hcl(pv)
     return out
+
+
+def _known(v) -> bool:
+    """Whether a planned value is wholly known: the plan writes null for what's only known after apply (an element
+    of a list, a member of an object), and then the expression says more than the plan."""
+    if v is None:
+        return False
+    if isinstance(v, list):
+        return all(_known(x) for x in v)
+    if isinstance(v, dict):
+        return all(_known(x) for x in v.values())
+    return True
 
 
 def _contains_sensitive(s) -> bool:
