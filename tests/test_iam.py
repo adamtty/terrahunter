@@ -258,3 +258,40 @@ def test_a_policy_attached_through_a_lookup_and_naming_a_module_s_output(tmp_pat
 def test_a_trust_that_only_allows_tag_session_admits_no_one(tmp_path):
     m = model(tmp_path, TRUST.format(principal="AWS = aws_iam_user.u.arn").replace("sts:AssumeRole", "sts:TagSession"))
     assert m.can_assume("aws_iam_user.u", "aws_iam_role.t") is False
+
+
+@pytest.mark.parametrize(
+    ("resource", "arn", "want"),
+    [
+        (
+            'resource "aws_ssm_parameter" "t" {\n  name = "/app/prod/token"\n}\n',
+            "arn:aws:ssm:eu-west-1:111122223333:parameter/app/prod/*",
+            True,
+        ),
+        (
+            'resource "aws_ssm_parameter" "t" {\n  name = "/app/dev/token"\n}\n',
+            "arn:aws:ssm:eu-west-1:111122223333:parameter/app/prod/*",
+            False,
+        ),
+        (
+            'resource "aws_secretsmanager_secret" "t" {\n  name = "db/password"\n}\n',
+            "arn:aws:secretsmanager:*:*:secret:db/password-AbCdEf",
+            True,
+        ),
+        (
+            'resource "aws_dynamodb_table" "t" {\n  name = "orders"\n}\n',
+            "arn:aws:dynamodb:${var.region}:${var.account}:table/orders",
+            True,
+        ),
+        ('resource "aws_s3_bucket" "t" {\n  bucket = "acme-drop"\n}\n', "arn:aws:s3:::acme-drop/*", True),
+    ],
+)
+def test_a_literal_arn_names_a_resource_by_its_own_arn(tmp_path, resource, arn, want):
+    action = {
+        "ssm": "ssm:GetParameter",
+        "secretsmanager": "secretsmanager:GetSecretValue",
+        "dynamodb": "dynamodb:GetItem",
+        "s3": "s3:GetObject",
+    }[arn.split(":")[2]]
+    m = model(tmp_path, ROLE + resource + policy("p", f'{{Effect = "Allow", Action = "{action}", Resource = "{arn}"}}'))
+    assert (m.allowed("aws_iam_role.r", action, resource.split('"')[1] + "." + resource.split('"')[3]) is True) is want
