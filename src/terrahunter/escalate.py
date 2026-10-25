@@ -1,14 +1,16 @@
 """If these credentials leak: what an attacker holding one identity's credentials can become and reach.
 
-From a start identity (an IAM user or role whose credentials the attacker holds), repeat until nothing changes:
+From a start identity whose credentials the attacker holds (an AWS IAM user or role, an Azure managed identity or a
+workload's system-assigned one, a Google Cloud service account), repeat until nothing changes:
 
-- **grants**: the data stores its own statements reach, at their access level (`iam.Model.access`);
-- **roles it can assume**: a trust policy that names it, or the account root when its own policies allow
-  sts:AssumeRole on the role;
-- **techniques**: every AWS privilege-escalation, lateral-movement and credential-source rule of the knowledge
-  base whose actions it's allowed on a resource of the rule's type. The rule's attribute tests must hold, and a
-  trust it names in prose ("a role whose trust policy lets lambda.amazonaws.com assume it") is checked against the
-  role. What the rule gives is gained: a resource's identity (a passed role, a function's role), the account
+- **grants**: the data stores its own permissions reach, at their access level (`iam.Models.access`: AWS
+  statements, Azure role assignments, Google Cloud IAM bindings, at their scope);
+- **identities it can become**: an AWS role whose trust policy names it (or the account root, when its own policies
+  allow sts:AssumeRole), a Google Cloud service account it can act as (token creator, service account user);
+- **techniques**: every privilege-escalation, lateral-movement and credential-source rule of the knowledge base
+  for its cloud (AWS actions, Azure operations, Google Cloud permissions) that it's allowed on a resource of the
+  rule's type. The rule's attribute tests must hold, and an AWS trust it names in prose ("a role whose trust policy
+  lets lambda.amazonaws.com assume it") is checked against the role. What the rule gives is gained: a resource's identity (a passed role, a function's role), the account
   (escalates: self), data access, or control of a compute resource's input (its identity, possibly);
 - **credentials in data**: a resource it can read whose configuration holds an access key gives the key's user.
 
@@ -107,8 +109,8 @@ def _min(*confs: str) -> str:
     return max(confs, key=lambda c: CONF[c])
 
 
-def search(g: graph.Graph, model: arch.Model, start: str, im: iam.Model | None = None) -> Result:
-    im = im or iam.Model(g)
+def search(g: graph.Graph, model: arch.Model, start: str, im: iam.Models | None = None) -> Result:
+    im = im or iam.Models(g)
     R = g.resources
     res = Result(start)
     runs_as: dict[str, list[str]] = {}
@@ -117,7 +119,8 @@ def search(g: graph.Graph, model: arch.Model, start: str, im: iam.Model | None =
             runs_as.setdefault(c.source, []).append(c.target)
     stores = [a for a, r in R.items() if r.mode == "managed" and _is_store(r.type)]
     roles = [a for a, r in R.items() if r.mode == "managed" and r.type == "aws_iam_role"]
-    rules = [r for r in kb.techniques("aws") if r.get("kind") in ("privesc", "lateral", "credential-source")]
+    kinds = ("privesc", "lateral", "credential-source")
+    rules_by = {c: [r for r in kb.techniques(c) if r.get("kind") in kinds] for c in ("aws", "azure", "gcp")}
     by_type: dict[str, list[str]] = {}
     for a, r in R.items():
         if r.mode == "managed":
@@ -146,6 +149,8 @@ def search(g: graph.Graph, model: arch.Model, start: str, im: iam.Model | None =
         return True
 
     def allowed(who: str, action: str, target: str | None) -> bool | None:
+        if not R[who].type.startswith("aws_"):  # Azure operations, Google Cloud permissions: at the target's scope
+            return im.allowed(who, action, target)
         svc = action.split(":")[0].lower()
         if target is not None and _service(R[target].type) != svc and not R[target].type.startswith(f"aws_{svc}"):
             target = None  # an action on a new resource (lambda:CreateFunction): on any resource
@@ -155,7 +160,10 @@ def search(g: graph.Graph, model: arch.Model, start: str, im: iam.Model | None =
 
     def identity_of(t: str) -> list[str]:
         """The identity a resource gives whoever controls it: itself for a role, else what it runs as."""
-        return [t] if R[t].type in ("aws_iam_role", "aws_iam_user") else runs_as.get(t, [])
+        if R[t].type in ("aws_iam_role", "aws_iam_user", "azurerm_user_assigned_identity", "google_service_account"):
+            return [t]
+        own = [t] if iam._system_identity(R[t]) else []  # an Azure workload's system-assigned identity
+        return own + runs_as.get(t, [])
 
     def _apply(rule: dict, who: str, base: str, admin: bool) -> bool:
         req = rule.get("requires") or {}
@@ -272,15 +280,13 @@ def search(g: graph.Graph, model: arch.Model, start: str, im: iam.Model | None =
         changed = False
         for who in list(conf_of):
             base = conf_of[who]
-            admin = im.allowed(who, "*", None) is True and any(
-                s.actions == ["*"] and s.resources == ["*"] for s in im.statements(who) if s.effect == "Allow"
-            )
+            admin = im.is_admin(who)
             if admin and gain(
                 "admin", "account", who, "grant", f"{who} is allowed every action on every resource", base
             ):
                 changed = True
             # grants: the data its own statements reach
-            for s in stores:
+            for s in [x for x in stores if R[x].type.split("_")[0] == R[who].type.split("_")[0]]:
                 level = "admin" if admin else im.access(who, s, _service(R[s].type))
                 if level:
                     src = im.why(who, f"{_service(R[s].type)}:*", s) or who
@@ -297,7 +303,10 @@ def search(g: graph.Graph, model: arch.Model, start: str, im: iam.Model | None =
                     conf = base if ok else _min(base, "possible")
                     changed |= gain("identity", role, who, "privesc-sts-001", f"{who} can assume {role}", conf)
             # the knowledge base's techniques
-            for rule in rules:
+            cloud = (
+                "azure" if R[who].type.startswith("azurerm_") else "gcp" if R[who].type.startswith("google_") else "aws"
+            )
+            for rule in rules_by[cloud]:
                 changed |= _apply(rule, who, base, admin)
             # an SSH private key or a login password it can read, for an instance that accepts SSH from anywhere
             for k in private_keys:
@@ -330,7 +339,17 @@ def search(g: graph.Graph, model: arch.Model, start: str, im: iam.Model | None =
     if ("admin", "account") in res.gains:  # the administrator reaches everything: data, and IAM itself
         g0 = res.gains[("admin", "account")]
         iam_types = ("aws_iam_policy", "aws_iam_role", "aws_iam_user", "aws_iam_group")
-        for s in stores + [a for t in iam_types for a in by_type.get(t, [])]:
+        prefix = R[g0.via].type.split("_")[0] + "_"
+        # its cloud's data, IAM, and every component on the diagram: compute, identities, the project itself
+        owned = stores + [a for t in iam_types for a in by_type.get(t, [])]
+        owned += [c.id for c in model.components if c.type.startswith(prefix) and not c.unknown]
+        owned += [
+            a
+            for a, r in R.items()
+            if r.mode == "managed"
+            and re.search(r"^(azurerm_role_assignment|google_project|google_project_iam_\w+)$", r.type)
+        ]
+        for s in dict.fromkeys(x for x in owned if R[x].type.startswith(prefix)):
             gain("data", s, g0.via, "admin", f"{g0.via} is the account's administrator", g0.confidence, "admin")
     return res
 
@@ -362,7 +381,7 @@ def leaks(g: graph.Graph, model: arch.Model, starts: list[str] | None = None):
     an attacker. One path per identity that escalates or reaches data, worst first."""
     from terrahunter import chains
 
-    im = iam.Model(g)
+    im = iam.Models(g)
     R = g.resources
     out = []
     for start in starts or im.identities:

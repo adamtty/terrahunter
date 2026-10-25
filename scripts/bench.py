@@ -117,7 +117,7 @@ def score_root(folder: Path, key: dict, inputs: dict | None = None) -> dict:
 
 def score_given(g: graph.Graph, model: arch.Model, given: list[dict]) -> list[dict]:
     """The paths that start from given credentials, against the credentials search from the same identity."""
-    im = iam.Model(g) if given else None
+    im = iam.Models(g) if given else None
     by_norm = {norm(a): a for a in g.resources}
     rows = []
     for p in given:

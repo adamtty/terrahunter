@@ -573,15 +573,16 @@ def build(g: graph.Graph, model: arch.Model) -> Result:
     im = None
 
     def search(identity: str):
-        """The credentials search from an AWS identity (what holding its credentials gives); None for other clouds."""
+        """The credentials search from an identity (what holding its credentials gives); None outside AWS, Azure and
+        Google Cloud."""
         nonlocal im
         if identity not in searched:
-            if identity not in R or not R[identity].type.startswith("aws_"):
+            if identity not in R or not R[identity].type.startswith(("aws_", "azurerm_", "google_")):
                 searched[identity] = None
             else:
                 from terrahunter import escalate, iam
 
-                im = im or iam.Model(g)
+                im = im or iam.Models(g)
                 searched[identity] = escalate.search(g, model, identity, im)
         return searched[identity]
 
@@ -655,8 +656,11 @@ def build(g: graph.Graph, model: arch.Model) -> Result:
                         hops.append(f"with {identity}'s credentials: {gn.text}{rule}")
             if len(took) > 4:
                 hops.append(f"with {identity}'s credentials: … and {len(took) - 4} more")
-            controls_of[identity] = [a for a in took if a != "account"]
-            more = [a for a in r.data() if a in comps and kb_store(comps[a].type) and a not in sinks]
+            data = r.data()
+            # what it takes over: the identities and compute it becomes, and (as the administrator) the rest
+            others = [a for a, lvl in data.items() if lvl == "admin" and not (a in comps and kb_store(comps[a].type))]
+            controls_of[identity] = list(dict.fromkeys([a for a in took if a != "account"] + others))
+            more = [a for a in data if a in comps and kb_store(comps[a].type) and a not in sinks]
             sinks = sinks + sorted(more)
         return sinks
 
