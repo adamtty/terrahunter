@@ -280,7 +280,7 @@ def show_scan(s: scanners.Scan, top: int = 10) -> None:
             counts[f.severity or "unrated"] = counts.get(f.severity or "unrated", 0) + 1
         print("  " + "  ".join(f"{k.lower()} {v}" for k, v in counts.items()))
         for f in s.findings[:top]:
-            where = f.address or "(not placed)"
+            where = estate.shown(f.address) if f.address else "(not placed)"
             print(
                 f"    {(f.severity or 'unrated').lower():<8} {sandbox.one_line(f.id, 20):<12} "
                 f"{sandbox.one_line(where, 70)}  {sandbox.one_line(f.title, 90)}"
@@ -498,7 +498,7 @@ def _main(argv: list[str] | None) -> int:
             if len(units) > 1:
                 slug = "root" if label == "." else label.replace("/", "-")
                 path = str(Path(a.diagram).with_name(f"{Path(a.diagram).stem}-{slug}{Path(a.diagram).suffix}"))
-            title = d.folder.name + ("" if label == "." else f"/{label}")
+            title = d.folder.name + ("" if label == "." else " (estate)" if a.estate else f"/{label}")
             write_private(path, diagram.render(model, title, scanned=scan is not None, paths=paths))
             print(f"  diagram: {sandbox.one_line(path)} (open it in a browser)")
         complete &= not s.open and not s.notes and not g.notes and not (scan and scan.failed)

@@ -199,3 +199,43 @@ resource "aws_iam_role_policy" "assume" {
     ):
         g = build(tmp_path / str(i), {"edge": aws("111111111111", role + grant), "vault": target(principal)})
         assert iam.Model(g).can_assume(ROLE, tgt) is expected, principal
+
+
+def test_shown_reads_as_root_and_address():
+    assert estate.shown('Internet → module.root["edge/prod"].module.site.aws_s3_bucket.x') == (
+        "Internet → edge/prod: module.site.aws_s3_bucket.x"
+    )
+    assert estate.shown("aws_s3_bucket.x") == "aws_s3_bucket.x"
+
+
+def test_the_diagram_groups_roots_by_account_and_repository(tmp_path):
+    from terrahunter import arch
+
+    g = build(
+        tmp_path,
+        {
+            "edge/prod": aws("111111111111", READER),
+            "edge/dev": aws("111111111111", READER),
+            "vault/prod": aws("222222222222", BUCKET),
+        },
+    )
+    m = arch.build(g)
+    conts = {c.id: c for c in m.containers}
+    assert conts["account:111111111111"].label == "AWS account 111111111111"
+    assert conts["repo:111111111111:edge"].parent == "account:111111111111"
+    assert conts["root:edge/dev"].parent == conts["root:edge/prod"].parent == "repo:111111111111:edge"
+    comps = {c.id: c for c in m.components}
+
+    def outer(addr):
+        chain, c = [], comps[addr].parent
+        while c:
+            chain.append(c)
+            c = conts[c].parent
+        return chain[-3:]
+
+    assert outer('module.root["vault/prod"].aws_s3_bucket.drop') == [
+        "root:vault/prod",
+        "repo:222222222222:vault",
+        "account:222222222222",
+    ]
+    assert outer('module.root["edge/dev"].aws_iam_role.intake')[0] == "root:edge/dev"

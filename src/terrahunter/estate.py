@@ -15,6 +15,7 @@ from dataclasses import replace
 from terrahunter import graph
 
 _TAG = re.compile(r'^module\.root\["((?:[^"\\]|\\.)*)"\]\.?')
+_ANY_TAG = re.compile(r'module\.root\["((?:[^"\\]|\\.)*)"\]\.')
 
 
 def tag(root: str) -> str:
@@ -37,6 +38,11 @@ def label(addr: str) -> str:
     """An estate address for people: `data-vault/prod: aws_s3_bucket.research`."""
     r = root_of(addr)
     return f"{r}: {local(addr)}" if r else addr
+
+
+def shown(text: str) -> str:
+    """Text with every estate address in it as people read it (`data-vault/prod: aws_s3_bucket.research`)."""
+    return _ANY_TAG.sub(lambda m: m.group(1).replace('\\"', '"').replace("\\\\", "\\") + ": ", text)
 
 
 def account_of(g: graph.Graph) -> str:
