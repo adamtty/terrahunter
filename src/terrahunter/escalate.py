@@ -158,6 +158,8 @@ def search(g: graph.Graph, model: arch.Model, start: str, im: iam.Models | None 
             # an action of another service: on a new resource (lambda:CreateFunction), or acting on this one
             # (ssm:StartSession on an instance): whichever its statements allow
             anywhere = im.allowed(who, action, None)
+            if anywhere is False and R[who].type.startswith("aws_"):
+                anywhere = im.aws.allowed_new(who, action)  # a new resource it may name (a schedule it creates)
             return True if True in (on_it, anywhere) else None if None in (on_it, anywhere) else False
         return on_it
 
@@ -189,8 +191,8 @@ def search(g: graph.Graph, model: arch.Model, start: str, im: iam.Models | None 
         becomes = rule.get("becomes") or {}
         changed = False
         for t in [x for ty in types for x in by_type.get(ty, [])] or ([None] if not types else []):
-            if t == who:
-                continue
+            if t == who and becomes.get("escalates") != "self":
+                continue  # (a rule that rewrites the identity's own permissions is about itself: PutUserPolicy)
             oks = [True if admin else allowed(who, a, t) for a in acts]
             if any_of:
                 alts = [[True if admin else allowed(who, a, t) for a in alt] for alt in any_of]
@@ -345,6 +347,21 @@ def search(g: graph.Graph, model: arch.Model, start: str, im: iam.Models | None 
                 if can_read(who, inst, admin):
                     how = "the instance's user data, which it can read, sets a login password"
                     changed |= shell(who, inst, how, "ssh-found-password", _min(base, "likely"))
+            # functions it may invoke: what it sends is the function's input, so the function's role is possibly
+            # the attacker's (what the code does with it decides)
+            for fn in by_type.get("aws_lambda_function", []):
+                if R[who].type.startswith("aws_") and (True if admin else allowed(who, "lambda:InvokeFunction", fn)):
+                    changed |= gain(
+                        "control",
+                        fn,
+                        who,
+                        "invoke",
+                        f"{who} may invoke {fn}: it sends the function's input",
+                        _min(base, "possible"),
+                    )
+                    for ident in identity_of(fn):
+                        text = f"{fn} runs as {ident}: what the input makes it do, it does as {ident}"
+                        changed |= gain("identity", ident, who, "invoke", text, _min(base, "possible"))
             # credentials in configuration it can read: a resource that holds an access key (an environment's
             # settings, a function's variables) gives the key's user to whoever can read the resource
             for addr in keys:
