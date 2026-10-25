@@ -87,7 +87,11 @@ class Statement:
             return True
         own = names.get(resource, set())
         rtype = resource.rsplit(".", 2)[-2] if resource.count(".") >= 1 else ""
-        return any(_arn_names(_literal_tail(r), own) or _arn_type(_literal_tail(r)) == rtype for r in self.resources)
+        arns = names.get(f"arn:{resource}", set())
+        return any(
+            _arn_names(_literal_tail(r), own) or _arn_type(_literal_tail(r)) == rtype or _arn_matches(r, arns)
+            for r in self.resources
+        )
 
 
 def _literal_tail(r: str) -> str:
@@ -113,6 +117,60 @@ _ARN_TYPES = {
     "parameter": "aws_ssm_parameter",
     "instance": "aws_instance",
 }
+
+
+# a resource's ARN from its own name, per type: the part after arn:<partition>:<service>:<region>:<account>:
+_ARN_FORMS = {
+    "aws_s3_bucket": ("s3", "{bucket}"),
+    "aws_ssm_parameter": ("ssm", "parameter/{name}"),
+    "aws_secretsmanager_secret": ("secretsmanager", "secret:{name}-*"),
+    "aws_dynamodb_table": ("dynamodb", "table/{name}"),
+    "aws_lambda_function": ("lambda", "function:{function_name}"),
+    "aws_iam_role": ("iam", "role/{name}"),
+    "aws_iam_user": ("iam", "user/{name}"),
+    "aws_sns_topic": ("sns", "{name}"),
+    "aws_sqs_queue": ("sqs", "{name}"),
+    "aws_kinesis_stream": ("kinesis", "stream/{name}"),
+    "aws_ecr_repository": ("ecr", "repository/{name}"),
+}
+
+
+def arn_forms(r) -> set[str]:
+    """The ARNs a resource has (its objects' too, for a bucket), built from its literal name; empty when the name
+    isn't written in the code. Region and account are any: a policy names them, the resource doesn't."""
+    form = _ARN_FORMS.get(r.type)
+    if not form:
+        return set()
+    service, tail = form
+    key = tail[tail.index("{") + 1 : tail.index("}")]
+    name = deps.unquote(r.body.get(key))
+    if not name or "${" in name:
+        return set()
+    if r.type == "aws_ssm_parameter":
+        name = name.lstrip("/")
+    # S3 ARNs have no region or account, IAM's no region; the rest are in any region and account here
+    prefix = {"s3": "arn:aws:s3:::", "iam": "arn:aws:iam::*:"}.get(service, f"arn:aws:{service}:*:*:")
+    arn = prefix + tail.replace("{" + key + "}", name)
+    return {arn, f"{arn}/*"} if service == "s3" else {arn}
+
+
+def _arn_matches(pattern: str, arns: set[str]) -> bool:
+    """Whether a literal ARN pattern (its ${…} parts any value) names one of a resource's ARNs."""
+    if not arns or not pattern.strip('"').startswith("arn:"):
+        return False
+    pat = re.sub(r"\$\{[^}]*\}", "*", pattern.strip('"'))
+    for arn in arns:
+        a_parts, p_parts = arn.split(":", 5), pat.split(":", 5)
+        if len(a_parts) != 6 or len(p_parts) != 6 or a_parts[2] != p_parts[2]:
+            continue  # not an ARN of the same service
+        # the resource's own region and account are "*" (the code doesn't say): either side's wildcard matches; its
+        # name part may carry a wildcard too (a secret's random suffix), so each side is tried as the pattern
+        where = all(
+            x == "*" or y == "*" or fnmatch.fnmatchcase(x, y) for x, y in zip(a_parts[3:5], p_parts[3:5], strict=True)
+        )
+        if where and (fnmatch.fnmatchcase(a_parts[5], p_parts[5]) or fnmatch.fnmatchcase(p_parts[5], a_parts[5])):
+            return True
+    return False
 
 
 def _arn_type(pattern: str) -> str:
@@ -295,6 +353,8 @@ class Model:
         for a, r in self.g.resources.items():
             vals = {deps.unquote(r.body.get(k)) for k in _NAME_ATTRS}
             out[a] = {v for v in vals if v}
+            if forms := arn_forms(r):
+                out[f"arn:{a}"] = forms
         return out
 
     def allowed(self, identity: str, action: str, resource: str | None = None) -> bool | None:
