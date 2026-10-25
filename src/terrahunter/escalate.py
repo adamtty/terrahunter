@@ -152,11 +152,13 @@ def search(g: graph.Graph, model: arch.Model, start: str, im: iam.Models | None 
         if not R[who].type.startswith("aws_"):  # Azure operations, Google Cloud permissions: at the target's scope
             return im.allowed(who, action, target)
         svc = action.split(":")[0].lower()
-        if target is not None and _service(R[target].type) != svc and not R[target].type.startswith(f"aws_{svc}"):
-            target = None  # an action on a new resource (lambda:CreateFunction): on any resource
-        if target is None:
-            return im.allowed(who, action, None)
-        return im.allowed(who, action, target)
+        on_it = im.allowed(who, action, target) if target is not None else False
+        if target is None or _service(R[target].type) != svc and not R[target].type.startswith(f"aws_{svc}"):
+            # an action of another service: on a new resource (lambda:CreateFunction), or acting on this one
+            # (ssm:StartSession on an instance): whichever its statements allow
+            anywhere = im.allowed(who, action, None)
+            return True if True in (on_it, anywhere) else None if None in (on_it, anywhere) else False
+        return on_it
 
     def implied(who: str, action: str, target: str | None) -> bool:
         """Allowed only by a grant the cloud adds by default (the default compute account's Editor role), not one

@@ -1,6 +1,7 @@
 """ECS: a service runs as its task definition's task role, and on EC2 it runs on its cluster's hosts, whose
 exposure (on the ports its containers publish) reaches it and whose role its containers can reach too."""
 
+import pytest
 from test_chains import BUCKETS, NET, sg
 
 from terrahunter import arch, chains, graph
@@ -206,3 +207,10 @@ def test_a_host_role_that_drains_pulls_other_services_over(tmp_path):
     )
     (ch,) = [c for c in r.chains if c.steps == ["internet", "aws_ecs_service.web", "aws_iam_role.host"]]
     assert "aws_ecs_service.vault" in ch.controls
+
+
+@pytest.mark.parametrize(("image", "path"), [("x", True), ("httpd:2.4", False), ("nginx", False)])
+def test_a_stock_web_server_container_has_no_application_to_break(tmp_path, image, path):
+    web = task("web").replace('image = "x"', f'image = "{image}"')
+    _, r = build(tmp_path, NET + BUCKETS + ROLES + CLUSTER + HOSTS + web + service("web", "web"))
+    assert any(c.steps[1:2] == ["aws_ecs_service.web"] for c in r.chains) is path
