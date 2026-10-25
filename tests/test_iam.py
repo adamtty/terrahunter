@@ -173,3 +173,34 @@ def test_gcp_bindings_and_acting_as_another_service_account(tmp_path):
     assert m.access("google_service_account.app", "google_storage_bucket.b") == "read"
     assert m.access("google_service_account.app", "google_storage_bucket.other") == ""
     assert m.can_assume("google_service_account.app", "google_service_account.admin") is True
+
+
+DEFAULT_SA_VM = (
+    'data "google_compute_default_service_account" "default" {{}}\n'
+    'resource "google_compute_instance" "dev" {{\n  service_account {{\n'
+    "    email = data.google_compute_default_service_account.default.email\n    scopes = {scopes}\n  }}\n}}\n"
+    'resource "google_compute_instance" "admin" {{}}\nresource "google_storage_bucket" "b" {{}}\n'
+)
+
+
+@pytest.mark.parametrize(
+    ("scopes", "extra", "metadata", "storage"),
+    [
+        ('["compute-rw", "storage-ro"]', "", True, "read"),  # Editor, capped by the token's scopes
+        ('["cloud-platform"]', "", True, "admin"),
+        (
+            '["cloud-platform"]',
+            'resource "google_project_default_service_accounts" "d" {\n  action = "DEPRIVILEGE"\n}\n',
+            False,
+            "",
+        ),
+    ],
+)
+def test_the_default_compute_account_is_an_editor_unless_deprivileged(tmp_path, scopes, extra, metadata, storage):
+    (tmp_path / "main.tf").write_text(DEFAULT_SA_VM.format(scopes=scopes) + extra)
+    m = iam.Models(graph.build(tmp_path, "."))
+    vm = "google_compute_instance.dev"
+    assert m.allowed(vm, "compute.instances.setMetadata", "google_compute_instance.admin") is metadata
+    assert m.access(vm, "google_storage_bucket.b") == storage
+    assert not m.is_admin(vm)  # Editor can't change IAM
+    assert m.why(vm, "compute.instances.setMetadata", None).startswith(iam.IMPLIED) is metadata

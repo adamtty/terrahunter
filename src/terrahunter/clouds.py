@@ -381,11 +381,12 @@ def system_identity(rtype: str, body: dict) -> str:
         return "its system-assigned managed identity"
     if rtype in ("google_compute_instance", "google_compute_instance_template"):
         sa = _block(body, "service_account")
-        if sa and (not sa.get("email") or "compute@developer" in _s(sa.get("email"))):
+        email = _s(sa.get("email")) if sa else ""
+        if sa and (not email or "compute@developer" in email or "data.google_compute_default_service_account" in email):
             return "the default compute service account"
     if rtype == "google_container_node_pool":
         sa = _s(_block(body, "node_config").get("service_account"))
-        if not sa or "compute@developer" in sa:
+        if not sa or "compute@developer" in sa or "data.google_compute_default_service_account" in sa:
             return "the default compute service account"
     if rtype in SERVERLESS and "service_account" not in str(body):
         return "the default compute service account"
