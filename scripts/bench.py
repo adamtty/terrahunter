@@ -10,8 +10,10 @@ aren't). This runs terrahunter's stages 1-5 on every labelled root, without scan
   at, something the key says isn't a path, and the key's reason is shown) or *unlabelled*;
 - **confidence**: terrahunter's confidence against the key's, side by side.
 
-Paths that start from credentials the project hands the attacker (`attacker-principal`) need an "assume a
-compromised identity" mode terrahunter doesn't have yet; they're counted apart and not in recall.
+Paths that start from credentials the project hands the attacker (`attacker-principal`) are scored apart, as
+**given-credentials recall**: terrahunter's credentials search runs from the key's start identity, and the path is
+found when the identity it ends as, or anything it reaches, is among what the search gains (the start itself
+doesn't count).
 
   python scripts/bench.py --kb ../terrahunter-kb                  # every project (fetch them first:
   python scripts/bench.py --kb ../terrahunter-kb --project terragoat   #   python scripts/bench/fetch.py in the kb)
@@ -28,7 +30,7 @@ import re
 import sys
 from pathlib import Path
 
-from terrahunter import arch, chains, graph
+from terrahunter import arch, chains, escalate, graph, iam
 
 _INDEX = re.compile(r"\[[^\]]*\]")
 # the inputs each project's answer key assumes (from its source.yaml notes), given as -var / -var-file would be
@@ -63,6 +65,7 @@ def score_root(folder: Path, key: dict, inputs: dict | None = None) -> dict:
     given = [p for p in key.get("paths", []) if p["steps"][:1] != ["internet"]]
     not_paths = {norm(n["resource"]): n["why"] for n in key.get("not_paths", [])}
     out = {"root": root, "resources": len(g.resources), "expected": [], "given_credentials": len(given), "found": []}
+    out["given"] = score_given(g, model, given)
     used: set[int] = set()
     for p in expected:
         e, first = norm(p["entry"]), norm(p["steps"][1]) if len(p["steps"]) > 1 else norm(p["entry"])
@@ -110,6 +113,31 @@ def score_root(folder: Path, key: dict, inputs: dict | None = None) -> dict:
     return out
 
 
+def score_given(g: graph.Graph, model: arch.Model, given: list[dict]) -> list[dict]:
+    """The paths that start from given credentials, against the credentials search from the same identity."""
+    im = iam.Model(g) if given else None
+    by_norm = {norm(a): a for a in g.resources}
+    rows = []
+    for p in given:
+        start = by_norm.get(norm(p["steps"][1]))
+        want = {norm(r["resource"]) for r in p.get("reaches", [])}
+        row = {"id": p["id"], "start": p["steps"][1], "found": False, "reaches": len(want), "reached": 0}
+        if start is None:
+            row["why"] = "the start identity isn't in the graph"
+            rows.append(row)
+            continue
+        r = escalate.search(g, model, start, im)
+        have = {norm(a) for (_, a) in r.gains} - {norm(start)}
+        last = norm(p["steps"][-1])
+        row["found"] = last in have or bool(want & have)
+        row["reached"] = len(want & have)
+        row["missed"] = sorted(want - have)
+        row["techniques"] = sorted({gn.rule for gn in r.gains.values() if gn.rule.startswith("privesc")})
+        row["key_techniques"] = p.get("techniques", [])
+        rows.append(row)
+    return rows
+
+
 def totals(rows: list[dict]) -> dict:
     exp = [p for r in rows for p in r["expected"]]
     fnd = [c for r in rows for c in r["found"]]
@@ -125,6 +153,16 @@ def totals(rows: list[dict]) -> dict:
         "unlabelled": sum(c["verdict"] == "unlabelled" for c in fnd),
         "precision": sum(c["verdict"] == "matched" for c in fnd) / len(fnd) if fnd else 0.0,
         "given_credentials": sum(r["given_credentials"] for r in rows),
+        "given_found": sum(p["found"] for r in rows for p in r.get("given", [])),
+        "given_recall": (
+            sum(p["found"] for r in rows for p in r.get("given", [])) / sum(len(r.get("given", [])) for r in rows)
+            if any(r.get("given") for r in rows)
+            else 0.0
+        ),
+        "given_reach_recall": (
+            sum(p["reached"] for r in rows for p in r.get("given", []))
+            / max(1, sum(p["reaches"] for r in rows for p in r.get("given", [])))
+        ),
     }
 
 
@@ -138,7 +176,9 @@ def markdown(results: dict[str, list[dict]]) -> str:
             f"**Recall {t['recall']:.0%}** ({t['found']} of {t['expected']} expected internet paths found; of the data they "
             f"reach, {t['reach_recall']:.0%}) · **precision {t['precision']:.0%}** ({t['matched']} of {t['paths']} "
             f"paths match; {t['contradicted']} contradicted by the key, {t['unlabelled']} unlabelled) · "
-            f"{t['given_credentials']} paths start from given credentials (not scored yet)"
+            f"**given-credentials recall {t['given_recall']:.0%}** ({t['given_found']} of {t['given_credentials']} paths "
+            f"that start from credentials the project hands the attacker; of what they reach, "
+            f"{t['given_reach_recall']:.0%})"
         ),
         "",
         (
@@ -147,14 +187,15 @@ def markdown(results: dict[str, list[dict]]) -> str:
             "runs with `all_findings = true` (the README's full corpus)."
         ),
         "",
-        "| Project | Roots | Expected | Found | Recall | Paths | Matched | Contradicted | Unlabelled |",
-        "|---|---|---|---|---|---|---|---|---|",
+        "| Project | Roots | Expected | Found | Recall | Paths | Matched | Contradicted | Unlabelled | Given found |",
+        "|---|---|---|---|---|---|---|---|---|---|",
     ]
     for name, rows in results.items():
         x = totals(rows)
+        given = f"{x['given_found']} of {x['given_credentials']}" if x["given_credentials"] else "—"
         lines.append(
             f"| {name} | {len(rows)} | {x['expected']} | {x['found']} | {x['recall']:.0%} | {x['paths']} | "
-            f"{x['matched']} | {x['contradicted']} | {x['unlabelled']} |"
+            f"{x['matched']} | {x['contradicted']} | {x['unlabelled']} | {given} |"
         )
     conf: dict[tuple[str, str], int] = {}
     for p in (p for r in allrows for p in r["expected"] if p["found"]):
@@ -166,9 +207,10 @@ def markdown(results: dict[str, list[dict]]) -> str:
         ]
     for name, rows in results.items():
         misses = [(r["root"], p) for r in rows for p in r["expected"] if not p["found"]]
+        given_misses = [(r["root"], p) for r in rows for p in r.get("given", []) if not p["found"]]
         partial = [(r["root"], p) for r in rows for p in r["expected"] if p["found"] and p.get("missed")]
         wrong = [(r["root"], c) for r in rows for c in r["found"] if c["verdict"] == "contradicted"]
-        if not (misses or partial or wrong):
+        if not (misses or partial or wrong or given_misses):
             continue
         lines += ["", f"## {name}", ""]
         for root, p in misses:
@@ -181,6 +223,9 @@ def markdown(results: dict[str, list[dict]]) -> str:
             )
         for root, c in wrong:
             lines.append(f"- **contradicted** `{c['entry']}` ({root}, {c['severity']}): {c['reason'][:300]}")
+        for root, p in given_misses:
+            techs = ", ".join(p.get("key_techniques") or []) or "none cited"
+            lines.append(f"- **given, missed** {p['id']} from `{p['start']}` ({root}): techniques {techs}")
     return "\n".join(lines) + "\n"
 
 

@@ -79,3 +79,26 @@ def test_a_key_may_name_what_opens_the_entry(tmp_path):
     (tmp_path / "main.tf").write_text(text)
     row = bench.score_root(tmp_path, {"root": ".", "paths": [path("Z-01", "azurerm_storage_container.c", [])]})
     assert row["expected"][0]["found"]
+
+
+def test_given_credentials_are_scored_from_the_start_identity(tmp_path):
+    key = [
+        {
+            "root": "infra",
+            "paths": [
+                path(
+                    "G-01", "aws_iam_role.app", ["aws_s3_bucket.logs"], steps=["attacker-principal", "aws_iam_role.app"]
+                ),
+                # reaching only itself isn't found: the start doesn't count as gained
+                path(
+                    "G-02", "aws_iam_role.app", ["aws_iam_role.app"], steps=["attacker-principal", "aws_iam_role.app"]
+                ),
+            ],
+            "not_paths": [],
+        }
+    ]
+    folder = kb(tmp_path, key)
+    out = tmp_path / "r.json"
+    assert bench.main(["--kb", str(folder), "--json", str(out)]) == 0
+    t = json.loads(out.read_text())["totals"]
+    assert (t["given_credentials"], t["given_found"]) == (2, 1)
