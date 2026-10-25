@@ -266,3 +266,24 @@ def test_ssh_open_is_a_way_in_only_with_a_login(tmp_path, login, found):
     # SSH open to the world, but with no key pair and no password nobody can log in
     r = paths(tmp_path, NET + sg("ssh", 22) + instance("box", "pub", "ssh", login))
     assert bool(r.chains) is found
+
+
+def test_an_internet_path_carries_on_with_the_role_s_credentials(tmp_path):
+    # the instance's role can assume an admin role: the path reaches what that role reaches, and records it
+    admin = (
+        'resource "aws_iam_role" "admin" {\n  assume_role_policy = jsonencode({Statement = [{Effect = "Allow", '
+        'Action = "sts:AssumeRole", Principal = {AWS = aws_iam_role.app.arn}}]})\n'
+        '  managed_policy_arns = ["arn:aws:iam::aws:policy/AdministratorAccess"]\n}\n'
+        'resource "aws_dynamodb_table" "orders" {}\n'
+    )
+    r = paths(
+        tmp_path,
+        NET
+        + ROLE
+        + admin
+        + sg("web", 80)
+        + instance("web", "pub", "web", "  iam_instance_profile = aws_iam_instance_profile.app.name\n"),
+    )
+    (c,) = r.chains
+    assert "aws_iam_role.admin" in c.controls and "aws_dynamodb_table.orders" in c.sinks
+    assert any("with aws_iam_role.app's credentials" in h and "privesc-sts-001" in h for h in c.hops)

@@ -157,6 +157,7 @@ class Chain:
     fixes: list[str] = field(default_factory=list)  # ids of the fixes that break or weaken it
     also: list[str] = field(default_factory=list)  # other entry points into the same workload, identity and data
     within: list[str] = field(default_factory=list)  # what's stored in the data stores it reaches (objects, documents)
+    controls: list[str] = field(default_factory=list)  # identities and compute it takes over beyond its steps
 
 
 @dataclass
@@ -568,23 +569,27 @@ def build(g: graph.Graph, model: arch.Model) -> Result:
                 {"id": f"x{len(edges)}", "source": s, "target": t, "label": label, "kind": kind, "quiet": False}
             )
 
-    gives: dict[str, bool] = {}
+    searched: dict[str, object] = {}
     im = None
 
-    def gives_more(identity: str) -> bool:
-        """Whether an identity's credentials give an attacker anything: data, another identity, or the account (the
-        credentials search). Non-AWS identities are kept as they are."""
+    def search(identity: str):
+        """The credentials search from an AWS identity (what holding its credentials gives); None for other clouds."""
         nonlocal im
-        if identity not in gives:
+        if identity not in searched:
             if identity not in R or not R[identity].type.startswith("aws_"):
-                gives[identity] = True
+                searched[identity] = None
             else:
                 from terrahunter import escalate, iam
 
                 im = im or iam.Model(g)
-                r = escalate.search(g, model, identity, im)
-                gives[identity] = any(a != identity for (_, a) in r.gains)
-        return gives[identity]
+                searched[identity] = escalate.search(g, model, identity, im)
+        return searched[identity]
+
+    def gives_more(identity: str) -> bool:
+        """Whether an identity's credentials give an attacker anything: data, another identity, or the account.
+        Non-AWS identities are kept as they are."""
+        r = search(identity)
+        return r is None or any(a != identity for (_, a) in r.gains)
 
     def hostless(c: arch.Component) -> bool:
         """Compute with no machine an attacker could also take over: a function, an API, a Fargate task."""
@@ -622,6 +627,8 @@ def build(g: graph.Graph, model: arch.Model) -> Result:
             )
         return f"{c.id}: reachable by traffic: a flaw in the application gets code running here", "possible"
 
+    controls_of: dict[str, list[str]] = {}
+
     def via_identity(identity: str, hops: list[str]) -> list[str]:
         """What an identity reaches, with its grant (and the access edges) added to the chain."""
         sinks, gr = reach(identity)
@@ -636,6 +643,21 @@ def build(g: graph.Graph, model: arch.Model) -> Result:
         for t in sinks:  # each edge names the actions for that store's service
             own = [x for x in gr.actions if comps[t].type in stores_of(x.split(":")[0].lower(), store_types)]
             add_edge(identity, t, ", ".join((own or [x for x in gr.actions if ":" not in x])[:2]) or "access", "access")
+        # and what its credentials lead to beyond its own grants: roles it can become, techniques, the account
+        r = search(identity)
+        if r is not None:
+            took = []
+            for (kind, a), gn in r.gains.items():
+                if kind in ("identity", "control", "admin") and a != identity:
+                    took.append(a)
+                    if len(took) <= 4:
+                        rule = f" [{gn.rule}]" if gn.rule not in ("grant", "credentials") else ""
+                        hops.append(f"with {identity}'s credentials: {gn.text}{rule}")
+            if len(took) > 4:
+                hops.append(f"with {identity}'s credentials: … and {len(took) - 4} more")
+            controls_of[identity] = [a for a in took if a != "account"]
+            more = [a for a in r.data() if a in comps and kb_store(comps[a].type) and a not in sinks]
+            sinks = sinks + sorted(more)
         return sinks
 
     def reached(sinks: list[str]) -> str:
@@ -754,6 +776,7 @@ def build(g: graph.Graph, model: arch.Model) -> Result:
                 )
                 key = (node.id, role, tuple(sinks))
                 ch = Chain("", kind, conf, f"{c.name}: {why}", steps, sinks, h)
+                ch.controls = [x for x in controls_of.get(role, []) if x not in steps] if role else []
                 old = found.get(key)
                 if old is None:
                     found[key] = ch
