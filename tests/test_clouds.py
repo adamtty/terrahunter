@@ -225,7 +225,7 @@ def test_gcp_cloud_run_anyone_can_invoke_to_a_secret(tmp_path):
     (c,) = r.chains
     assert c.steps == ["internet", "google_cloud_run_v2_service.api", "google_service_account.run"]
     assert c.sinks == ["google_secret_manager_secret.db_password"] and c.severity == "critical"
-    assert "anyone may invoke it" in c.entry
+    assert "allUsers" in c.entry
 
 
 def test_gcp_service_account_key_is_a_badge_not_a_path(tmp_path):
@@ -256,3 +256,44 @@ def test_gke_node_pool_nodes_are_instances(tmp_path, private, found):
     )
     entries = {c.steps[1] for c in r.chains if len(c.steps) > 1}
     assert ("google_container_node_pool.p" in entries) is found
+
+
+GCS_PUBLIC = (
+    'resource "google_storage_bucket" "b" {\nEXTRA}\nresource "google_storage_bucket_iam_member" "pub" {\n'
+    '  bucket = google_storage_bucket.b.name\n  role = "roles/storage.objectViewer"\n  member = "allUsers"\nCOND}\n'
+)
+EXPIRED = '  condition {\n    title = "t"\n    expression = "request.time < timestamp(\'2020-01-01T00:00:00Z\')"\n  }\n'
+
+
+@pytest.mark.parametrize(
+    ("extra", "cond", "public"),
+    [
+        ("", "", True),
+        ('  public_access_prevention = "enforced"\n', "", False),  # prevention overrides the grant
+        ("", EXPIRED, False),  # a grant whose condition expired opens nothing
+    ],
+)
+def test_allusers_on_a_bucket_is_judged_by_the_knowledge_base(tmp_path, extra, cond, public):
+    _, m, _ = build(tmp_path, GCS_PUBLIC.replace("EXTRA", extra).replace("COND", cond))
+    assert ("google_storage_bucket.b" in m.exposed) is public
+
+
+@pytest.mark.parametrize(("ingress", "public"), [("", True), ('  ingress = "INGRESS_TRAFFIC_INTERNAL_ONLY"\n', False)])
+def test_cloud_run_internal_ingress_isn_t_opened_by_allusers(tmp_path, ingress, public):
+    _, m, _ = build(
+        tmp_path,
+        f'resource "google_cloud_run_v2_service" "api" {{\n{ingress}  template {{}}\n}}\n'
+        'resource "google_cloud_run_v2_service_iam_member" "pub" {\n  name = google_cloud_run_v2_service.api.name\n'
+        '  role = "roles/run.invoker"\n  member = "allUsers"\n}\n',
+    )
+    assert ("google_cloud_run_v2_service.api" in m.exposed) is public
+
+
+@pytest.mark.parametrize(("effect", "public"), [("Allow", True), ("Deny", False)])
+def test_a_search_domain_is_public_only_when_its_access_policy_lets_anyone_in(tmp_path, effect, public):
+    _, m, _ = build(
+        tmp_path,
+        'resource "aws_opensearch_domain" "d" {\n  access_policies = jsonencode({Statement = [{'
+        f'Effect = "{effect}", Principal = "*", Action = "es:*", Resource = "*"}}]}})\n}}\n',
+    )
+    assert ("aws_opensearch_domain.d" in m.exposed) is public

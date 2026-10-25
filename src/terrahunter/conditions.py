@@ -268,6 +268,12 @@ def _compare(op: str, want, v) -> bool | None:
             return False
         if ref and op == "in" and all(_never(w) for w in want):
             return False
+        # a template whose own text can't begin the value ("serviceAccount:${…}" is never "allUsers")
+        head = v.strip('"').split("${", 1)[0].lower() if isinstance(v, str) else ""
+        if head and op in ("is", "in"):
+            wants = [want] if op == "is" else list(want)
+            if not any(isinstance(w, str) and w.lower().startswith(head) for w in wants):
+                return False
         return None
     if op == "is":
         return _canon(s) == _canon(want)

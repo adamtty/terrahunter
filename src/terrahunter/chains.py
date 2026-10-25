@@ -746,8 +746,6 @@ def build(g: graph.Graph, model: arch.Model) -> Result:
             entries.append((c.id, "publicly accessible database" + (f", open on {', '.join(ports)}" if ports else "")))
         elif c.type == "aws_s3_bucket" and any(b.text.startswith("ACL public") for b in c.badges):
             entries.append((c.id, "bucket ACL makes it public"))
-        elif c.type in ("aws_elasticsearch_domain", "aws_opensearch_domain") and not b.get("vpc_options"):
-            entries.append((c.id, "search domain outside a VPC: its endpoint is on the internet"))
         elif c.type == "aws_lambda_function_url" and deps.unquote(b.get("authorization_type")) == "NONE":
             entries.append((c.id, "function URL with no authentication"))
         elif c.type == "aws_eks_cluster":
