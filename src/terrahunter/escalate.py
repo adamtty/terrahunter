@@ -424,6 +424,96 @@ def _sensitive(r: graph.Resource) -> bool:
     )
 
 
+# a trust principal outside the configuration: another account's root, role or user, any account, a federated
+# identity provider (account ids derived from aws_caller_identity are this account)
+_OTHER_ACCOUNT = re.compile(r"^(?:arn:aws[\w-]*:iam::)?(\d{12})(?::|$)")
+_NARROWING = {  # condition keys that narrow who outside may assume it, and what the attacker would need
+    "sts:externalid": "the external ID",
+    "aws:principalorgid": "a principal in the organization",
+    "aws:principalarn": "a principal whose ARN matches",
+    "aws:sourceaccount": "a request from the account",
+    "aws:sourcearn": "a request from the resource",
+    "aws:principalaccount": "a principal in the account",
+}
+
+
+def _outsiders(im: iam.Models, role: str) -> list[tuple[str, str, str]]:
+    """Who outside the configuration a role's trust admits: (who, what narrows it, confidence)."""
+    out = []
+    for st in im.aws.trust(role):
+        conds = {str(k).strip('"').lower() for tests in st.condition.values() if isinstance(tests, dict) for k in tests}
+        narrowed = sorted(
+            {v for k, v in _NARROWING.items() if k in conds} | ({f"{k}" for k in conds if k.endswith(":sub")})
+        )
+        for p in st.resources:
+            kind, _, value = p.partition(":")
+            value = value.strip('"')
+            if kind == "AWS" and value == "*":
+                who = "any AWS account"
+            elif kind == "AWS" and (m := _OTHER_ACCOUNT.match(value)):
+                who = f"account {m.group(1)}" + (
+                    f" ({value.rsplit(':', 1)[-1]})" if ":" in value and not value.endswith(":root") else ""
+                )
+            elif kind == "Federated":  # an identity provider: its identities are outside the account
+                who = f"identities from {value.rsplit('/', 1)[-1] or value}"
+            else:
+                continue
+            open_to_all = who == "any AWS account" or kind == "Federated" and not any(c.endswith(":sub") for c in conds)
+            conf = "certain" if open_to_all and not narrowed else "possible"
+            out.append((who, ", ".join(narrowed), conf))
+    return out
+
+
+def outside(g: graph.Graph, model: arch.Model) -> list:
+    """From other accounts: each role whose trust policy admits principals outside the configuration (another
+    account, any account, a federated identity provider), and what becoming it gives. Worst first."""
+    from terrahunter import chains
+
+    im = iam.Models(g)
+    R = g.resources
+    comps = {c.id for c in model.components}
+    out = []
+    for role in [a for a, r in R.items() if r.mode == "managed" and r.type == "aws_iam_role"]:
+        who = _outsiders(im, role)
+        if not who:
+            continue
+        conf = min((c for _, _, c in who), key=lambda c: CONF[c])
+        r = search(g, model, role, im)
+        data = r.data()
+        stores = sorted(a for a in data if _is_store(R[a].type))
+        admin = r.gains.get(("admin", "account"))
+        hops = [
+            f"{w} may assume {role}" + (f", given {n}" if n else ": nothing in the trust narrows it") for w, n, _ in who
+        ]
+        hops += [
+            g_.text + (f" [{g_.rule}]" if g_.rule not in ("grant", "credentials") else "")
+            for g_ in r.gains.values()
+            if g_.kind in ("identity", "admin") and g_.address != role
+        ][:6]
+        if stores:
+            hops.append(
+                "reaches: "
+                + ", ".join(f"{s} ({data[s]})" + (" ⚠sensitive" if _sensitive(R[s]) else "") for s in stores)
+            )
+        sens = any(_sensitive(R[s]) and iam.LEVELS.get(data[s], 0) >= iam.LEVELS["read"] for s in stores)
+        open_ = conf == "certain"
+        severity = "critical" if open_ and (admin or sens) else "high" if admin or sens or open_ else "medium"
+        names = ", ".join(dict.fromkeys(w for w, _, _ in who))
+        ch = chains.Chain(
+            severity,
+            "from another account",
+            conf,
+            f"{R[role].name}: {names} may assume it",
+            ["attacker-principal", role],
+            stores,
+            hops,
+        )
+        ch.controls = [a for (k, a) in r.gains if k in ("identity", "control") and a != role]
+        ch.drawn = role in comps
+        out.append((RANK[severity], CONF[conf], -len(stores), role, ch))
+    return [x[-1] for x in sorted(out, key=lambda x: x[:4])]
+
+
 def leaks(g: graph.Graph, model: arch.Model, starts: list[str] | None = None):
     """If these credentials leak: for each AWS user and role (or only `starts`), what holding its credentials gives
     an attacker. One path per identity that escalates or reaches data, worst first."""

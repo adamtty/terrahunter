@@ -214,6 +214,7 @@ class Result:
     edges: list[dict]  # extra drawn edges: internet → entry, identity → what it can access
     fixes: list[Fix] = field(default_factory=list)  # most valuable first
     leaks: list[Chain] = field(default_factory=list)  # if these credentials leak: one per identity, worst first
+    outside: list[Chain] = field(default_factory=list)  # roles other accounts may assume, and what they give
     checks: list[Check] = field(default_factory=list)  # what the paths rest on, to confirm by hand; most paths first
 
     def to_dict(self) -> dict:
@@ -222,6 +223,7 @@ class Result:
             "edges": self.edges,
             "fixes": [asdict(f) for f in self.fixes],
             "leaks": [asdict(c) for c in self.leaks],
+            "outside": [asdict(c) for c in self.outside],
             "checks": [asdict(c) for c in self.checks],
         }
 

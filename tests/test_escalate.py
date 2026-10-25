@@ -248,3 +248,35 @@ def test_another_service_s_action_on_an_instance_its_policy_names(tmp_path):
         "aws_iam_user.u",
     )
     assert ("control", "aws_instance.box") in r.gains  # ssm: acting on an EC2 instance the statement names
+
+
+def trusted(name, principal, extra="", action='"sts:AssumeRole"'):
+    return (
+        f'resource "aws_iam_role" "{name}" {{\n  assume_role_policy = jsonencode({{Statement = [{{Effect = "Allow", '
+        f"Action = {action}, Principal = {principal}{extra}}}]}})\n}}\n"
+    )
+
+
+def test_roles_other_accounts_may_assume(tmp_path):
+    (tmp_path / "main.tf").write_text(
+        'data "aws_caller_identity" "me" {}\n'
+        + trusted(
+            "vendor",
+            '{AWS = "arn:aws:iam::111122223333:root"}',
+            ', Condition = {StringEquals = {"sts:ExternalId" = "x"}}',
+        )
+        + trusted("anyone", '{AWS = "*"}')
+        + trusted("ours", "{AWS = data.aws_caller_identity.me.account_id}")
+        + trusted("tags_only", '{AWS = "arn:aws:iam::111122223333:root"}', action='"sts:TagSession"')
+        + 'resource "aws_iam_role_policy" "p" {\n  role = aws_iam_role.anyone.id\n'
+        '  policy = jsonencode({Statement = [{Effect = "Allow", Action = "s3:*", Resource = "*"}]})\n}\n'
+        'resource "aws_s3_bucket" "customer_exports" {}\n'
+    )
+    g = graph.build(tmp_path, ".")
+    out = {c.steps[1]: c for c in escalate.outside(g, arch.build(g))}
+    assert set(out) == {"aws_iam_role.vendor", "aws_iam_role.anyone"}  # not our own account, not TagSession alone
+    assert out["aws_iam_role.anyone"].confidence == "certain" and out["aws_iam_role.anyone"].severity == "critical"
+    assert out["aws_iam_role.anyone"].sinks == ["aws_s3_bucket.customer_exports"]
+    assert (
+        out["aws_iam_role.vendor"].confidence == "possible" and "the external ID" in out["aws_iam_role.vendor"].hops[0]
+    )

@@ -45,7 +45,8 @@ def render(model: arch.Model, title: str, scanned: bool = False, paths: chains.R
             e["kind"] = "unknown"
     found = paths.to_dict() if paths else {"chains": [], "edges": [], "fixes": [], "leaks": []}
     data["edges"] += found["edges"]
-    leaks = [{**c, "leak": True} for c in found.get("leaks", [])]  # after the paths, so fixes' indexes still hold
+    # after the paths, so fixes' indexes still hold: the sidebar lists these with the leaks
+    leaks = [{**c, "leak": True} for c in found.get("leaks", []) + found.get("outside", [])]
     data.update(
         target=title,
         chains=found["chains"] + leaks,

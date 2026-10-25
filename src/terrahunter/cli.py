@@ -318,6 +318,17 @@ def show_leaks(r: chains.Result) -> None:
         print(f"           … and {n - 10} more (--report)")
 
 
+def show_outside(r: chains.Result) -> None:
+    if not r.outside:
+        return
+    n = len(r.outside)
+    print(f"\nFrom other accounts: {n} role{'s' if n != 1 else ''} principals outside this configuration may assume")
+    for c in r.outside[:10]:
+        print(f"  {c.severity:<8} {c.confidence:<8} {sandbox.one_line(c.entry, 130)}")
+    if n > 10:
+        print(f"           … and {n - 10} more (--report)")
+
+
 def parse_vars(pairs: list[str]) -> dict:
     """--var NAME=VALUE → {name: value in the parser's shape}. VALUE is read as HCL; if it isn't valid HCL, it's a
     string (as terraform takes `-var region=eu-west-1`)."""
@@ -419,6 +430,8 @@ def _main(argv: list[str] | None) -> int:
                     print(f"  --as: not in this root: {', '.join(missing)}")
                 paths.leaks = escalate.leaks(g, model, [x for x in a.as_ if x in g.resources] or None)
                 show_leaks(paths)
+            paths.outside = escalate.outside(g, model)
+            show_outside(paths)
         graphs.append((g, scan, paths))
         if paths:
             results.append(report.RootResult(c.path, s, g, model, scan, paths))
@@ -445,6 +458,7 @@ def _main(argv: list[str] | None) -> int:
                                 "attack_paths": p.to_dict()["chains"],
                                 "fixes": p.to_dict()["fixes"],
                                 "if_credentials_leak": p.to_dict()["leaks"],
+                                "from_other_accounts": p.to_dict()["outside"],
                             }
                             if p
                             else {}

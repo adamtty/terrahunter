@@ -253,3 +253,8 @@ def test_a_policy_attached_through_a_lookup_and_naming_a_module_s_output(tmp_pat
         m.allowed("aws_iam_role.r", "secretsmanager:GetSecretValue", "module.data.aws_secretsmanager_secret.ops")
         is True
     )
+
+
+def test_a_trust_that_only_allows_tag_session_admits_no_one(tmp_path):
+    m = model(tmp_path, TRUST.format(principal="AWS = aws_iam_user.u.arn").replace("sts:AssumeRole", "sts:TagSession"))
+    assert m.can_assume("aws_iam_user.u", "aws_iam_role.t") is False
