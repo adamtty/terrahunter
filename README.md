@@ -74,6 +74,14 @@ left in configuration it can read, …). Each identity that would give more is l
 the diagram, with every hop and the technique behind it. `--as ADDRESS` starts from named identities only;
 `--no-credentials` skips it.
 
+### From other accounts
+
+Roles whose trust policy admits principals outside the configuration — another account, any account (`*`), an
+identity provider's users — are listed separately, with what narrows each trust (an external ID, an organization,
+a principal pattern, an OIDC subject) and what becoming the role gives. An unconditional `*`, or an identity
+provider with no subject condition, is *certain*; a named account or a narrowed trust is *possible*. A statement that
+allows only `sts:TagSession` admits no one.
+
 ### Check by hand
 
 Some of what a path rests on isn't in the Terraform, so terrahunter asks instead of guessing. Each question names the

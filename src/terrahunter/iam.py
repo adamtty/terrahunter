@@ -390,18 +390,22 @@ class Model:
         doc = self._doc(role, "assume_role_policy", r.body.get("assume_role_policy"))
         out = []
         for st in _list((doc or {}).get("Statement")):
-            if isinstance(st, dict) and str(st.get("Effect", "Allow")) == "Allow":
-                pr = st.get("Principal")
-                principals = (
-                    {"AWS": ["*"]}
-                    if pr == "*"
-                    else {k: _list(v) for k, v in pr.items()}
-                    if isinstance(pr, dict)
-                    else {}
-                )
-                s = Statement("Allow", [], [], [], [], bool(st.get("Condition")), role)
-                s.resources = [f"{k}:{x}" for k, vs in principals.items() for x in vs]  # principals, kind:value
-                out.append(s)
+            if not isinstance(st, dict) or str(st.get("Effect", "Allow")) != "Allow":
+                continue
+            acts = [str(a).strip('"').lower() for a in _list(st.get("Action"))]
+            # only a statement that allows assuming the role lets anyone in (sts:TagSession alone doesn't)
+            if acts and not any(
+                fnmatch.fnmatchcase("sts:assumerole", a) or a.startswith("sts:assumerolewith") for a in acts
+            ):
+                continue
+            pr = st.get("Principal")
+            principals = (
+                {"AWS": ["*"]} if pr == "*" else {k: _list(v) for k, v in pr.items()} if isinstance(pr, dict) else {}
+            )
+            cond = st.get("Condition") if isinstance(st.get("Condition"), dict) else {}
+            s = Statement("Allow", [], [], [], [], bool(st.get("Condition")), role, condition=cond)
+            s.resources = [f"{k}:{x}" for k, vs in principals.items() for x in vs]  # principals, kind:value
+            out.append(s)
         return out
 
     def services(self, role: str) -> set[str]:

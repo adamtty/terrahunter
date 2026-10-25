@@ -161,6 +161,24 @@ def _root(r: RootResult) -> list[str]:
                 out.append(f"- **{md(reach)}**")
             out.append("")
 
+    if p.outside:
+        out += [
+            "### From other accounts",
+            "",
+            (
+                "Roles whose trust policy admits principals outside this configuration (another account, any account, "
+                "an identity provider's users), with what each trust is narrowed by and what becoming the role gives."
+            ),
+            "",
+        ]
+        for n, c in enumerate(p.outside, 1):
+            out += [f"#### {n}. {c.severity.upper()} · {c.confidence} · {md(c.entry)}", ""]
+            out += [f"- {md(h)}" for h in c.hops if not h.startswith("reaches:")]
+            reach = next((h for h in c.hops if h.startswith("reaches:")), "")
+            if reach:
+                out.append(f"- **{md(reach)}**")
+            out.append("")
+
     if r.scan:
         out += ["### Findings", ""]
         st = ", ".join(
