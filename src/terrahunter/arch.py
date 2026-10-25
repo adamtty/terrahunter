@@ -470,9 +470,9 @@ def build(g: graph.Graph, findings: list[scanners.Finding] = ()) -> Model:
             if b.get("cidr_ipv4") or b.get("cidr_blocks")
             else ["sg"]
         )
-        for sg in targets(r, "aws_security_group"):
+        for sg in targets(r, "aws_security_group"):  # a group the configuration creates, or one it looks up
             for c in cidrs:
-                sg_rules[sg].append((_ports(b), _s(c), r))
+                sg_rules.setdefault(sg, []).append((_ports(b), _s(c), r))
     exposed, public_ips = clouds.exposure(R, targets, sources, of)
     maybe: dict[str, list[tuple[str, str]]] = {}  # possibly exposed: a test or a condition terrahunter can't settle
     account_open: dict[str, list[tuple[str, str]]] = {}  # open to every principal of the account, not the internet
