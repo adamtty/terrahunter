@@ -557,6 +557,31 @@ def build(g: graph.Graph, model: arch.Model) -> Result:
                 {"id": f"x{len(edges)}", "source": s, "target": t, "label": label, "kind": kind, "quiet": False}
             )
 
+    gives: dict[str, bool] = {}
+    im = None
+
+    def gives_more(identity: str) -> bool:
+        """Whether an identity's credentials give an attacker anything: data, another identity, or the account (the
+        credentials search). Non-AWS identities are kept as they are."""
+        nonlocal im
+        if identity not in gives:
+            if identity not in R or not R[identity].type.startswith("aws_"):
+                gives[identity] = True
+            else:
+                from terrahunter import escalate, iam
+
+                im = im or iam.Model(g)
+                r = escalate.search(g, model, identity, im)
+                gives[identity] = any(a != identity for (_, a) in r.gains)
+        return gives[identity]
+
+    def hostless(c: arch.Component) -> bool:
+        """Compute with no machine an attacker could also take over: a function, an API, a Fargate task."""
+        if c.type in APIS or c.type in clouds.SERVERLESS or c.type == "aws_lambda_function":
+            return True
+        b = R[c.id].body if c.id in R else {}
+        return c.type == "aws_ecs_service" and deps.unquote(b.get("launch_type")) == "FARGATE"
+
     def can_log_in(c: arch.Component) -> bool:
         """Whether SSH or RDP open to the internet is a way in: an EC2 instance takes a login only with a key pair or
         a password its user data sets (EC2 Instance Connect needs IAM permissions the internet doesn't have)."""
@@ -706,8 +731,10 @@ def build(g: graph.Graph, model: arch.Model) -> Result:
                     sinks += [t for t in via_identity(role, h) if t not in sinks]
                 if sinks:
                     h.append(reached(sinks))
-                elif not (role or "shell" in text):
-                    continue  # traffic reaches it, but nothing follows
+                elif not (role and (gives_more(role) or not hostless(node)) or "shell" in text):
+                    # traffic reaches it, but nothing follows: no shell, and an identity that can do nothing that
+                    # matters on compute with no host behind it (a function, an API, a Fargate task)
+                    continue
                 kind = " → ".join(
                     ["internet"]
                     + [comps[p].tname for p in path]
@@ -732,7 +759,8 @@ def build(g: graph.Graph, model: arch.Model) -> Result:
     # the configuration) still answers anyone who calls it: its responses are what the internet gets
     started = {ch.steps[1] for ch in chains if len(ch.steps) > 1} | {s for ch in chains for s in ch.sinks}
     for eid, why in entries:
-        if comps[eid].type in APIS and eid not in started:
+        backend = any(e.label in ("invokes", "routes to") and e.target in comps for e in out.get(eid, []))
+        if comps[eid].type in APIS and eid not in started and not backend:  # a backend was followed: it decided
             keyed = any(
                 arch._bool(R[m].body.get("api_key_required"))
                 for m in R

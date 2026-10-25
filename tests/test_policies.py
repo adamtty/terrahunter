@@ -198,6 +198,22 @@ def test_a_public_api_with_nothing_behind_it_is_still_a_path(tmp_path, keyed, co
     assert (c.kind, c.steps, c.confidence) == ("exposed API", ["internet", "aws_api_gateway_rest_api.api"], confidence)
 
 
+@pytest.mark.parametrize(("action", "found"), [("logs:PutLogEvents", False), ("s3:GetObject", True)])
+def test_a_function_whose_role_does_nothing_that_matters_is_no_path(tmp_path, action, found):
+    text = (
+        'resource "aws_s3_bucket" "b" {}\nresource "aws_iam_role" "fn" {}\n'
+        'resource "aws_iam_role_policy" "p" {\n  role = aws_iam_role.fn.id\n'
+        f'  policy = jsonencode({{Statement = [{{Effect = "Allow", Action = "{action}", Resource = "*"}}]}})\n}}\n'
+        'resource "aws_lambda_function" "f" {\n  function_name = "f"\n  role = aws_iam_role.fn.arn\n}\n'
+        'resource "aws_api_gateway_rest_api" "api" {}\n'
+        'resource "aws_api_gateway_method" "m" {\n  rest_api_id = aws_api_gateway_rest_api.api.id\n'
+        '  http_method = "GET"\n  authorization = "NONE"\n}\n'
+        'resource "aws_api_gateway_integration" "i" {\n  rest_api_id = aws_api_gateway_rest_api.api.id\n'
+        '  type = "AWS_PROXY"\n  uri = aws_lambda_function.f.invoke_arn\n}\n'
+    )
+    assert bool(build(tmp_path, text).chains) is found
+
+
 @pytest.mark.parametrize(("key", "internet"), [("", False), ("  kms_key_id = aws_kms_key.k.arn\n", True)])
 def test_a_public_secret_on_the_aws_managed_key_is_only_open_to_the_account(tmp_path, key, internet):
     text = (
