@@ -102,6 +102,7 @@ class Model:
             self.out_e.setdefault(e.source, []).append(e)
             self.in_e.setdefault(e.target, []).append(e)
         self._statements: dict[str, list[Statement]] = {}
+        self._allowed: dict[tuple, bool | None] = {}
         self.identities = [a for a, r in R.items() if r.mode == "managed" and r.type in IDENTITIES]
 
     # --- documents ---------------------------------------------------------------------------------------------
@@ -222,6 +223,12 @@ class Model:
 
     def allowed(self, identity: str, action: str, resource: str | None = None) -> bool | None:
         """Whether the identity's statements allow an action on a resource (None: on "*" only)."""
+        key = (identity, action.lower(), resource)
+        if key not in self._allowed:
+            self._allowed[key] = self._decide(identity, action, resource)
+        return self._allowed[key]
+
+    def _decide(self, identity: str, action: str, resource: str | None) -> bool | None:
         sts = [s for s in self.statements(identity) if s.covers_action(action) and s.covers(resource, self.names)]
         if any(s.effect == "Deny" and not s.conditional for s in sts):
             return False
@@ -244,20 +251,39 @@ class Model:
         for s in self.statements(identity):
             if s.effect != "Allow" or s.conditional or not s.covers(resource, self.names):
                 continue
-            if s.not_actions or any(p in ("*", f"{service}:*") for p in s.actions):
-                level = "admin"
-            else:
-                level = ""
-                for p in s.actions:
-                    if p.split(":")[0] != service and not fnmatch.fnmatchcase(service, p.split(":")[0]):
+            # the actions of the service it allows, each at its access level; an action a Deny takes away doesn't
+            # count. Every action of the service (`*`, `svc:*`, NotAction) is admin.
+            patterns = (
+                [f"{service}:*"]
+                if s.not_actions
+                else [p for p in s.actions if p == "*" or p.split(":")[0] in (service, "*")]
+            )
+            whole = s.not_actions or any(p in ("*", f"{service}:*") for p in s.actions)
+            level = ""
+            for p in patterns:
+                for a, lvl in kb.aws_actions(f"{service}:*" if p == "*" else p):
+                    if not s.covers_action(a) or self.allowed(identity, a, resource) is not True:
                         continue
-                    for _, lvl in kb.aws_actions(p):
-                        mine = _KB_LEVEL.get(lvl, "")
-                        if LEVELS.get(mine, 0) > LEVELS.get(level, 0):
-                            level = mine
+                    mine = (
+                        "admin"
+                        if whole and not self._denied_any(identity, service, resource)
+                        else _KB_LEVEL.get(lvl, "")
+                    )
+                    if LEVELS.get(mine, 0) > LEVELS.get(level, 0):
+                        level = mine
             if LEVELS.get(level, 0) > LEVELS.get(best, 0):
                 best = level
         return best
+
+    def _denied_any(self, identity: str, service: str, resource: str | None) -> bool:
+        """Whether an unconditional Deny takes any of a service's actions away on the resource."""
+        return any(
+            st.effect == "Deny"
+            and not st.conditional
+            and st.covers(resource, self.names)
+            and (st.not_actions or any(p == "*" or p.split(":")[0] in (service, "*") for p in st.actions))
+            for st in self.statements(identity)
+        )
 
     # --- trust -------------------------------------------------------------------------------------------------
     def trust(self, role: str) -> list[Statement]:
