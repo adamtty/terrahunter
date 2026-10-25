@@ -419,3 +419,17 @@ def test_a_cloudfront_distribution_serves_the_bucket_it_may_read(tmp_path, signe
     r = paths(tmp_path, CDN.replace("SIGNED", signed) + policy)
     cdn = [c for c in r.chains if c.kind == "internet → CloudFront → data"]
     assert bool(cdn) is found and (not found or cdn[0].sinks == ["aws_s3_bucket.site"])
+
+
+def test_a_rule_on_a_looked_up_security_group(tmp_path):
+    # a group found with a data source, opened by a rule in this configuration: no crash, and it opens the port
+    r = paths(
+        tmp_path,
+        NET + ROLE + BUCKETS + WILDCARD_S3 + 'data "aws_security_group" "default" {\n  name = "default"\n}\n'
+        'resource "aws_security_group_rule" "ssh" {\n  type = "ingress"\n  from_port = 22\n  to_port = 22\n'
+        '  cidr_blocks = ["0.0.0.0/0"]\n  security_group_id = data.aws_security_group.default.id\n}\n'
+        'resource "aws_instance" "box" {\n  subnet_id = aws_subnet.pub.id\n  key_name = "ops"\n'
+        "  vpc_security_group_ids = [data.aws_security_group.default.id]\n"
+        "  iam_instance_profile = aws_iam_instance_profile.app.name\n}\n",
+    )
+    assert any("aws_instance.box" in c.steps for c in r.chains)
