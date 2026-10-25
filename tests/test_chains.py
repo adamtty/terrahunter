@@ -287,3 +287,37 @@ def test_an_internet_path_carries_on_with_the_role_s_credentials(tmp_path):
     (c,) = r.chains
     assert "aws_iam_role.admin" in c.controls and "aws_dynamodb_table.orders" in c.sinks
     assert any("with aws_iam_role.app's credentials" in h and "privesc-sts-001" in h for h in c.hops)
+
+
+def test_a_private_key_in_a_public_bucket_logs_in_to_the_machine_that_trusts_it(tmp_path):
+    (tmp_path / "files" / "keys").mkdir(parents=True)
+    (tmp_path / "files" / "keys" / "justin.pem").write_text("-----BEGIN OPENSSH PRIVATE KEY-----\n")
+    (tmp_path / "files" / "index.html").write_text("<p>hi</p>")
+    r = paths(
+        tmp_path,
+        NET + ROLE + sg("ssh", 22) + 'resource "aws_s3_bucket" "site" {\n  acl = "public-read"\n}\n'
+        'resource "aws_s3_object" "files" {\n  for_each = fileset("${path.module}/files", "**")\n'
+        '  bucket = aws_s3_bucket.site.id\n  key = each.value\n  source = "${path.module}/files/${each.value}"\n}\n'
+        + instance(
+            "dev",
+            "pub",
+            "ssh",
+            '  user_data = "curl -o /home/justin/.ssh/authorized_keys https://site/keys/justin.pub"\n'
+            "  iam_instance_profile = aws_iam_instance_profile.app.name\n",
+        )
+        + instance("other", "pub", "ssh", '  key_name = "ops"\n'),
+    )
+    (ch,) = [c for c in r.chains if c.kind == "internet → public store → SSH key → VM"]
+    assert ch.steps == ["internet", "aws_s3_bucket.site", "aws_instance.dev", "aws_iam_role.app"]
+    assert ch.confidence == "likely" and "justin.pem" in ch.hops[-3]
+
+
+def test_an_older_provider_names_the_container_a_blob_is_in(tmp_path):
+    # azurerm 3 and 4 took names where 5 takes the container's id
+    (tmp_path / "main.tf").write_text(
+        'resource "azurerm_storage_container" "c" {}\n'
+        'resource "azurerm_storage_blob" "b" {\n  storage_container_name = azurerm_storage_container.c.name\n}\n'
+    )
+    g = graph.build(tmp_path, ".")
+    (e,) = [e for e in g.edges if e.source == "azurerm_storage_blob.b"]
+    assert chains._stores_in(e, g.resources)

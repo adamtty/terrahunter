@@ -61,6 +61,12 @@ def score_root(folder: Path, key: dict, inputs: dict | None = None) -> dict:
         g = graph.build(folder, root, variables=inputs.get("variables"), var_files=[f for f in files if f.is_file()])
         model = arch.build(g)
         found = chains.build(g, model).chains
+
+    def reach(c: chains.Chain) -> set[str]:
+        """What a path reaches: the data, what's kept in it, what it takes over, and the components it goes through
+        (a VM it logs in to is controlled, and keys list it)."""
+        return {norm(x) for x in [*c.steps[1:], *c.sinks, *c.within, *c.controls]}
+
     expected = [p for p in key.get("paths", []) if p["steps"][:1] == ["internet"]]
     given = [p for p in key.get("paths", []) if p["steps"][:1] != ["internet"]]
     not_paths = {norm(n["resource"]): n["why"] for n in key.get("not_paths", [])}
@@ -70,16 +76,18 @@ def score_root(folder: Path, key: dict, inputs: dict | None = None) -> dict:
     for p in expected:
         e, first = norm(p["entry"]), norm(p["steps"][1]) if len(p["steps"]) > 1 else norm(p["entry"])
         want = {norm(r["resource"]) for r in p.get("reaches", [])}
-        best, best_hit = None, -1
+        best, best_hit, best_rank = None, -1, (False, -1)
         for i, c in enumerate(found):
             on_path = {norm(x) for x in c.steps[1:]} | ({norm(c.sinks[0])} if c.steps == ["internet"] else set())
             # the path's entry, its other ways in, and what opens the entry to the internet (a public container
             # on its storage account, a bucket policy on its bucket): keys may name either
             entries = {norm(entry_of(c)), *map(norm, c.also), *(norm(o) for _, o in model.exposed.get(entry_of(c), []))}
             if e in entries or first in on_path | entries:
-                hit = len(want & {norm(s) for s in [*c.sinks, *c.within, *c.controls]})
-                if hit > best_hit:
-                    best, best_hit = i, hit
+                # a path that starts where the key's does comes before one that only passes through it
+                hit = len(want & reach(c))
+                rank = (e in entries, hit)
+                if best is None or rank > best_rank:
+                    best, best_hit, best_rank = i, hit, rank
         row = {
             "id": p["id"],
             "entry": p["entry"],
@@ -92,9 +100,7 @@ def score_root(folder: Path, key: dict, inputs: dict | None = None) -> dict:
         if best is not None:
             used.add(best)
             row["confidence"] = CONF.get(found[best].confidence, found[best].confidence)
-            row["missed"] = sorted(
-                want - {norm(s) for s in [*found[best].sinks, *found[best].within, *found[best].controls]}
-            )
+            row["missed"] = sorted(want - reach(found[best]))
         out["expected"].append(row)
     for i, c in enumerate(found):
         if i in used:
