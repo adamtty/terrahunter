@@ -351,3 +351,263 @@ class Model:
                 if ok is None:
                     best = None
         return best
+
+
+# --- Azure and Google Cloud ----------------------------------------------------------------------------------------
+# where each provider's data plane lives, for an access level on a store (azurerm type prefix → provider)
+AZURE_PROVIDERS = {
+    "azurerm_storage": "Microsoft.Storage",
+    "azurerm_key_vault": "Microsoft.KeyVault",
+    "azurerm_cosmosdb": "Microsoft.DocumentDB",
+    "azurerm_mssql": "Microsoft.Sql",
+    "azurerm_sql": "Microsoft.Sql",
+    "azurerm_mysql": "Microsoft.DBforMySQL",
+    "azurerm_postgresql": "Microsoft.DBforPostgreSQL",
+    "azurerm_managed_disk": "Microsoft.Compute",
+    "azurerm_linux_function_app": "Microsoft.Web",
+    "azurerm_windows_function_app": "Microsoft.Web",
+    "azurerm_function_app": "Microsoft.Web",
+    "azurerm_linux_web_app": "Microsoft.Web",
+    "azurerm_windows_web_app": "Microsoft.Web",
+    "azurerm_app_service": "Microsoft.Web",
+    "azurerm_automation": "Microsoft.Automation",
+    "azurerm_virtual_machine": "Microsoft.Compute",
+    "azurerm_linux_virtual_machine": "Microsoft.Compute",
+    "azurerm_windows_virtual_machine": "Microsoft.Compute",
+}
+_MEMBER_ATTRS = ("member", "members", "role", "condition", "etag", "project")
+
+
+@dataclass
+class Assignment:
+    source: str  # the role assignment / IAM binding resource
+    role: str
+    actions: list[str]  # lower case patterns (Azure operations / GCP permissions)
+    not_actions: list[str]
+    scope: set[str] | None  # the resources it covers; None: the whole subscription / project
+
+
+class _CloudModel:
+    """What Azure and Google Cloud models share with the AWS one: allowed, access, can_assume, is_admin."""
+
+    def __init__(self, g: graph.Graph):
+        self.g = g
+        self.out_e: dict[str, list[graph.Edge]] = {}
+        self.in_e: dict[str, list[graph.Edge]] = {}
+        for e in g.edges:
+            self.out_e.setdefault(e.source, []).append(e)
+            self.in_e.setdefault(e.target, []).append(e)
+        self._assignments: dict[str, list[Assignment]] = {}
+
+    def assignments(self, identity: str) -> list[Assignment]:
+        raise NotImplementedError
+
+    def _covers(self, a: Assignment, action: str, resource: str | None) -> bool:
+        act = action.lower()
+        ok = any(fnmatch.fnmatchcase(act, p) for p in a.actions) and not any(
+            fnmatch.fnmatchcase(act, p) for p in a.not_actions
+        )
+        return ok and (a.scope is None or resource is None or resource in a.scope)
+
+    def allowed(self, identity: str, action: str, resource: str | None = None) -> bool | None:
+        return any(self._covers(a, action, resource) for a in self.assignments(identity))
+
+    def why(self, identity: str, action: str, resource: str | None = None) -> str:
+        return next((a.source for a in self.assignments(identity) if self._covers(a, action, resource)), "")
+
+    def is_admin(self, identity: str) -> bool:
+        return any(a.scope is None and a.actions == ["*"] and not a.not_actions for a in self.assignments(identity))
+
+    def can_assume(self, principal: str, role: str) -> bool | None:
+        return False
+
+    def services(self, role: str) -> set[str]:
+        return set()
+
+    def statements(self, identity: str) -> list:
+        return []
+
+
+class AzureModel(_CloudModel):
+    """Azure RBAC: role assignments whose principal_id is an identity's (a user-assigned identity, or the
+    system-assigned identity of a workload), with the role's actions and data actions, at their scope."""
+
+    def assignments(self, identity: str) -> list[Assignment]:
+        if identity in self._assignments:
+            return self._assignments[identity]
+        R = self.g.resources
+        out = []
+        for e in self.in_e.get(identity, []):
+            a = e.source
+            if R[a].type != "azurerm_role_assignment" or not e.attr.startswith("principal_id"):
+                continue
+            b = R[a].body
+            role = deps.unquote(b.get("role_definition_name")) or ""
+            perms = kb.azure_role(role) or []
+            for d in self.out_e.get(a, []):  # a custom role definition
+                if R.get(d.target) and R[d.target].type == "azurerm_role_definition":
+                    role = role or R[d.target].name
+                    perms = [
+                        {
+                            k: [deps.unquote(x) or str(x) for x in _list(p.get(k))]
+                            for k in ("actions", "not_actions", "data_actions", "not_data_actions")
+                        }
+                        for p in _list(R[d.target].body.get("permissions"))
+                        if isinstance(p, dict)
+                    ]
+            acts = [x.lower() for p in perms for x in [*(p.get("actions") or []), *(p.get("data_actions") or [])]]
+            nots = [
+                x.lower() for p in perms for x in [*(p.get("not_actions") or []), *(p.get("not_data_actions") or [])]
+            ]
+            out.append(Assignment(a, role or "a role", acts, nots, self._scope(a)))
+        self._assignments[identity] = out
+        return out
+
+    def _scope(self, a: str) -> set[str] | None:
+        R = self.g.resources
+        for e in self.out_e.get(a, []):
+            t = e.target
+            if not e.attr.startswith("scope") or t not in R or R[t].mode != "managed":
+                continue  # a data source (the subscription) or no reference: the whole subscription
+            if R[t].type == "azurerm_resource_group":  # what lives in the group
+                return {x.source for x in self.in_e.get(t, []) if x.attr.startswith("resource_group_name")}
+            return {t} | {x.source for x in self.in_e.get(t, [])}  # the resource and what's inside it
+        return None
+
+    def access(self, identity: str, resource: str, service: str = "") -> str:
+        R = self.g.resources
+        prov = next((p for k, p in AZURE_PROVIDERS.items() if R[resource].type.startswith(k)), "")
+        best = ""
+        for a in self.assignments(identity):
+            if a.scope is not None and resource not in a.scope:
+                continue
+            if any(p in ("*", f"{prov.lower()}/*") for p in a.actions) or any(
+                p.endswith("listkeys/action") and p.startswith(prov.lower()) for p in a.actions
+            ):
+                level = "admin"  # every action, or the account keys, which give every data action
+            elif any(p.startswith(prov.lower()) and _azure_writes(p) for p in a.actions):
+                level = "write"
+            elif any(p.startswith(prov.lower()) or p == "*/read" for p in a.actions):
+                level = "read"
+            else:
+                level = ""
+            if LEVELS.get(level, 0) > LEVELS.get(best, 0):
+                best = level
+        return best
+
+
+class GcpModel(_CloudModel):
+    """Google Cloud IAM: project and resource IAM members and bindings that name a service account, with the role's
+    permissions; holding roles/iam.serviceAccountTokenCreator or serviceAccountUser on another service account lets
+    it act as that one."""
+
+    def assignments(self, identity: str) -> list[Assignment]:
+        if identity in self._assignments:
+            return self._assignments[identity]
+        R = self.g.resources
+        out = []
+        for e in self.in_e.get(identity, []):
+            b = e.source
+            t = R[b].type
+            if not re.search(r"_iam_(member|binding)$", t) or not e.attr.startswith("member"):
+                continue
+            role = deps.unquote(R[b].body.get("role")) or ""
+            perms = kb.gcp_role(role)
+            if perms is None:  # a custom role the configuration creates
+                perms = [
+                    deps.unquote(p) or str(p)
+                    for x in self.out_e.get(b, [])
+                    if R.get(x.target) and R[x.target].type.endswith("_iam_custom_role")
+                    for p in _list(R[x.target].body.get("permissions"))
+                ]
+            acts = ["*"] if role in ("roles/owner", "roles/editor") else [p.lower() for p in perms]
+            scope = None
+            if not t.startswith(("google_project_iam", "google_organization_iam", "google_folder_iam")):
+                scope = {x.target for x in self.out_e.get(b, []) if not x.attr.startswith(_MEMBER_ATTRS)}
+            out.append(Assignment(b, role, acts, [], scope))
+        self._assignments[identity] = out
+        return out
+
+    def access(self, identity: str, resource: str, service: str = "") -> str:
+        R = self.g.resources
+        svc = R[resource].type.split("_")[1] if "_" in R[resource].type else ""
+        best = ""
+        for a in self.assignments(identity):
+            if a.scope is not None and resource not in a.scope:
+                continue
+            mine = [
+                p
+                for p in a.actions
+                if p == "*" or p.startswith(f"{svc}.") or svc == "storage" and p.startswith("storage.")
+            ]
+            if not mine:
+                continue
+            if "*" in mine or any(p.endswith((".setiampolicy", ".delete")) for p in mine):
+                level = "admin"
+            elif any(p.endswith((".create", ".update")) for p in mine):
+                level = "write"
+            else:
+                level = "read"
+            if LEVELS.get(level, 0) > LEVELS.get(best, 0):
+                best = level
+        return best
+
+    def can_assume(self, principal: str, role: str) -> bool | None:
+        """Acting as another service account: token creator or service account user on it, or project-wide."""
+        if self.g.resources.get(role) is None or self.g.resources[role].type != "google_service_account":
+            return False
+        return any(
+            self._covers(a, perm, role)
+            for a in self.assignments(principal)
+            for perm in ("iam.serviceAccounts.getAccessToken", "iam.serviceAccounts.actAs")
+        )
+
+
+class Models:
+    """One IAM model per cloud, called by the identity's cloud: the AWS model's interface for all three."""
+
+    def __init__(self, g: graph.Graph):
+        self.g = g
+        self.aws = Model(g)
+        self.azure = AzureModel(g)
+        self.gcp = GcpModel(g)
+        R = g.resources
+        self.identities = self.aws.identities + [
+            a
+            for a, r in R.items()
+            if r.mode == "managed"
+            and (r.type in ("azurerm_user_assigned_identity", "google_service_account") or _system_identity(r))
+        ]
+
+    def of(self, identity: str):
+        t = self.g.resources[identity].type if identity in self.g.resources else ""
+        return self.azure if t.startswith("azurerm_") else self.gcp if t.startswith("google_") else self.aws
+
+    def __getattr__(self, name):  # allowed, access, why, can_assume, services, statements: by the identity's cloud
+        def call(identity, *args, **kw):
+            return getattr(self.of(identity), name)(identity, *args, **kw)
+
+        return call
+
+    def is_admin(self, identity: str) -> bool:
+        m = self.of(identity)
+        if m is self.aws:
+            return m.allowed(identity, "*", None) is True and any(
+                s.actions == ["*"] and s.resources == ["*"] for s in m.statements(identity) if s.effect == "Allow"
+            )
+        return m.is_admin(identity)
+
+
+def _azure_writes(op: str) -> bool:
+    """An Azure operation that changes something: a write or delete, or an action that isn't a read in disguise
+    (generateUserDelegationKey, listKeys and the like read; listKeys is handled as admin before this)."""
+    if op.endswith(("/write", "/delete")):
+        return True
+    return op.endswith("/action") and not re.search(r"/(get|list|read|generate)[^/]*/action$", op)
+
+
+def _system_identity(r: graph.Resource) -> bool:
+    """An Azure workload with a system-assigned identity is an identity too."""
+    if not r.type.startswith("azurerm_"):
+        return False
+    return any("SystemAssigned" in str(b.get("type", "")) for b in _list(r.body.get("identity")) if isinstance(b, dict))

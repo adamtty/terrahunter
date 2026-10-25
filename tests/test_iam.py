@@ -140,3 +140,36 @@ def test_an_arn_with_an_interpolation_names_by_its_literal_tail(tmp_path):
     )
     assert m.allowed("aws_iam_role.r", "iam:PassRole", "aws_iam_role.agentcore_runtime") is True
     assert m.allowed("aws_iam_role.r", "iam:PassRole", "aws_iam_role.other") is False
+
+
+def test_azure_role_assignments(tmp_path):
+    (tmp_path / "main.tf").write_text(
+        'resource "azurerm_user_assigned_identity" "ops" {}\nresource "azurerm_user_assigned_identity" "app" {}\n'
+        'resource "azurerm_resource_group" "rg" {}\n'
+        'resource "azurerm_storage_account" "data" {\n  resource_group_name = azurerm_resource_group.rg.name\n}\n'
+        'resource "azurerm_key_vault" "kv" {}\n'
+        'resource "azurerm_role_assignment" "owner" {\n  principal_id = azurerm_user_assigned_identity.ops.principal_id\n'
+        '  role_definition_name = "Owner"\n  scope = data.azurerm_subscription.current.id\n}\n'
+        'resource "azurerm_role_assignment" "blob" {\n  principal_id = azurerm_user_assigned_identity.app.principal_id\n'
+        '  role_definition_name = "Storage Blob Data Reader"\n  scope = azurerm_resource_group.rg.id\n}\n'
+    )
+    m = iam.Models(graph.build(tmp_path, "."))
+    assert m.is_admin("azurerm_user_assigned_identity.ops")
+    assert not m.is_admin("azurerm_user_assigned_identity.app")
+    assert m.access("azurerm_user_assigned_identity.app", "azurerm_storage_account.data") == "read"
+    assert m.access("azurerm_user_assigned_identity.app", "azurerm_key_vault.kv") == ""  # outside its scope
+
+
+def test_gcp_bindings_and_acting_as_another_service_account(tmp_path):
+    (tmp_path / "main.tf").write_text(
+        'resource "google_service_account" "app" {}\nresource "google_service_account" "admin" {}\n'
+        'resource "google_storage_bucket" "b" {}\nresource "google_storage_bucket" "other" {}\n'
+        'resource "google_storage_bucket_iam_member" "read" {\n  bucket = google_storage_bucket.b.name\n'
+        '  role = "roles/storage.objectViewer"\n  member = "serviceAccount:${google_service_account.app.email}"\n}\n'
+        'resource "google_service_account_iam_member" "token" {\n  service_account_id = google_service_account.admin.name\n'
+        '  role = "roles/iam.serviceAccountTokenCreator"\n  member = "serviceAccount:${google_service_account.app.email}"\n}\n'
+    )
+    m = iam.Models(graph.build(tmp_path, "."))
+    assert m.access("google_service_account.app", "google_storage_bucket.b") == "read"
+    assert m.access("google_service_account.app", "google_storage_bucket.other") == ""
+    assert m.can_assume("google_service_account.app", "google_service_account.admin") is True
