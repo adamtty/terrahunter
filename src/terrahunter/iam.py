@@ -22,6 +22,8 @@ import re
 from dataclasses import dataclass, field
 from functools import cached_property
 
+import hcl2
+
 from terrahunter import clouds, deps, graph, kb, policies
 
 POLICY_TYPES = (
@@ -49,6 +51,39 @@ _KB_LEVEL = {"List": "list", "Read": "read", "Write": "write", "Tagging": "write
 _NAME_ATTRS = ("name", "bucket", "function_name", "name_prefix", "repository_name", "cluster_identifier", "identifier")
 
 
+def _branches(v) -> list | None:
+    """Both branches of a value that's a conditional the code doesn't settle (`${var.x ? ["a"] : ["b"]}`), as one
+    list; None when it isn't one."""
+    if not isinstance(v, str):
+        return None
+    m = re.fullmatch(r"\$\{(.*)\}", v.strip().strip('"'), re.DOTALL)
+    if not m:
+        return None
+    text, depth, quote, q, c = m.group(1), 0, False, -1, -1
+    for i, ch in enumerate(text):
+        if ch == '"' and text[i - 1 : i] != "\\":
+            quote = not quote
+        elif not quote and ch in "[({":
+            depth += 1
+        elif not quote and ch in "])}":
+            depth -= 1
+        elif not quote and depth == 0 and ch == "?" and q < 0:
+            q = i
+        elif not quote and depth == 0 and ch == ":" and q >= 0:
+            c = i
+            break
+    if q < 0 or c < 0:
+        return None
+    out = []
+    for branch in (text[q + 1 : c], text[c + 1 :]):
+        try:
+            val = hcl2.loads(f"x = {branch.strip()}\n").get("x")
+        except Exception:  # noqa: BLE001 - a branch the parser can't read isn't a value
+            return None
+        out += [x[1:-1] if isinstance(x, str) and len(x) >= 2 and x[0] == x[-1] == '"' else x for x in _list(val)]
+    return [str(x) for x in out]
+
+
 def _list(v) -> list:
     return v if isinstance(v, list) else ([] if v is None else [v])
 
@@ -69,6 +104,7 @@ class Statement:
     source: str  # the resource the statement is written in
     targets: set[str] = field(default_factory=set)  # graph resources its Resource references or names
     condition: dict = field(default_factory=dict, repr=False)  # as written
+    maybe: bool = False  # its actions or resources are one of two branches the code doesn't settle
 
     def covers_action(self, action: str) -> bool:
         a = action.lower()
@@ -224,6 +260,11 @@ class Model:
         for st in _list(doc.get("Statement")):
             if not isinstance(st, dict):
                 continue
+            # `var.wide ? ["s3:*"] : ["s3:PutObject"]` with a condition nothing settles: either branch, possibly
+            st, maybe = dict(st), False
+            for k in ("Action", "NotAction", "Resource", "NotResource"):
+                if (both := _branches(st.get(k))) is not None:
+                    st[k], maybe = both, True
             res = [str(x) for x in _list(st.get("Resource"))]
             targets = set()
             for r in res + [str(x) for x in _list(st.get("NotResource"))]:
@@ -257,10 +298,11 @@ class Model:
                     not_actions=[str(a).lower() for a in _list(st.get("NotAction"))],
                     resources=res,
                     not_resources=[str(x) for x in _list(st.get("NotResource"))],
-                    conditional=bool(st.get("Condition")),
+                    conditional=bool(st.get("Condition")) or maybe,
                     source=source,
                     targets=targets,
                     condition=st.get("Condition") if isinstance(st.get("Condition"), dict) else {},
+                    maybe=maybe,
                 )
             )
         return out
@@ -431,7 +473,7 @@ class Model:
         admin; otherwise the knowledge base's access level of each action it's allowed."""
         best = ""
         for s in self.statements(identity):
-            if s.effect != "Allow" or s.conditional or not s.covers(resource, self.names):
+            if s.effect != "Allow" or s.conditional and not s.maybe or not s.covers(resource, self.names):
                 continue
             # the actions of the service it allows, each at its access level; an action a Deny takes away doesn't
             # count. Every action of the service (`*`, `svc:*`, NotAction) is admin.
@@ -444,7 +486,9 @@ class Model:
             level = ""
             for p in patterns:
                 for a, lvl in kb.aws_actions(f"{service}:*" if p == "*" else p):
-                    if not s.covers_action(a) or self.allowed(identity, a, resource) is not True:
+                    if not s.covers_action(a) or self.allowed(identity, a, resource) is False:
+                        continue
+                    if not s.maybe and self.allowed(identity, a, resource) is not True:
                         continue
                     mine = (
                         "admin"
