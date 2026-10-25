@@ -316,8 +316,7 @@ def _uploaded_files(g: graph.Graph, addr: str, limit: int = 2000) -> list[str]:
     return out
 
 
-# what links a store to the function it triggers, and an exposure that lets anyone write to the store
-_TRIGGERS = {"aws_lambda_event_source_mapping", "aws_s3_bucket_notification", "aws_sns_topic_subscription"}
+# an exposure that lets anyone write to a store (what the store then triggers: escalate.feeds)
 _WRITES = re.compile(r"\b\w+:(Send|Put|Publish|Write)\w*|\b\w+:\*|\bwrit", re.IGNORECASE)
 _SECRET_VAR = re.compile(
     r"""['"]?\w*(PASSW(OR)?D|SECRET|TOKEN|API_?KEY|ACCESS_?KEY|CREDENTIAL)\w*['"]?\s*[:=]""", re.IGNORECASE
@@ -662,16 +661,11 @@ def build(g: graph.Graph, model: arch.Model) -> Result:
         return bool(r and r.type == "aws_ecs_service" and str(deps.unquote(v) if isinstance(v, str) else v) == "0")
 
     def triggered(store: str) -> list[str]:
-        """The functions a store triggers: an event source mapping, a bucket notification or a topic subscription
-        that names both."""
-        out_fns = []
-        for r in R.values():
-            if r.type not in _TRIGGERS:
-                continue
-            refs = {e.target for e in g.edges if e.source == r.address}
-            if store in refs:
-                out_fns += [t for t in refs if t in comps and comps[t].type == "aws_lambda_function"]
-        return list(dict.fromkeys(out_fns))
+        """The compute a store hands what's written to it: an event source mapping, a bucket notification, a topic
+        subscription, an event bus's rules and targets (escalate.feeds)."""
+        from terrahunter import escalate as _feeds
+
+        return [t for t in _feeds.feeds(g, store) if t in comps]
 
     def ssh_hosts(keys: list[str]) -> dict[str, list[str]]:
         """Machines that take SSH from the internet (a public IP, 22 open) and trust one of these private keys: their
