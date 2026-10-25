@@ -83,6 +83,26 @@ def _root(r: RootResult) -> list[str]:
             out.append(f"| {i} | {md(f.action)} | {EFFECT[f.effect]} | {paths} | {where}{more} |")
         out.append("")
 
+    if p.checks:
+        out += [
+            "### Check by hand",
+            "",
+            (
+                "What the paths rest on that the Terraform doesn't show: confirm these before acting on a *likely* "
+                "or *possible* path."
+            ),
+            "",
+            "| # | Check | Where | Paths |",
+            "|---|---|---|---|",
+        ]
+        for i, k in enumerate(p.checks, 1):
+            where = "<br>".join(code(w) for w in k.where[:3]) + (
+                f"<br>+{len(k.where) - 3} more" if len(k.where) > 3 else ""
+            )
+            out.append(f"| {i} | {md(k.question, 600)} | {where} | {', '.join(str(n + 1) for n in k.chains)} |")
+        out.append("")
+    check_no = {k.id: i for i, k in enumerate(p.checks, 1)}
+
     out += ["### Attack paths", ""]
     if not p.chains:
         out += ["Nothing from the internet reaches data or a workload an attacker could take over.", ""]
@@ -115,6 +135,11 @@ def _root(r: RootResult) -> list[str]:
         if c.fixes:
             refs = ", ".join(f"#{n}" for n in sorted(fix_no[f] for f in c.fixes if f in fix_no))
             out += ["", f"Fixes: {refs}"]
+        if c.checks:
+            out += [
+                "",
+                "Check by hand: " + ", ".join(f"#{n}" for n in sorted(check_no[k] for k in c.checks if k in check_no)),
+            ]
         out.append("")
 
     if p.leaks:

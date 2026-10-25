@@ -50,6 +50,7 @@ def render(model: arch.Model, title: str, scanned: bool = False, paths: chains.R
         target=title,
         chains=found["chains"] + leaks,
         fixes=found["fixes"],
+        checks=found.get("checks", []),
         internet=bool(found["chains"]),
         scanned=scanned,
         walked=paths is not None,

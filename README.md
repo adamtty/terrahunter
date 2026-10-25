@@ -74,6 +74,22 @@ left in configuration it can read, …). Each identity that would give more is l
 the diagram, with every hop and the technique behind it. `--as ADDRESS` starts from named identities only;
 `--no-credentials` skips it.
 
+### Check by hand
+
+Some of what a path rests on isn't in the Terraform, so terrahunter asks instead of guessing. Each question names the
+resource and where to look, and lists the paths that depend on it:
+
+- whether the application's code mishandles input, pointing at the code where it's in the folder;
+- whether a key or password for an open SSH port exists elsewhere;
+- whether a host keeps its containers from the metadata service;
+- deploy-time scripts (provisioners, `null_resource`) and boot scripts that act on a resource on the path, with any
+  credentials they carry;
+- values the configuration doesn't settle;
+- defaults the cloud adds (GCP's automatic Editor grant);
+- the knowledge base's preconditions for each technique the path uses.
+
+They're in the report, under each path, and on each step of the diagram's walkthrough.
+
 ### With a plan
 
 Read from the code alone, terrahunter sees one node per resource block, and anything that depends on variables,
