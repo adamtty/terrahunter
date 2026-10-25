@@ -193,3 +193,29 @@ def test_the_default_compute_account_adds_an_ssh_key_to_an_owner_s_vm(tmp_path):
     assert (hop.rule, hop.confidence) == ("gcp-lat-compute-instance-ssh-key-metadata", "likely")
     assert r.gains[("admin", "account")].confidence == "likely"
     assert r.data()["google_firestore_document.user"] == "admin"  # the owner's data, drawn or not
+
+
+def test_every_action_on_compute_takes_it_over_and_rds_covers_neptune(tmp_path):
+    r = search(
+        tmp_path,
+        'resource "aws_iam_user" "u" {}\nresource "aws_instance" "web" {}\n'
+        'resource "aws_neptune_cluster" "graph" {}\nresource "aws_db_snapshot" "snap" {}\n'
+        + user_policy("u", '{Effect = "Allow", Action = ["ec2:*", "rds:*"], Resource = "*"}'),
+        "aws_iam_user.u",
+    )
+    data = r.data()
+    assert data["aws_instance.web"] == "admin"  # no role on it, but whatever runs there is the attacker's
+    assert data["aws_neptune_cluster.graph"] and data["aws_db_snapshot.snap"]  # rds: is their control plane
+
+
+def test_running_commands_on_an_instance_controls_it(tmp_path):
+    r = search(
+        tmp_path,
+        'resource "aws_iam_user" "u" {}\n'
+        + role("box", "ec2.amazonaws.com", READ)
+        + 'resource "aws_iam_instance_profile" "box" {\n  role = aws_iam_role.box.name\n}\n'
+        'resource "aws_instance" "box" {\n  iam_instance_profile = aws_iam_instance_profile.box.name\n}\n'
+        + user_policy("u", '{Effect = "Allow", Action = "ssm:SendCommand", Resource = "*"}'),
+        "aws_iam_user.u",
+    )
+    assert ("control", "aws_instance.box") in r.gains and "aws_iam_role.box" in r.identities()
