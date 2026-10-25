@@ -102,7 +102,15 @@ def _hcl(v):
 
 
 def _expr(v) -> bool:
-    return isinstance(v, str) and "${" in v or isinstance(v, list) and any(_expr(x) for x in v)
+    """Whether a value is (or holds) an expression the plan knows the result of: a string with ${…}, or a list or an
+    object (a jsonencode({...}) policy) with one inside."""
+    if isinstance(v, str):
+        return "${" in v
+    if isinstance(v, list):
+        return any(_expr(x) for x in v)
+    if isinstance(v, dict):
+        return not v.get("__is_block__") and any(_expr(x) for k, x in v.items() if not str(k).startswith("__"))
+    return False
 
 
 def overlay(body: dict, values: dict, sensitive) -> dict:
