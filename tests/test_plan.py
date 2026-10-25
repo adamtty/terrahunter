@@ -169,3 +169,28 @@ def test_a_reference_to_one_instance_of_a_module_stays_with_it(tmp_path):
     assert [e.target for e in g.edges if e.source == "aws_iam_role_policy_attachment.x"] == [
         'module.w["a"].aws_iam_role.this'
     ]
+
+
+def test_a_jsonencoded_policy_takes_its_planned_value(tmp_path):
+    (tmp_path / "main.tf").write_text(
+        'variable "wide" {}\nresource "aws_iam_role" "r" {}\n'
+        'resource "aws_iam_role_policy" "p" {\n  role = aws_iam_role.r.id\n'
+        '  policy = jsonencode({Statement = [{Effect = "Allow", Action = var.wide ? "s3:*" : "s3:GetObject", '
+        'Resource = "*"}]})\n}\n'
+    )
+    planned = '{"Statement":[{"Effect":"Allow","Action":"s3:GetObject","Resource":"*"}]}'
+    data = {
+        "planned_values": {
+            "root_module": {
+                "resources": [
+                    {"address": "aws_iam_role.r", "values": {}},
+                    {"address": "aws_iam_role_policy.p", "values": {"policy": planned}},
+                ]
+            }
+        },
+        "configuration": {
+            "root_module": {"resources": [{"address": "aws_iam_role.r"}, {"address": "aws_iam_role_policy.p"}]}
+        },
+    }
+    g = plan.apply(graph.build(tmp_path, "."), data)
+    assert g.resources["aws_iam_role_policy.p"].body["policy"] == f'"{planned}"'  # the object with an expression in it
