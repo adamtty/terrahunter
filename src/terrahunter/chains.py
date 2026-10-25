@@ -473,6 +473,17 @@ def build(g: graph.Graph, model: arch.Model) -> Result:
                 return h.id, ports
         return "", []
 
+    def idle_host(c: arch.Component, ports: list[str]) -> bool:
+        """An ECS container host whose services publish none of its open ports: nothing listens on them (its other
+        ports, such as SSH, aren't web ports here)."""
+        services = [e.source for e in model.connections if e.label == "runs on" and e.target == c.id]
+        if not services or any(p in ADMIN_PORTS for p in ports):
+            return False
+        published = [_host_ports(g, s) for s in services]
+        if any(p is None for p in published):
+            return False  # a task definition that can't be read: nothing is ruled out
+        return not any(_port_in(hp, p) for hps in published for hp in hps for p in ports)
+
     def self_sign_up(pool: str) -> bool:
         """A user pool anyone can join: self sign-up isn't turned off and some client can sign them in."""
         cfg = arch._list(R[pool].body.get("admin_create_user_config"))
@@ -499,7 +510,7 @@ def build(g: graph.Graph, model: arch.Model) -> Result:
             b.get("frontend_ip_configuration")
         ):
             entries.append((c.id, f"internet-facing {c.tname} (a public frontend IP)"))
-        elif c.type in clouds.VMS and ports and public_ip(c):
+        elif c.type in clouds.VMS and ports and public_ip(c) and not idle_host(c, ports):
             entries.append((c.id, f"public IP, {firewall(c.id)} open to the internet on {', '.join(ports)}"))
         elif c.type == "aws_ecs_service" and host_exposure(c.id)[0]:
             host, hp = host_exposure(c.id)
