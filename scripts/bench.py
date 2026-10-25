@@ -107,7 +107,9 @@ def score_root(folder: Path, key: dict, inputs: dict | None = None) -> dict:
         if i in used:
             verdict, reason = "matched", ""
         else:
-            hit = next((x for x in [norm(entry_of(c)), *map(norm, c.sinks)] if x in not_paths), None)
+            # a not-path is something that looks exposed but isn't: a path that starts there (or is that store on
+            # the internet); reaching it from inside, with an identity's own grants, isn't what the key rules out
+            hit = norm(entry_of(c)) if norm(entry_of(c)) in not_paths else None
             verdict, reason = ("contradicted", f"{hit}: {not_paths[hit]}") if hit else ("unlabelled", "")
         out["found"].append(
             {
