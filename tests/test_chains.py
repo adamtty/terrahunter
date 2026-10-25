@@ -390,3 +390,32 @@ def test_a_function_s_configuration_with_a_password_is_reached_by_reading_it(tmp
     )
     (ch,) = [c for c in r.chains if "aws_instance.box" in c.steps]
     assert "aws_lambda_function.f" in ch.sinks
+
+
+CDN = (
+    'resource "aws_s3_bucket" "site" {}\nresource "aws_cloudfront_origin_access_control" "oac" {}\n'
+    'resource "aws_cloudfront_distribution" "cdn" {\n  enabled = true\n'
+    '  origin {\n    domain_name = aws_s3_bucket.site.bucket_regional_domain_name\n    origin_id = "site"\n'
+    "    origin_access_control_id = aws_cloudfront_origin_access_control.oac.id\n  }\n"
+    '  default_cache_behavior {\n    target_origin_id = "site"\nSIGNED  }\n}\n'
+)
+OAC_POLICY = (
+    'resource "aws_s3_bucket_policy" "p" {\n  bucket = aws_s3_bucket.site.id\n'
+    '  policy = jsonencode({Statement = [{Effect = "Allow", Principal = {Service = "cloudfront.amazonaws.com"}, '
+    'Action = "s3:GetObject", Resource = "${aws_s3_bucket.site.arn}/*", '
+    'Condition = {StringEquals = {"AWS:SourceArn" = aws_cloudfront_distribution.cdn.arn}}}]})\n}\n'
+)
+
+
+@pytest.mark.parametrize(
+    ("signed", "policy", "found"),
+    [
+        ("", OAC_POLICY, True),  # unsigned, and the bucket lets the distribution read it
+        ('    trusted_key_groups = ["kg"]\n', OAC_POLICY, False),  # every request needs a signed URL
+        ("", "", False),  # nothing lets the distribution read the private bucket
+    ],
+)
+def test_a_cloudfront_distribution_serves_the_bucket_it_may_read(tmp_path, signed, policy, found):
+    r = paths(tmp_path, CDN.replace("SIGNED", signed) + policy)
+    cdn = [c for c in r.chains if c.kind == "internet → CloudFront → data"]
+    assert bool(cdn) is found and (not found or cdn[0].sinks == ["aws_s3_bucket.site"])
