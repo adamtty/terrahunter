@@ -237,7 +237,9 @@ def _bool(v) -> bool:
     return str(deps.unquote(v) if isinstance(v, str) else v).lower() == "true"
 
 
-def aws_exposure(R: dict, targets, sources, of, maybe: dict | None = None) -> dict[str, list[tuple[str, str]]]:
+def aws_exposure(
+    R: dict, targets, sources, of, maybe: dict | None = None, account: dict | None = None
+) -> dict[str, list[tuple[str, str]]]:
     """AWS resources a policy opens to anyone: resource → [(reason, the policy resource)]. Those a policy opens only
     through a condition terrahunter can't resolve go in `maybe`, the same way."""
     exposed: dict[str, list[tuple[str, str]]] = {}
@@ -272,9 +274,17 @@ def aws_exposure(R: dict, targets, sources, of, maybe: dict | None = None) -> di
         ("aws_ecr_repository", "aws_ecr_repository_policy", "policy"),
     ):
         for t in of(kind):
+            # a secret encrypted with the AWS managed key (no kms_key_id) can't be decrypted from another account,
+            # so a policy open to everyone opens it only to the account's own principals
+            own_key = kind == "aws_secretsmanager_secret" and not R[t].body.get("kms_key_id")
             for pol in [*sources(t, pol_type), t]:
                 acts = public_actions(R, pol, attr, targets)
-                if acts:
+                if acts and own_key:
+                    if account is not None:
+                        account.setdefault(t, []).append(
+                            (f"its policy lets any principal in the account {short(acts)}", pol)
+                        )
+                elif acts:
                     add(t, f"its policy lets any AWS account {short(acts)}", pol)
                 elif acts := public_actions(R, pol, attr, targets, maybe=True):
                     possibly(t, f"its policy may let any AWS account {short(acts)} (a condition isn't known)", pol)
