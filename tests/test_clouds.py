@@ -4,7 +4,7 @@ attack paths through what a workload runs as to what its role assignments or IAM
 
 import pytest
 
-from terrahunter import arch, chains, graph
+from terrahunter import arch, chains, clouds, graph, kb
 
 AZ_NET = (
     'resource "azurerm_resource_group" "rg" {}\nresource "azurerm_resource_group" "other" {}\n'
@@ -297,3 +297,18 @@ def test_a_search_domain_is_public_only_when_its_access_policy_lets_anyone_in(tm
         f'Effect = "{effect}", Principal = "*", Action = "es:*", Resource = "*"}}]}})\n}}\n',
     )
     assert ("aws_opensearch_domain.d" in m.exposed) is public
+
+
+@pytest.mark.parametrize(
+    ("rtype", "catalogue", "cloud"),
+    [
+        ("aws_s3_bucket", "aws", "aws"),
+        ("azuread_service_principal", "azuread", "azure"),  # Entra ID: its own catalogue, Azure's identities
+        ("kubernetes_service_account_v1", "kubernetes", ""),  # a platform: drawn with the cluster's cloud
+        ("helm_release", "helm", ""),
+        ("kubectl_manifest", "kubectl", ""),
+        ("random_id", "", ""),
+    ],
+)
+def test_which_catalogue_and_cloud_a_type_belongs_to(rtype, catalogue, cloud):
+    assert (kb._cloud(rtype), clouds.cloud(rtype)) == (catalogue, cloud)

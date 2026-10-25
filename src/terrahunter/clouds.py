@@ -159,7 +159,10 @@ DB_FIREWALLS = {
 
 
 def cloud(rtype: str) -> str:
-    return next((c for c, p in (("aws", "aws_"), ("azure", "azurerm_"), ("gcp", "google_")) if rtype.startswith(p)), "")
+    """The cloud a type belongs to; Entra ID's (azuread_) are Azure's identities. Kubernetes isn't a cloud: its
+    resources are drawn with the cloud the cluster is in."""
+    prefixes = (("aws", "aws_"), ("azure", "azurerm_"), ("azure", "azuread_"), ("gcp", "google_"))
+    return next((c for c, p in prefixes if rtype.startswith(p)), "")
 
 
 AREAS = {  # cloud → (its container, its services area, its identities area), with their labels

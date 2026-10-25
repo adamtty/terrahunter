@@ -70,8 +70,15 @@ def version() -> str:
     return str(_load().get("commit", ""))
 
 
+# a type's catalogue in the bundle, by its provider's prefix: the clouds, and the platforms that run on them
+_CATALOGUES = (
+    ("aws", "aws_"), ("azure", "azurerm_"), ("gcp", "google_"), ("azuread", "azuread_"),
+    ("kubernetes", "kubernetes_"), ("helm", "helm_"), ("kubectl", "kubectl_"),
+)  # fmt: skip
+
+
 def _cloud(rtype: str) -> str:
-    return next((c for c, p in (("aws", "aws_"), ("azure", "azurerm_"), ("gcp", "google_")) if rtype.startswith(p)), "")
+    return next((c for c, p in _CATALOGUES if rtype.startswith(p)), "")
 
 
 def canonical(rtype: str) -> str:
