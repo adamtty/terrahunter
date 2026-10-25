@@ -24,6 +24,7 @@ from terrahunter import (
     deps,
     diagram,
     escalate,
+    estate,
     graph,
     kb,
     plan,
@@ -68,6 +69,11 @@ def build_parser(mode: str = "hunt") -> argparse.ArgumentParser:
         "--root", help="the root module to analyse, relative to the folder (default: ask, or the only one)"
     )
     pick.add_argument("--all-roots", action="store_true", help="analyse every root module found")
+    pick.add_argument(
+        "--estate",
+        action="store_true",
+        help="analyse every root module found together, as one estate: paths may cross roots and repositories",
+    )
     ap.add_argument(
         "--with",
         dest="with_folders",
@@ -106,8 +112,11 @@ def build_parser(mode: str = "hunt") -> argparse.ArgumentParser:
     ap.add_argument(
         "--plan",
         metavar="PATH",
+        action="append",
+        default=[],
         help="a plan for the root, as JSON (`terraform show -json tf.plan > plan.json`; a state works too): every "
-        "instance, with the values that will really be deployed; needs --root (one root)",
+        "instance, with the values that will really be deployed; needs --root (one root), or with --estate give each "
+        "root's as ROOT=PATH (repeatable)",
     )
     ap.add_argument(
         "--kb",
@@ -386,7 +395,7 @@ def _main(argv: list[str] | None) -> int:
         raise TerrahunterError(f"not a directory: {a.folder}")
     d = roots.discover(a.folder)
     _show(d)
-    chosen = select(d, a.root, a.all_roots)
+    chosen = select(d, a.root, a.all_roots or a.estate)
     withs = []
     for w in a.with_folders:
         if not Path(w).is_dir():
@@ -397,31 +406,71 @@ def _main(argv: list[str] | None) -> int:
     for f in a.var_file:
         if not Path(f).is_file():
             raise TerrahunterError(f"--var-file {f}: not a file")
-    planned = None
-    if a.plan:
-        if len(chosen) != 1:
+    plans: dict[str, dict] = {}  # root path → its plan
+    for spec in a.plan:
+        root, eq, path = spec.rpartition("=") if a.estate else ("", "", spec)
+        if a.estate and not eq:
+            raise TerrahunterError(f"--plan {spec}: with --estate, give the root too: ROOT=PATH")
+        if not a.estate and len(chosen) != 1:
             raise TerrahunterError("--plan is for one root module: pick it with --root")
+        key = root.strip("/") if a.estate else chosen[0].path
+        if key not in {c.path for c in chosen}:
+            raise TerrahunterError(f"--plan {spec}: {key} isn't one of the roots")
         try:
-            planned = plan.load(Path(a.plan))
+            plans[key] = plan.load(Path(path))
         except plan.PlanError as e:
-            raise TerrahunterError(f"--plan {a.plan}: {e}") from None
+            raise TerrahunterError(f"--plan {spec}: {e}") from None
     graphs = []
     results: list[report.RootResult] = []
+    built = []  # (root path, survey, graph, the graph as written: without -var, -var-file or a plan)
     for c in chosen:
         s = resolve(d.folder, c.path, withs, a.fetch_modules)
         show_needs(s)
         g = graph.build(d.folder, c.path, withs, inputs, [Path(f) for f in a.var_file])
-        if planned is not None:
+        if c.path in plans:
             n = len(g.resources)
-            g = plan.apply(g, planned)
+            g = plan.apply(g, plans[c.path])
             print(f"\nPlan: {n} resource blocks → {len(g.resources)} instances")
+        given = inputs or a.var_file or c.path in plans
+        written = graph.build(d.folder, c.path, withs) if given and not mapping else g
+        built.append((c.path, s, g, written))
+    if a.estate:
+        # one unit: every root's graph together, each under its root's name
+        merged_s = deps.Survey("(estate)")
+        for path, s, _, _ in built:
+            merged_s.needs += s.needs
+            merged_s.notes += [f"{path}: {n}" for n in s.notes]
+        units = [
+            (
+                "(estate)",
+                merged_s,
+                estate.merge({p: g for p, _, g, _ in built}),
+                estate.merge({p: w for p, _, _, w in built}),
+            )
+        ]
+        print(f"\nEstate: {len(built)} roots analysed together")
+    else:
+        units = built
+    for label, s, g, written in units:
         show_graph(g)
         scan = None
         if not mapping:
             # the scanners (map has no --no-scan: it never scans), and terrahunter's own: hard-coded secrets
-            scan = scanners.scan(g, d.folder, withs) if not a.no_scan else scanners.Scan()
-            # in the configuration as written: values given with -var, -var-file or a plan aren't in the code
-            written = g if not (inputs or a.var_file or planned is not None) else graph.build(d.folder, c.path, withs)
+            if a.no_scan:
+                scan = scanners.Scan()
+            elif a.estate:  # each root's own staged copy
+                scan = scanners.Scan()
+                for path, _, g1, _ in built:
+                    one = scanners.scan(g1, d.folder, withs)
+                    t = estate.tag(path)
+                    for f in one.findings:
+                        f.address = f"{t}.{f.address}" if f.address else f.address
+                    scan.findings += one.findings
+                    for name, st in one.status.items():
+                        scan.status.setdefault(name, {**st, "findings": 0})["findings"] += st.get("findings", 0)
+                    scan.notes += [f"{path}: {n}" for n in one.notes]
+            else:
+                scan = scanners.scan(g, d.folder, withs)
             own = secrets.find(written)
             scan.findings += own
             scan.status["secrets"] = {"version": "", "ok": True, "error": None, "findings": len(own)}
@@ -441,13 +490,13 @@ def _main(argv: list[str] | None) -> int:
             show_outside(paths)
         graphs.append((g, scan, paths))
         if paths:
-            results.append(report.RootResult(c.path, s, g, model, scan, paths))
+            results.append(report.RootResult(label, s, g, model, scan, paths))
         if not a.no_diagram:
             path = a.diagram
-            if len(chosen) > 1:
-                slug = "root" if c.path == "." else c.path.replace("/", "-")
+            if len(units) > 1:
+                slug = "root" if label == "." else label.replace("/", "-")
                 path = str(Path(a.diagram).with_name(f"{Path(a.diagram).stem}-{slug}{Path(a.diagram).suffix}"))
-            title = d.folder.name + ("" if c.path == "." else f"/{c.path}")
+            title = d.folder.name + ("" if label == "." else f"/{label}")
             write_private(path, diagram.render(model, title, scanned=scan is not None, paths=paths))
             print(f"  diagram: {sandbox.one_line(path)} (open it in a browser)")
         complete &= not s.open and not s.notes and not g.notes and not (scan and scan.failed)

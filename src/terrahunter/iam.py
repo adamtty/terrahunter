@@ -423,8 +423,39 @@ class Model:
         """Whether the identity's statements allow an action on a resource (None: on "*" only)."""
         key = (identity, action.lower(), resource)
         if key not in self._allowed:
-            self._allowed[key] = self._decide(identity, action, resource)
+            self._allowed[key] = (
+                self._decide(identity, action, resource) if self._reachable(identity, resource) else False
+            )
         return self._allowed[key]
+
+    def _reachable(self, identity: str, resource: str | None) -> bool:
+        """In an estate, whether the identity's own policies can reach a resource at all: in its own account, or in
+        another one whose resource policy names the identity's account or the identity (AWS needs both sides)."""
+        if resource is None or not self.g.accounts:
+            return True
+        from terrahunter import estate
+
+        if estate.same_account(self.g, identity, resource):
+            return True
+        return self._resource_policy_names(resource, identity)
+
+    def _resource_policy_names(self, resource: str, identity: str) -> bool:
+        """Whether a policy on the resource (its own, a bucket or key policy, a permission) names the identity's
+        account or the identity."""
+        from terrahunter import estate
+
+        R = self.g.resources
+        acct = self.g.accounts.get(estate.root_of(identity), "")
+        name = self.names.get(identity, set())
+        docs = [R[resource].body.get("policy")] + [
+            R[e.source].body.get("policy") or R[e.source].body.get("principal")
+            for e in self.in_e.get(resource, [])
+            if R.get(e.source)
+            and R[e.source].mode == "managed"
+            and (R[e.source].body.get("policy") or R[e.source].body.get("principal"))
+        ]
+        text = " ".join(str(d) for d in docs if d)
+        return bool(acct and re.search(rf"\b{acct}\b", text)) or any(n and f"/{n}" in text for n in name)
 
     def _decide(self, identity: str, action: str, resource: str | None) -> bool | None:
         sts = [s for s in self.statements(identity) if s.covers_action(action) and s.covers(resource, self.names)]
@@ -479,6 +510,11 @@ class Model:
     def access(self, identity: str, resource: str, service: str) -> str:
         """The strongest access the identity has on a resource of an IAM service ("" for none): `*` or `svc:*` is
         admin; otherwise the knowledge base's access level of each action it's allowed."""
+        if not self._reachable(identity, resource):
+            return ""
+        return self._access(identity, resource, service)
+
+    def _access(self, identity: str, resource: str, service: str) -> str:
         best = ""
         for s in self.statements(identity):
             if s.effect != "Allow" or s.conditional and not s.maybe or not s.covers(resource, self.names):
@@ -637,6 +673,15 @@ class _CloudModel:
     def assignments(self, identity: str) -> list[Assignment]:
         raise NotImplementedError
 
+    def _apart(self, identity: str, resource: str | None) -> bool:
+        """In an estate, whether a resource is in another subscription or project than the identity: its grants
+        (subscription- or project-wide ones included) don't reach there."""
+        if resource is None or not self.g.accounts:
+            return False
+        from terrahunter import estate
+
+        return not estate.same_account(self.g, identity, resource)
+
     def _covers(self, a: Assignment, action: str, resource: str | None) -> bool:
         act = action.lower()
         return (
@@ -646,6 +691,8 @@ class _CloudModel:
         )
 
     def allowed(self, identity: str, action: str, resource: str | None = None) -> bool | None:
+        if self._apart(identity, resource):
+            return False
         return any(self._covers(a, action, resource) for a in self.assignments(identity))
 
     def why(self, identity: str, action: str, resource: str | None = None) -> str:
@@ -711,6 +758,8 @@ class AzureModel(_CloudModel):
         return None
 
     def access(self, identity: str, resource: str, service: str = "") -> str:
+        if self._apart(identity, resource):
+            return ""
         R = self.g.resources
         prov = next((p for k, p in AZURE_PROVIDERS.items() if R[resource].type.startswith(k)), "")
         best = ""
@@ -795,6 +844,8 @@ class GcpModel(_CloudModel):
     def access_via(self, identity: str, resource: str) -> tuple[str, str]:
         """The access level on a resource, and the binding (or implied grant) that gives it; explicit bindings win
         a tie."""
+        if self._apart(identity, resource):
+            return "", ""
         R = self.g.resources
         svc = R[resource].type.split("_")[1] if "_" in R[resource].type else ""
         svc = _GCP_PERMISSION_SERVICE.get(svc, svc)
