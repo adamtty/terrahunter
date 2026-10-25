@@ -133,3 +133,43 @@ def test_leaks_worst_first(tmp_path):
     assert [c.steps[1] for c in out] == ["aws_iam_user.boss", "aws_iam_user.reader"]  # idle gives nothing more
     assert out[0].entry == "boss: becomes the account's administrator" and out[0].severity == "critical"
     assert out[1].sinks == ["aws_s3_bucket.secrets"]
+
+
+def ssh_host(extra: str) -> str:
+    """An instance with a public IP, SSH open to the world, running as an admin role."""
+    return (
+        'resource "aws_vpc" "v" {}\nresource "aws_subnet" "pub" {\n  vpc_id = aws_vpc.v.id\n'
+        "  map_public_ip_on_launch = true\n}\n"
+        'resource "aws_security_group" "ssh" {\n  vpc_id = aws_vpc.v.id\n  ingress {\n    from_port = 22\n'
+        '    to_port = 22\n    cidr_blocks = ["0.0.0.0/0"]\n  }\n}\n'
+        + role("box", "ec2.amazonaws.com", ADMIN)
+        + 'resource "aws_iam_instance_profile" "box" {\n  role = aws_iam_role.box.name\n}\n'
+        'resource "aws_instance" "box" {\n  subnet_id = aws_subnet.pub.id\n  associate_public_ip_address = true\n'
+        "  vpc_security_group_ids = [aws_security_group.ssh.id]\n"
+        "  iam_instance_profile = aws_iam_instance_profile.box.name\n" + extra + "}\n"
+    )
+
+
+def test_ssh_with_a_private_key_found_in_a_parameter(tmp_path):
+    r = search(
+        tmp_path,
+        'resource "aws_iam_user" "u" {}\nresource "aws_key_pair" "k" {\n  public_key = "ssh-ed25519 AAAA"\n}\n'
+        'resource "aws_ssm_parameter" "ssh_private_key" {\n  type = "SecureString"\n  value = "x"\n}\n'
+        + ssh_host("  key_name = aws_key_pair.k.key_name\n")
+        + user_policy("u", '{Effect = "Allow", Action = "ssm:GetParameter", Resource = "*"}'),
+        "aws_iam_user.u",
+    )
+    hop = r.path("identity", "aws_iam_role.box")[-1]
+    assert (hop.rule, hop.confidence) == ("ssh-found-key", "likely")
+    assert ("control", "aws_instance.box") in r.gains
+
+
+def test_ssh_with_a_password_set_in_user_data(tmp_path):
+    r = search(
+        tmp_path,
+        'resource "aws_iam_user" "u" {}\n'
+        + ssh_host('  user_data = "echo \\"ec2-user:hunter2\\" | chpasswd"\n')
+        + user_policy("u", '{Effect = "Allow", Action = "ec2:DescribeInstanceAttribute", Resource = "*"}'),
+        "aws_iam_user.u",
+    )
+    assert r.path("identity", "aws_iam_role.box")[-1].rule == "ssh-found-password"

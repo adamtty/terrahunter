@@ -24,6 +24,12 @@ from dataclasses import dataclass, field
 from terrahunter import arch, conditions, graph, iam, kb
 
 CONF = {"certain": 0, "likely": 1, "possible": 2}
+# an SSH private key held in configuration: a generated key's private half, a key file, PEM text
+_PRIVATE_KEY = re.compile(
+    r"tls_private_key\.[^.]+\.private_key|PRIVATE KEY|private[-_]?key|id_(rsa|ed25519)\b", re.IGNORECASE
+)
+# user data that gives a login a password, or turns password logins on
+_PASSWORD_LOGIN = re.compile(r"chpasswd|\bpasswd\b|PasswordAuthentication\s+yes", re.IGNORECASE)
 _TRUST = re.compile(r"trust policy (?:lets|allows) ([a-z0-9.-]+\.amazonaws\.com)")
 MAX_ROUNDS = 8
 
@@ -227,6 +233,40 @@ def search(g: graph.Graph, model: arch.Model, start: str, im: iam.Model | None =
     def _keys_in(addr: str) -> list[str]:
         return list(dict.fromkeys(keys.get(addr, [])))
 
+    # SSH from the internet with credentials found in data: instances with a public IP and port 22 open
+    comps = {c.id: c for c in model.components}
+
+    def ssh_open(inst: str) -> bool:
+        c = comps.get(inst)
+        if c is None:
+            return False
+        ports = [p.strip() for b in c.badges if b.text.startswith("open to internet: ") for p in b.text[18:].split(",")]
+        return any(p in ("22", "all") for p in ports) and any(b.text == "public IP" for b in c.badges)
+
+    instances = [a for a in by_type.get("aws_instance", []) if ssh_open(a)]
+    keyed = [a for a in instances if R[a].body.get("key_name")]
+    private_keys = [  # where a private key is kept: a parameter, a secret, an object (not the generator itself)
+        a
+        for a, r in R.items()
+        if r.mode == "managed"
+        and r.type != "tls_private_key"
+        and _PRIVATE_KEY.search(f"{r.name} {r.body.get('value', '')} {r.body.get('secret_string', '')}")
+    ]
+    passworded = [a for a in instances if _PASSWORD_LOGIN.search(str(R[a].body.get("user_data", "")))]
+
+    def can_read(who: str, addr: str, admin: bool) -> bool:
+        gn = res.gains.get(("data", addr))
+        if admin or gn and iam.LEVELS.get(gn.access, 0) >= iam.LEVELS["read"]:
+            return True
+        return iam.LEVELS.get(im.access(who, addr, _service(R[addr].type)), 0) >= iam.LEVELS["read"]
+
+    def shell(who: str, inst: str, how: str, rule: str, conf: str) -> bool:
+        changed = gain("control", inst, who, rule, f"{who}: {how}, and SSH to {inst} is open: a shell on it", conf)
+        for ident in identity_of(inst):
+            text = f"{inst} runs as {ident}: from the shell, its credentials come from the instance metadata service"
+            changed |= gain("identity", ident, who, rule, text, conf)
+        return changed
+
     for _ in range(MAX_ROUNDS):
         changed = False
         for who in list(conf_of):
@@ -258,6 +298,21 @@ def search(g: graph.Graph, model: arch.Model, start: str, im: iam.Model | None =
             # the knowledge base's techniques
             for rule in rules:
                 changed |= _apply(rule, who, base, admin)
+            # an SSH private key or a login password it can read, for an instance that accepts SSH from anywhere
+            for k in private_keys:
+                if keyed and can_read(who, k, admin):
+                    for inst in keyed:
+                        changed |= shell(
+                            who,
+                            inst,
+                            f"{k} holds an SSH private key it can read",
+                            "ssh-found-key",
+                            _min(base, "likely"),
+                        )
+            for inst in passworded:
+                if can_read(who, inst, admin):
+                    how = "the instance's user data, which it can read, sets a login password"
+                    changed |= shell(who, inst, how, "ssh-found-password", _min(base, "likely"))
             # credentials in configuration it can read: a resource that holds an access key (an environment's
             # settings, a function's variables) gives the key's user to whoever can read the resource
             for addr in keys:
