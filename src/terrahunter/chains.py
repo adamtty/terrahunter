@@ -326,6 +326,41 @@ def _holds_secrets(r: graph.Resource | None) -> bool:
     return bool(_SECRET_VAR.search(env))
 
 
+_STOCK_IMAGE = re.compile(
+    r"""image['"]?\s*[:=]\s*['"]+(?:docker\.io/)?(?:library/)?(httpd|nginx|caddy)(?::[\w.-]+)?['"]"""
+)
+_ANY_IMAGE = re.compile(r"""image['"]?\s*[:=]\s*['"]+([^'"]+)['"]""")
+_WEB_INSTALL = re.compile(
+    r"\b(yum|apt-get|apt|dnf|apk)\b[^\n]*\binstall\b[^\n]*\b(httpd|apache2|nginx)\b", re.IGNORECASE
+)
+_RUNS_CODE = re.compile(
+    r"\b(python3?|node|npm|pip3?|php|java|ruby|gunicorn|uwsgi|flask|django|rails|go run|docker|podman|git clone|"
+    r"proxy_pass|ProxyPass|mod_wsgi|cgi-bin|systemctl start (?!httpd|nginx|apache2)\w+)\b",
+    re.IGNORECASE,
+)
+
+
+def _static_web(g: graph.Graph, addr: str) -> bool:
+    """A web server with no application behind it: an ECS service whose containers all run a stock web-server image,
+    or a machine whose boot script installs one and nothing that runs code. Its requests are only served files."""
+    R = g.resources
+    r = R.get(addr)
+    if r is None:
+        return False
+    if r.type == "aws_ecs_service":
+        for e in g.edges:
+            if e.source == addr and R.get(e.target) and R[e.target].type == "aws_ecs_task_definition":
+                defs = str(R[e.target].body.get("container_definitions", ""))
+                images = _ANY_IMAGE.findall(defs)
+                stock = _STOCK_IMAGE.findall(defs)
+                return bool(images) and len(stock) == len(images) and not _RUNS_CODE.search(defs)
+        return False
+    if r.type in clouds.VMS:
+        boot = arch.boot_script(g, addr)
+        return bool(_WEB_INSTALL.search(boot)) and not _RUNS_CODE.search(boot)
+    return False
+
+
 def _host_access(g: graph.Graph, svc: str) -> str:
     """How an ECS service's containers reach their host, from its task definition: the Docker socket, a privileged
     container, or the host's process namespace; "" when they don't."""
@@ -761,7 +796,8 @@ def build(g: graph.Graph, model: arch.Model) -> Result:
         ports = set(_ports(c))
         web = bool(ports & WEB_PORTS) or via_lb
         admin = [ADMIN_PORTS[p] for p in ("22", "3389", "all") if p in ports] if can_log_in(c) else []
-        if has_role and web and _has(c, "IMDSv1 allowed"):
+        static = _static_web(g, c.id)
+        if has_role and web and _has(c, "IMDSv1 allowed") and not static:
             return (
                 f"{c.id}: serves the web with IMDSv1 allowed: one SSRF in the app hands over its credentials",
                 "likely",
@@ -776,6 +812,8 @@ def build(g: graph.Graph, model: arch.Model) -> Result:
                 "possible",
                 "code",
             )
+        if static and c.type == "aws_ecs_service":  # stock web-server containers: there's no application to break
+            return "", "", ""
         return f"{c.id}: reachable by traffic: a flaw in the application gets code running here", "possible", "code"
 
     assumed: dict[int, list[tuple[str, str]]] = {}  # a path → what it rests on: (kind, resource)
@@ -1000,6 +1038,8 @@ def build(g: graph.Graph, model: arch.Model) -> Result:
             # own identity: no extra step, its grants come from itself
             own = clouds.system_identity(node.type, R[node.id].body) if node.id in R else ""
             text, conf, rests = compromise(node, len(path) > 1, bool(roles or own))
+            if not text:
+                continue
             hops = base + [
                 f"{a} {next(x.label for x in out[a] if x.target == b)} {b}" for a, b in itertools.pairwise(path)
             ]

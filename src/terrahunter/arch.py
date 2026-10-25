@@ -100,6 +100,24 @@ QUIET = {"encrypted with", "logs to"}
 _READS = re.compile(r'\b(?:file|templatefile)\(\s*"([^"$]+)"')
 
 
+_BOOT_ATTRS = ("user_data", "user_data_base64", "metadata_startup_script", "custom_data")
+
+
+def boot_script(g: graph.Graph, addr: str) -> str:
+    """A machine's boot script: its user data (startup script, custom data), with the templates it renders and the
+    files those read."""
+    R = g.resources
+    b = R[addr].body
+    meta = b.get("metadata") if isinstance(b.get("metadata"), dict) else {}
+    script = " ".join(
+        str(v)
+        for v in (*(b.get(k) for k in _BOOT_ATTRS), meta.get("startup-script"), meta.get('"startup-script"'))
+        if v
+    )
+    rendered = [a for a in re.findall(r"data\.[\w-]+\.[\w-]+", script) if a in R]
+    return script + " " + " ".join(setup_text(g, a) for a in rendered)
+
+
 def setup_text(g: graph.Graph, addr: str) -> str:
     """What sets a machine up, as text: its configuration, what it takes from (a rendered template) or what acts on
     it (a VM extension), and the files those read with file() or templatefile(), inside the folders under analysis."""

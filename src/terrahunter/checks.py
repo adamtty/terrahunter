@@ -37,7 +37,6 @@ _BOOTED = {
     "azurerm_linux_virtual_machine",
     "azurerm_windows_virtual_machine",
 }
-_BOOT_ATTRS = ("user_data", "user_data_base64", "metadata_startup_script", "custom_data")
 _RULE = re.compile(r"\[([a-z0-9-]+)\]$")
 _IMAGE = re.compile(r"""['"]?image['"]?\s*[:=]\s*['"]([^'"]+)['"]""")
 
@@ -134,18 +133,8 @@ def find(g: graph.Graph, paths: list[chains.Chain], assumed: dict[int, list[tupl
     texts: dict[str, str] = {}
 
     def boot_text(m: str) -> str:
-        """A machine's boot script: its user data (startup script, custom data), with the templates it renders and
-        the files those read."""
         if m not in texts:
-            b = R[m].body
-            meta = b.get("metadata") if isinstance(b.get("metadata"), dict) else {}
-            script = " ".join(
-                str(v)
-                for v in (*(b.get(k) for k in _BOOT_ATTRS), meta.get("startup-script"), meta.get('"startup-script"'))
-                if v
-            )
-            rendered = [a for a in re.findall(r"data\.[\w-]+\.[\w-]+", script) if a in R]
-            texts[m] = script + " " + " ".join(arch.setup_text(g, a) for a in rendered)
+            texts[m] = arch.boot_script(g, m)
         return texts[m]
 
     rules = {r["id"]: r for c in ("aws", "azure", "gcp") for r in kb.techniques(c)}
