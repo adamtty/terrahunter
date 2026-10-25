@@ -78,7 +78,11 @@ the diagram, with every hop and the technique behind it. `--as ADDRESS` starts f
 
 Roles whose trust policy admits principals outside the configuration — another account, any account (`*`), an
 identity provider's users — are listed separately, with what narrows each trust (an external ID, an organization,
-a principal pattern, an OIDC subject) and what becoming the role gives. An unconditional `*`, or an identity
+a principal pattern, an OIDC subject) and what becoming the role gives. So are resource policies that grant another
+account directly: a bucket (with the KMS key its objects need), a topic or queue (and the functions it triggers), a
+secret, a repository, a Lambda permission. The configuration's own accounts (from `aws_caller_identity`, the
+provider's `allowed_account_ids` or assumed role, or a local named `account_id`) aren't outside; a bucket whose
+policy is public under RestrictPublicBuckets takes no cross-account request at all. An unconditional `*`, or an identity
 provider with no subject condition, is *certain*; a named account or a narrowed trust is *possible*. A statement that
 allows only `sts:TagSession` admits no one.
 
