@@ -86,4 +86,91 @@ def merge(graphs: dict[str, graph.Graph]) -> graph.Graph:
         out.folders += [f for f in g.folders if f not in out.folders]
         out.notes += [f"{root}: {n}" for n in g.notes]
         out.info += [f"{root}: {n}" for n in g.info]
+        out.outputs.update({f"{t}.{n}": [at(a) for a in v] for n, v in g.outputs.items()})
     return out
+
+
+# a data source that looks a resource up by name → the managed type it finds, and (data attribute, resource
+# attribute) pairs that must all be equal; a type not listed matches the same managed type by `name`
+_LOOKUPS: dict[str, tuple[str, tuple[tuple[str, str], ...]]] = {
+    "aws_s3_bucket": ("aws_s3_bucket", (("bucket", "bucket"),)),
+    "aws_iam_user": ("aws_iam_user", (("user_name", "name"),)),
+    "aws_lambda_function": ("aws_lambda_function", (("function_name", "function_name"),)),
+    "aws_db_instance": ("aws_db_instance", (("db_instance_identifier", "identifier"),)),
+    "aws_rds_cluster": ("aws_rds_cluster", (("cluster_identifier", "cluster_identifier"),)),
+    "aws_ecs_cluster": ("aws_ecs_cluster", (("cluster_name", "name"),)),
+    "aws_elasticache_cluster": ("aws_elasticache_cluster", (("cluster_id", "cluster_id"),)),
+    "aws_opensearch_domain": ("aws_opensearch_domain", (("domain_name", "domain_name"),)),
+    "aws_cognito_user_pools": ("aws_cognito_user_pool", (("name", "name"),)),
+    "aws_kms_alias": ("aws_kms_alias", (("name", "name"),)),
+    "aws_secretsmanager_secret_version": ("aws_secretsmanager_secret", (("secret_id", "name"),)),
+    "google_service_account": ("google_service_account", (("account_id", "account_id"), ("project", "project"))),
+    "google_secret_manager_secret": ("google_secret_manager_secret", (("secret_id", "secret_id"),)),
+    "google_secret_manager_secret_version": ("google_secret_manager_secret", (("secret", "secret_id"),)),
+    "google_storage_bucket": ("google_storage_bucket", (("name", "name"),)),
+}
+
+
+def _literal(r: graph.Resource, attr: str) -> str:
+    from terrahunter import deps
+
+    return deps.unquote(r.body.get(attr)) or ""
+
+
+def _found_by(g: graph.Graph, d: graph.Resource) -> list[str]:
+    """The managed resources in other roots that a data source finds by name (in its own account first)."""
+    rtype, keys = _LOOKUPS.get(d.type, (d.type, (("name", "name"),)))
+    if d.type.startswith("azurerm_"):
+        keys = (("name", "name"), ("resource_group_name", "resource_group_name"))
+    if not _literal(d, keys[0][0]):  # looked up by something else (a filter, an ARN, an expression)
+        return []
+    want = [(_literal(d, a), b) for a, b in keys if _literal(d, a)]
+    here = root_of(d.address)
+    hits = [
+        a
+        for a, r in g.resources.items()
+        if r.mode == "managed" and r.type == rtype and root_of(a) != here and all(_literal(r, b) == v for v, b in want)
+    ]
+    same = [a for a in hits if same_account(g, d.address, a)]
+    return same or hits
+
+
+def link(g: graph.Graph, surveys: dict) -> list[str]:
+    """Join the roots where one names another's resources indirectly: a remote state's outputs are the resources
+    the other root's outputs name, and a data source that looks a resource up by name is that resource. Each
+    reference to the remote state or the data source also becomes one to what it stands for. → what was linked."""
+    by_target: dict[str, list[graph.Edge]] = {}
+    for e in g.edges:
+        by_target.setdefault(e.target, []).append(e)
+    stands: dict[str, list[tuple[str, str]]] = {}  # remote state or data source → (what it stands for, output)
+    for root, s in surveys.items():
+        for n in s.of("remote-state", "matched"):
+            addr = f"{tag(root)}.{(n.via + '.') if n.via else ''}{n.name}"
+            other = tag(n.detail)
+            outs = sorted(k for k in g.outputs if k.startswith(other + "."))
+            if addr in g.resources and outs:
+                stands[addr] = [(a, k[len(other) + 1 :]) for k in outs for a in g.outputs[k]]
+    for a, r in g.resources.items():
+        if r.mode == "data" and r.type not in ("terraform_remote_state", "tfe_outputs"):
+            found = _found_by(g, r)
+            if found:
+                stands[a] = [(f, "") for f in found]
+    g.links = stands
+    added: list[graph.Edge] = []
+    seen = {(e.source, e.target, e.attr) for e in g.edges}
+    for addr, targets in stands.items():
+        for e in by_target.get(addr, []):
+            for t, output in targets:
+                if (output and e.output and output != e.output) or e.source == t or (e.source, t, e.attr) in seen:
+                    continue
+                seen.add((e.source, t, e.attr))
+                added.append(graph.Edge(e.source, t, e.attr))
+    g.edges += added
+    notes = []
+    for addr, targets in stands.items():
+        shown = sorted({label(t) for t, _ in targets})
+        if by_target.get(addr):
+            notes.append(
+                f"{label(addr)} → " + ", ".join(shown[:4]) + (f" (+{len(shown) - 4} more)" if len(shown) > 4 else "")
+            )
+    return notes

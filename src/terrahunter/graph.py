@@ -41,6 +41,9 @@ _SKIP_HEADS = {"var", "local", "module", "each", "count", "path", "terraform", "
 _RES = re.compile(r'(?<![\w.])(data\.)?([a-z][a-z0-9_]*)\.([A-Za-z0-9_-]+)(?:\[(\d+|"[^"\]]*")\])?')
 _VAR = re.compile(r"(?<![\w.])var\.([A-Za-z0-9_-]+)")
 _LOCAL = re.compile(r"(?<![\w.])local\.([A-Za-z0-9_-]+)")
+# what a remote state reference reads after its address: `.outputs.x`, `.outputs["x"]` (tfe_outputs: `.values.x`)
+_STATE_OUT = re.compile(r'^\.(?:outputs|values|nonsensitive_values)(?:\.([A-Za-z0-9_-]+)|\[\s*"([^"]+)"\s*\])')
+_STATES = {"terraform_remote_state", "tfe_outputs"}
 _MOD = re.compile(r"(?<![\w.])module\.([A-Za-z0-9_-]+)(?:\[([^\]]*)\])?\.([A-Za-z0-9_-]+)")
 # a block's labels may be quoted or not (`data aws_iam_policy_document "x"` is valid HCL)
 _BLOCK_LINE = re.compile(
@@ -67,6 +70,9 @@ class Edge:
     attr: str  # the attribute of the source the reference is in (dotted path)
     index: str = ""  # a literal index the reference names on the target (`0`, `k`), else ""
     module_index: str = ""  # a literal module instance it names (`worker=0` for module.worker["0"].x), else ""
+    output: str = (
+        ""  # the output of a remote state it reads (`vpc_id` for data.terraform_remote_state.x.outputs.vpc_id)
+    )
 
 
 @dataclass
@@ -89,6 +95,9 @@ class Graph:
     module_dirs: dict[str, Path] = field(default_factory=dict, repr=False)  # module address ("" root) → its directory
     folders: list[Path] = field(default_factory=list, repr=False)  # the folders under analysis (the folder, --with)
     accounts: dict[str, str] = field(default_factory=dict, repr=False)  # an estate: root → its account / project
+    outputs: dict[str, list[str]] = field(default_factory=dict, repr=False)  # the root's outputs → resources named
+    # an estate: a remote state or data source → (what it stands for in another root, the output that names it)
+    links: dict[str, list[tuple[str, str]]] = field(default_factory=dict, repr=False)
 
     @property
     def dirs(self) -> list[Path]:
@@ -100,7 +109,8 @@ class Graph:
             "root": self.root,
             "resources": [{k: v for k, v in asdict(r).items() if k != "body"} for r in self.resources.values()],
             "edges": [
-                {k: v for k, v in asdict(e).items() if k not in ("index", "module_index") or v} for e in self.edges
+                {k: v for k, v in asdict(e).items() if k not in ("index", "module_index", "output") or v}
+                for e in self.edges
             ],
             "unknown": [asdict(u) for u in self.unknown.values()],
             "modules": self.modules,
@@ -377,7 +387,9 @@ def build(
                 local = f"{'data.' if m.group(1) else ''}{head}.{m.group(3)}"
                 if local in sc.resources:
                     idx = (m.group(4) or "").strip('"')
-                    out.add(sc.resources[local] + (f"[{idx}]" if m.group(4) else ""))
+                    found = sc.resources[local] + (f"[{idx}]" if m.group(4) else "")
+                    so = _STATE_OUT.match(e[m.end() :]) if m.group(1) and head in _STATES else None
+                    out.add(found + (f"#{so.group(1) or so.group(2)}" if so else ""))
             for m in _VAR.finditer(e):
                 out |= lookup(("var", m.group(1)), sc, depth)
             for m in _LOCAL.finditer(e):
@@ -429,11 +441,16 @@ def build(
             for attr, value in _attrs(g.resources[addr].body):
                 for found in sorted(resolve(value, sc, 0)):
                     found, _, mod = found.partition("@")
+                    found, _, output = found.partition("#")
                     target, _, idx = found.partition("[")
                     idx = idx[:-1]
-                    if target != addr and (addr, target, attr, idx + "@" + mod) not in seen:
-                        seen.add((addr, target, attr, idx + "@" + mod))
-                        g.edges.append(Edge(addr, target, attr, idx, mod))
+                    if target != addr and (addr, target, attr, idx + "@" + mod + "#" + output) not in seen:
+                        seen.add((addr, target, attr, idx + "@" + mod + "#" + output))
+                        g.edges.append(Edge(addr, target, attr, idx, mod, output))
+    g.outputs = {
+        name: sorted({f.partition("@")[0].partition("#")[0].partition("[")[0] for f in resolve(v, top, 0)})
+        for name, v in top.outputs.items()
+    }
 
     # known values in place of their expressions (after the edges, which read the references)
     def substitute(v, sc: _Scope):
