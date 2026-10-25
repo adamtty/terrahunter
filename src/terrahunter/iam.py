@@ -40,6 +40,7 @@ IDENTITIES = ("aws_iam_user", "aws_iam_role")
 # a reference in a policy string: ${aws_s3_bucket.data.arn}, ${module.x.aws_iam_role.r.arn}
 _REF = re.compile(r"\$\{(?:data\.)?([a-z][a-z0-9_]*)\.([A-Za-z0-9_-]+)(?:\[[^\]]*\])?\.[A-Za-z0-9_]+\}")
 # the account itself as a principal: its root ARN, its id, or the id read from aws_caller_identity
+_MOD_REF = re.compile(r"\$\{module\.([A-Za-z0-9_-]+)(?:\[[^\]]*\])?\.[A-Za-z0-9_-]+\}")
 _ROOT = re.compile(r":root$|^\d{12}$|^\$\{data\.aws_caller_identity\.[\w-]+\.account_id\}$")
 LEVELS = {"list": 1, "read": 2, "write": 3, "admin": 4}
 _KB_LEVEL = {"List": "list", "Read": "read", "Write": "write", "Tagging": "write", "Permissions management": "admin"}
@@ -171,6 +172,14 @@ class Model:
                     addr = f"{self._module(source)}{t}.{n}"
                     if addr in R:
                         targets.add(addr)
+                # a module's output (${module.data.secret_arn}): what the reference resolves to, from the edges
+                for name in _MOD_REF.findall(r):
+                    inside = f"{self._module(source)}module.{name}"
+                    targets |= {
+                        e.target
+                        for e in self.out_e.get(source, [])
+                        if e.attr.startswith("policy") and re.match(rf"{re.escape(inside)}(\[[^\]]*\])?\.", e.target)
+                    }
             out.append(
                 Statement(
                     effect=str(st.get("Effect", "Allow")),
@@ -244,10 +253,39 @@ class Model:
         out = []
         for e in self.out_e.get(holder, []):
             if e.attr == attr and e.target in R and R[e.target].type == "aws_iam_policy":
-                pol = R[e.target]
-                doc = self._doc(e.target, "policy", pol.body.get("policy"))
-                out += self._statements_of(doc, e.target) if doc else []
+                for pol in self._looked_up(e.target) if R[e.target].mode == "data" else [e.target]:
+                    if pol.startswith("arn:"):
+                        out += self._managed(pol, holder)
+                        continue
+                    doc = self._doc(pol, "policy", R[pol].body.get("policy"))
+                    out += self._statements_of(doc, pol) if doc else []
         return out
+
+    def _looked_up(self, data_addr: str) -> list[str]:
+        """The policies a `data "aws_iam_policy"` finds: one the configuration creates (it references it, or names it by
+        name or name prefix), else an AWS managed policy by its name or ARN."""
+        R = self.g.resources
+        refs = [x.target for x in self.out_e.get(data_addr, []) if R.get(x.target) and R[x.target].mode == "managed"]
+        found = [t for t in refs if R[t].type == "aws_iam_policy"]
+        if found:
+            return found
+        b = R[data_addr].body
+        name, arn = deps.unquote(b.get("name")), deps.unquote(b.get("arn"))
+        if arn and "${" not in arn:
+            name = arn.rsplit("/", 1)[-1]
+        if not name or "${" in name:
+            return []
+        mine = [
+            a
+            for a, r in R.items()
+            if r.mode == "managed"
+            and r.type == "aws_iam_policy"
+            and (
+                deps.unquote(r.body.get("name")) == name
+                or name.startswith(deps.unquote(r.body.get("name_prefix")) or "\0")
+            )
+        ]
+        return mine or ([arn] if arn and "${" not in arn else [f"arn:aws:iam::aws:policy/{name}"])
 
     # --- decisions ---------------------------------------------------------------------------------------------
     @cached_property

@@ -136,3 +136,36 @@ def test_a_symlinked_plan_is_refused(estate, tmp_path, capsys):
     with pytest.raises(SystemExit) as e:
         cli.main(["map", str(estate), "--no-diagram", "--plan", str(tmp_path / "link.json")])
     assert e.value.code == cli.EXIT_ERROR
+
+
+def test_a_reference_to_one_instance_of_a_module_stays_with_it(tmp_path):
+    (tmp_path / "m").mkdir()
+    (tmp_path / "m" / "main.tf").write_text(
+        'resource "aws_iam_role" "this" {}\noutput "name" {\n  value = aws_iam_role.this.name\n}\n'
+    )
+    (tmp_path / "main.tf").write_text(
+        'module "w" {\n  for_each = toset(["a", "b"])\n  source = "./m"\n}\n'
+        'resource "aws_iam_role_policy_attachment" "x" {\n  role = module.w["a"].name\n  policy_arn = "arn"\n}\n'
+    )
+
+    def role(k):
+        return {"address": f'module.w["{k}"].aws_iam_role.this', "values": {}}
+
+    data = {
+        "planned_values": {
+            "root_module": {
+                "resources": [{"address": "aws_iam_role_policy_attachment.x", "values": {}}],
+                "child_modules": [{"address": f'module.w["{k}"]', "resources": [role(k)]} for k in ("a", "b")],
+            }
+        },
+        "configuration": {
+            "root_module": {
+                "resources": [{"address": "aws_iam_role_policy_attachment.x"}],
+                "module_calls": {"w": {"module": {"resources": [{"address": "aws_iam_role.this"}]}}},
+            }
+        },
+    }
+    g = plan.apply(graph.build(tmp_path, "."), data)
+    assert [e.target for e in g.edges if e.source == "aws_iam_role_policy_attachment.x"] == [
+        'module.w["a"].aws_iam_role.this'
+    ]
