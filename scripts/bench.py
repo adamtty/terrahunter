@@ -25,6 +25,10 @@ A generated estate (a folder with `bench/source.yaml` and `bench/expected.json`,
 findings (hard-coded secrets, long-lived keys) against terrahunter's own:
 
   python scripts/bench.py --estate ~/estates/harbourline-2026-11-02 --report estate.md
+
+With `--together`, an estate's roots are analysed as one (terrahunter's `--estate`: merged, linked, accounts kept
+apart), so paths that cross roots and repositories count. Each root's key is scored against the paths that start in
+that root, by the addresses its own code uses; what a path reaches may be in any root.
 """
 
 from __future__ import annotations
@@ -37,7 +41,7 @@ import re
 import sys
 from pathlib import Path
 
-from terrahunter import arch, chains, escalate, graph, iam, plan, secrets
+from terrahunter import arch, chains, deps, escalate, estate, graph, iam, plan, secrets
 
 _INDEX = re.compile(r"\[[^\]]*\]")
 # the inputs each project's answer key assumes (from its source.yaml notes), given as -var / -var-file would be
@@ -60,49 +64,87 @@ def entry_of(c: chains.Chain) -> str:
     return c.steps[1] if len(c.steps) > 1 else (c.sinks[0] if c.sinks else "")
 
 
-def score_root(folder: Path, key: dict, inputs: dict | None = None) -> dict:
-    root = key["root"]
+def build_root(folder: Path, root: str, inputs: dict | None = None) -> tuple[graph.Graph, graph.Graph]:
+    """A root's graph with the key's inputs (and plan), and as written (for the secrets in the code itself)."""
     inputs = inputs or {}
+    files = [folder / f for f in inputs.get("var_files", [])]
+    g = graph.build(folder, root, variables=inputs.get("variables"), var_files=[f for f in files if f.is_file()])
+    if inputs.get("plan"):  # an estate's plan for the root: the instances count/for_each make
+        g = plan.apply(g, plan.load(folder / inputs["plan"]))
+    given = inputs.get("variables") or inputs.get("var_files") or inputs.get("plan")
+    return g, graph.build(folder, root) if given else g
+
+
+def score_root(folder: Path, key: dict, inputs: dict | None = None) -> dict:
     with contextlib.redirect_stdout(io.StringIO()):
-        files = [folder / f for f in inputs.get("var_files", [])]
-        g = graph.build(folder, root, variables=inputs.get("variables"), var_files=[f for f in files if f.is_file()])
-        if inputs.get("plan"):  # an estate's plan for the root: the instances count/for_each make
-            g = plan.apply(g, plan.load(folder / inputs["plan"]))
+        g, written = build_root(folder, key["root"], inputs)
         model = arch.build(g)
         found = chains.build(g, model).chains
+    return score(key, g, model, found, written)
+
+
+class View:
+    """How a graph's addresses compare with a key's: as they are, or, in an estate graph, as the key's root's own code
+    names them (its root's prefix taken off), and which of them are that root's."""
+
+    def __init__(self, root: str | None = None):
+        self.root = root
+
+    def __call__(self, addr: str) -> str:
+        return norm(estate.local(addr) if self.root is not None else addr)
+
+    def here(self, addr: str) -> bool:
+        return self.root is None or estate.root_of(addr) == self.root
+
+
+def score(
+    key: dict,
+    g: graph.Graph,
+    model: arch.Model,
+    found: list[chains.Chain],
+    written: graph.Graph,
+    view: View | None = None,
+) -> dict:
+    """One root's key against terrahunter's results: of that root, or (with a view) of an estate graph."""
+    root = key["root"]
+    view = view or View()
+    found = [c for c in found if view.here(entry_of(c))]  # the paths that start in this root
 
     def reach(c: chains.Chain) -> set[str]:
         """What a path reaches: the data, what's kept in it, what it takes over, and the components it goes through
         (a VM it logs in to is controlled, and keys list it)."""
-        return {norm(x) for x in [*c.steps[1:], *c.sinks, *c.within, *c.controls]}
+        return {view(x) for x in [*c.steps[1:], *c.sinks, *c.within, *c.controls]}
 
     expected = [p for p in key.get("paths", []) if p["steps"][:1] == ["internet"]]
     given = [p for p in key.get("paths", []) if p["steps"][:1] == ["attacker-principal"]]
     others = [p for p in key.get("paths", []) if p["steps"][:1] == ["other-account"]]
     not_paths = {norm(n["resource"]): n["why"] for n in key.get("not_paths", [])}
-    out = {"root": root, "resources": len(g.resources), "expected": [], "given_credentials": len(given), "found": []}
-    out["given"] = score_given(g, model, given)
-    out["outside"] = score_outside(g, model, others) if others else []
+    out = {
+        "root": root,
+        "resources": sum(view.here(a) for a in g.resources),
+        "expected": [],
+        "given_credentials": len(given),
+        "found": [],
+    }
+    out["given"] = score_given(g, model, given, view)
+    out["outside"] = score_outside(g, model, others, view) if others else []
     # the secrets in the configuration as written: values the key's inputs give aren't in the code
-    written = (
-        graph.build(folder, root) if inputs.get("variables") or inputs.get("var_files") or inputs.get("plan") else g
-    )
-    out["findings"], out["false_findings"] = score_findings(written, key)
+    out["findings"], out["false_findings"] = score_findings(written, key, view)
     used: set[int] = set()
     for p in expected:
         e, first = norm(p["entry"]), norm(p["steps"][1]) if len(p["steps"]) > 1 else norm(p["entry"])
         want = {norm(r["resource"]) for r in p.get("reaches", [])}
         best, best_hit, best_rank = None, -1, (False, -1, -1)
         for i, c in enumerate(found):
-            on_path = {norm(x) for x in c.steps[1:]} | ({norm(c.sinks[0])} if c.steps == ["internet"] else set())
+            on_path = {view(x) for x in c.steps[1:]} | ({view(c.sinks[0])} if c.steps == ["internet"] else set())
             # the path's entry, its other ways in, and what opens the entry to the internet (a public container
             # on its storage account, a bucket policy on its bucket): keys may name either
-            entries = {norm(entry_of(c)), *map(norm, c.also), *(norm(o) for _, o in model.exposed.get(entry_of(c), []))}
+            entries = {view(entry_of(c)), *map(view, c.also), *(view(o) for _, o in model.exposed.get(entry_of(c), []))}
             if e in entries or first in on_path | entries:
                 # a path that starts where the key's does comes before one that only passes through it; then the
                 # one that reaches more of it, then the one that goes the key's way
                 hit = len(want & reach(c))
-                rank = (e in entries, hit, len({norm(x) for x in p["steps"]} & {norm(x) for x in c.steps}))
+                rank = (e in entries, hit, len({norm(x) for x in p["steps"]} & {view(x) for x in c.steps}))
                 if best is None or rank > best_rank:
                     best, best_hit, best_rank = i, hit, rank
         row = {
@@ -125,7 +167,7 @@ def score_root(folder: Path, key: dict, inputs: dict | None = None) -> dict:
         else:
             # a not-path is something that looks exposed but isn't: a path that starts there (or is that store on
             # the internet); reaching it from inside, with an identity's own grants, isn't what the key rules out
-            hit = norm(entry_of(c)) if norm(entry_of(c)) in not_paths else None
+            hit = view(entry_of(c)) if view(entry_of(c)) in not_paths else None
             verdict, reason = ("contradicted", f"{hit}: {not_paths[hit]}") if hit else ("unlabelled", "")
         out["found"].append(
             {
@@ -140,10 +182,11 @@ def score_root(folder: Path, key: dict, inputs: dict | None = None) -> dict:
     return out
 
 
-def score_given(g: graph.Graph, model: arch.Model, given: list[dict]) -> list[dict]:
+def score_given(g: graph.Graph, model: arch.Model, given: list[dict], view: View | None = None) -> list[dict]:
     """The paths that start from given credentials, against the credentials search from the same identity."""
+    view = view or View()
     im = iam.Models(g) if given else None
-    by_norm = {norm(a): a for a in g.resources}
+    by_norm = {view(a): a for a in g.resources if view.here(a)}
     rows = []
     for p in given:
         start = by_norm.get(norm(p["steps"][1]))
@@ -154,7 +197,7 @@ def score_given(g: graph.Graph, model: arch.Model, given: list[dict]) -> list[di
             rows.append(row)
             continue
         r = escalate.search(g, model, start, im)
-        have = {norm(a) for (_, a) in r.gains} - {norm(start)}
+        have = {view(a) for (_, a) in r.gains} - {view(start)}
         last = norm(p["steps"][-1])
         row["found"] = last in have or bool(want & have)
         row["reached"] = len(want & have)
@@ -165,15 +208,16 @@ def score_given(g: graph.Graph, model: arch.Model, given: list[dict]) -> list[di
     return rows
 
 
-def score_outside(g: graph.Graph, model: arch.Model, others: list[dict]) -> list[dict]:
+def score_outside(g: graph.Graph, model: arch.Model, others: list[dict], view: View | None = None) -> list[dict]:
     """Paths that start from a principal outside the estate's accounts, against terrahunter's "from other accounts":
     found when it lists the key's first role, and what it reaches from there."""
-    mine = {norm(c.steps[1]): c for c in escalate.outside(g, model)}
+    view = view or View()
+    mine = {view(c.steps[1]): c for c in escalate.outside(g, model) if view.here(c.steps[1])}
     rows = []
     for p in others:
         c = mine.get(norm(p["steps"][1]))
         want = {norm(r["resource"]) for r in p.get("reaches", [])}
-        have = {norm(x) for x in [*c.steps[1:], *c.sinks, *c.controls]} if c else set()
+        have = {view(x) for x in [*c.steps[1:], *c.sinks, *c.controls]} if c else set()
         rows.append(
             {
                 "id": p["id"],
@@ -190,11 +234,12 @@ def score_outside(g: graph.Graph, model: arch.Model, others: list[dict]) -> list
 FINDING_IDS = {"hardcoded-secret": "TH-SECRET", "long-lived-key": "TH-KEY"}
 
 
-def score_findings(g: graph.Graph, key: dict) -> tuple[list[dict], list[dict]]:
+def score_findings(g: graph.Graph, key: dict, view: View | None = None) -> tuple[list[dict], list[dict]]:
     """An estate's findings (hard-coded secrets, long-lived keys) against terrahunter's own; and the not_findings
     it reports anyway. Exposures (a public control plane) are scored as found when the resource is drawn."""
-    mine = {(f.id, norm(f.address)) for f in secrets.find(g)}
-    drawn = {norm(a) for a in g.resources}
+    view = view or View()
+    mine = {(f.id, view(f.address)) for f in secrets.find(g) if view.here(f.address)}
+    drawn = {view(a) for a in g.resources if view.here(a)}
     rows = []
     for f in key.get("findings", []):
         res = norm(f["resource"])
@@ -257,12 +302,18 @@ def markdown(results: dict[str, list[dict]]) -> str:
             f"{t['given_reach_recall']:.0%})"
         ),
         "",
-        (
-            "Inputs the answer keys assume: CloudGoat's `cg_whitelist` (the player's address) is `0.0.0.0/0`, the player "
-            "being the attacker; CloudFoxable uses its `terraform.tfvars.example` (its default challenges); sadcloud "
-            "runs with `all_findings = true` (the README's full corpus)."
+        *(
+            [
+                (
+                    "Inputs the answer keys assume: CloudGoat's `cg_whitelist` (the player's address) is `0.0.0.0/0`, "
+                    "the player being the attacker; CloudFoxable uses its `terraform.tfvars.example` (its default "
+                    "challenges); sadcloud runs with `all_findings = true` (the README's full corpus)."
+                ),
+                "",
+            ]
+            if set(results) & set(INPUTS)
+            else []
         ),
-        "",
         *(
             [
                 (
@@ -328,14 +379,14 @@ def _shaped(v):
     return v
 
 
-def score_estate(folder: Path) -> list[dict]:
+def score_estate(folder: Path, together: bool = False) -> list[dict]:
     """A generated estate: its roots (bench/source.yaml: path, variables, var_files, plan) against its answer key
-    (bench/expected.json, one entry per root, `root` = the root's path)."""
+    (bench/expected.json, one entry per root, `root` = the root's path); `together`, analysed as one."""
     import yaml  # a dev dependency: only the benchmark reads YAML
 
     source = yaml.safe_load((folder / "bench" / "source.yaml").read_text()) or {}
     keys = {k["root"]: k for k in json.loads((folder / "bench" / "expected.json").read_text())}
-    rows = []
+    todo = []
     for r in source.get("roots", []):
         key = keys.get(r["path"])
         if key is None:
@@ -354,8 +405,17 @@ def score_estate(folder: Path) -> list[dict]:
             "var_files": r.get("var_files") or [],
             "plan": plan_file,
         }
-        rows.append(score_root(folder, key, inputs))
-    return rows
+        todo.append((key, inputs))
+    if not together:
+        return [score_root(folder, key, inputs) for key, inputs in todo]
+    with contextlib.redirect_stdout(io.StringIO()):
+        built = {key["root"]: build_root(folder, key["root"], inputs) for key, inputs in todo}
+        g = estate.merge({r: b[0] for r, b in built.items()})
+        estate.link(g, {r: deps.survey(folder, r) for r in built})
+        written = estate.merge({r: b[1] for r, b in built.items()})
+        model = arch.build(g)
+        found = chains.build(g, model).chains
+    return [score(key, g, model, found, written, View(key["root"])) for key, _ in todo]
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -368,13 +428,16 @@ def main(argv: list[str] | None = None) -> int:
         default=[],
         help="a generated estate (its bench/source.yaml and bench/expected.json), scored on its own; repeatable",
     )
+    ap.add_argument(
+        "--together", action="store_true", help="analyse each estate's roots as one, so paths may cross roots"
+    )
     ap.add_argument("--project", action="append", help="only these projects (repeatable)")
     ap.add_argument("--report", type=Path, help="write the Markdown report here")
     ap.add_argument("--json", type=Path, help="write the full results here")
     a = ap.parse_args(argv)
     results: dict[str, list[dict]] = {}
     for est in a.estate:
-        results[est.name] = score_estate(est)
+        results[est.name] = score_estate(est, a.together)
     if a.kb is None and not a.estate:
         ap.error("give --kb, --estate, or both")
     for key_file in sorted((a.kb / "bench").glob("*/expected.json")) if a.kb else []:
