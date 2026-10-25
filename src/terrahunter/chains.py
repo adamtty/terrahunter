@@ -930,9 +930,14 @@ def fixes(g: graph.Graph, model: arch.Model, chains: list[Chain]) -> list[Fix]:
                 i,
             )
         elif public:
+            # one fix per change to make, listing every resource it's made on (an API's unauthenticated methods)
+            by_action: dict[str, list[str]] = {}
             for _, o in public:
                 action = next((text for types, text in _PUBLIC_FIX if R[o].type in types), "Make it private")
-                add(f"public:{o}", f"{c.name}: {action}", "breaks", [o], i)
+                by_action.setdefault(action, []).append(o)
+            for action, origins in by_action.items():
+                origins = sorted(set(origins))
+                add("public:" + ",".join(origins), f"{c.name}: {action}", "breaks", origins, i)
         elif c.type in _ENTRY_FIX:
             add(f"public:{entry}", f"{c.name}: {_ENTRY_FIX[c.type]}", "breaks", [entry], i)
         for s in ch.steps[1:]:
