@@ -327,3 +327,18 @@ def test_a_conditional_the_code_doesn_t_settle_is_either_branch_possibly(tmp_pat
     assert m.allowed("aws_iam_role.r", "s3:PutObject", "aws_s3_bucket.inbox") is None  # possibly
     assert m.access("aws_iam_role.r", "aws_s3_bucket.inbox", "s3") == "admin"  # at most the wide branch
     assert m.allowed("aws_iam_role.r", "dynamodb:Scan", None) is False  # in neither branch
+
+
+def test_a_module_policy_document_naming_its_argument(tmp_path):
+    (tmp_path / "w").mkdir()
+    (tmp_path / "w" / "main.tf").write_text(
+        'variable "archive_arn" {}\nresource "aws_iam_role" "r" {}\n'
+        'data "aws_iam_policy_document" "d" {\n  statement {\n    actions = ["s3:GetObject"]\n'
+        "    resources = [var.archive_arn]\n  }\n}\n"
+        'resource "aws_iam_role_policy" "p" {\n  role = aws_iam_role.r.id\n  policy = data.aws_iam_policy_document.d.json\n}\n'
+    )
+    m = model(
+        tmp_path,
+        'resource "aws_s3_bucket" "archive" {}\nmodule "w" {\n  source = "./w"\n  archive_arn = aws_s3_bucket.archive.arn\n}\n',
+    )
+    assert m.allowed("module.w.aws_iam_role.r", "s3:GetObject", "aws_s3_bucket.archive") is True

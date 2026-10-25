@@ -276,11 +276,19 @@ class Model:
                 # of the service the statement's actions are for
                 if _VAR_REF.search(r):
                     services = {a.split(":")[0] for a in _list(st.get("Action")) if ":" in str(a)}
+                    # the policy's own references, and (a data policy document it reads) the document's
+                    refs = [e for e in self.out_e.get(source, []) if e.attr.startswith("policy")]
+                    refs += [
+                        d
+                        for e in refs
+                        if R.get(e.target) and R[e.target].type == "aws_iam_policy_document"
+                        for d in self.out_e.get(e.target, [])
+                        if d.attr.startswith("statement")
+                    ]
                     targets |= {
                         e.target
-                        for e in self.out_e.get(source, [])
-                        if e.attr.startswith("policy")
-                        and e.target in R
+                        for e in refs
+                        if e.target in R
                         and (R[e.target].type.split("_") + [""])[1] in {str(x).lower() for x in services}
                     }
                 # a module's output (${module.data.secret_arn}): what the reference resolves to, from the edges
