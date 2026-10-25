@@ -138,7 +138,7 @@ def find(g: graph.Graph) -> list[scanners.Finding]:
     # provider blocks: credentials written into them
     for mod, d in g.module_dirs.items():
         notes: list[str] = []
-        for fname, doc, text in deps.load_dir(d, notes, str(d)):
+        for fname, doc, text in deps.load_dir(d, notes, str(d), g.folders):
             for block in doc.get("provider") or []:
                 for name, body in block.items() if isinstance(block, dict) else []:
                     name = name.strip('"')

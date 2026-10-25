@@ -1,7 +1,8 @@
 """Containment for reading Terraform you don't trust.
 
 The folder under review may be a pull request from a stranger, so nothing in it is trusted: files are only read when
-they are regular files inside the folder (a symlink to ~/.ssh is never followed), every read has a size limit, and
+they are regular files inside the folder, or symlinks to one (a shared variables file linked into each root; a
+symlink to ~/.ssh, or anywhere outside the folders under review, is never followed), every read has a size limit, and
 text that came from the folder has control characters removed before it reaches a terminal or a report. The
 scanners run on a staged copy, from an empty directory, with a throwaway HOME, a minimal environment, no network
 and a cap on what they may write (see `scanners`).
@@ -65,6 +66,25 @@ def one_line(text: object, limit: int | None = None) -> str:
     return s[:limit] if limit else s
 
 
+def linked_inside(link: Path, folders: list[Path]) -> Path | None:
+    """The real path of a symlinked file, when it's a regular file (not another link, a FIFO or a device) inside one
+    of the folders; None otherwise (a link to ~/.ssh, to a directory, or that dangles)."""
+    try:
+        real = link.resolve(strict=True)
+        st = real.lstat()
+    except (OSError, RuntimeError):
+        return None
+    if not stat.S_ISREG(st.st_mode):
+        return None
+    for f in folders:
+        try:
+            real.relative_to(f.resolve())
+            return real
+        except (OSError, ValueError):
+            continue
+    return None
+
+
 def is_regular_inside(path: Path, root: Path) -> bool:
     """True for a regular file (not a symlink, FIFO or device) whose real path is inside root."""
     try:
@@ -100,10 +120,14 @@ def read_regular(path: Path, limit: int = MAX_FILE_BYTES) -> bytes:
     return data
 
 
-def tf_files(root: Path, recursive: bool = True, budget: list[int] | None = None) -> tuple[list[Path], list[str]]:
+def tf_files(
+    root: Path, recursive: bool = True, budget: list[int] | None = None, inside: list[Path] | None = None
+) -> tuple[list[Path], list[str]]:
     """The Terraform files under root that are safe to read, and a note for each one left out. Hidden directories
-    (.git, .terraform, …) and symlinked directories are not entered. `budget` ([bytes left]) lets several calls share
-    one MAX_TOTAL_BYTES allowance; it's updated in place."""
+    (.git, .terraform, …) and symlinked directories are not entered. A symlinked file is read when its real path is a
+    regular file inside root or one of the `inside` folders (the folders under analysis: a shared variables-common.tf
+    linked into each root); its real path is what's returned. `budget` ([bytes left]) lets several calls share one
+    MAX_TOTAL_BYTES allowance; it's updated in place."""
     found, skipped = [], []
     budget = budget if budget is not None else [MAX_TOTAL_BYTES]
     root = Path(root)
@@ -114,7 +138,9 @@ def tf_files(root: Path, recursive: bool = True, budget: list[int] | None = None
                 continue
             p = Path(dirpath) / name
             rel = p.relative_to(root).as_posix()
-            if not is_regular_inside(p, root):
+            if p.is_symlink() and (real := linked_inside(p, [root, *(inside or [])])):
+                p = real
+            elif not is_regular_inside(p, root):
                 skipped.append(f"{rel}: not a regular file inside the folder (symlink or special file), skipped")
                 continue
             size = p.lstat().st_size

@@ -74,16 +74,17 @@ def _key(k) -> str:
     return k[1:-1] if isinstance(k, str) and len(k) >= 2 and k[0] == k[-1] == '"' else str(k)
 
 
-def parse_dir(d: Path, notes: list[str], label: str) -> list[tuple[str, dict]]:
+def parse_dir(d: Path, notes: list[str], label: str, inside: list[Path] | None = None) -> list[tuple[str, dict]]:
     """Every configuration file directly in d → [(file name, parsed document)]."""
-    return [(name, doc) for name, doc, _ in load_dir(d, notes, label)]
+    return [(name, doc) for name, doc, _ in load_dir(d, notes, label, inside)]
 
 
-def load_dir(d: Path, notes: list[str], label: str) -> list[tuple[str, dict, str]]:
+def load_dir(d: Path, notes: list[str], label: str, inside: list[Path] | None = None) -> list[tuple[str, dict, str]]:
     """Every configuration file directly in d → [(file name, parsed document, text)]. JSON files are read as JSON
-    (their strings get quotes added, so both look the same to the rest); files that won't parse become notes."""
+    (their strings get quotes added, so both look the same to the rest); files that won't parse become notes. A file
+    linked from inside the `inside` folders is read through its link."""
     out = []
-    files, skipped = sandbox.tf_files(d, recursive=False)
+    files, skipped = sandbox.tf_files(d, recursive=False, inside=inside)
     notes += [f"{label}/{s}" for s in skipped]
     started = time.monotonic()
     for p in files:
@@ -303,7 +304,7 @@ def survey(folder: Path, root: str, with_folders: list[Path] | None = None) -> S
             return
         seen.add(d)
         via = ".".join(f"module.{p}" for p in path)
-        for fname, doc in parse_dir(d, s.notes, label(d)):
+        for fname, doc in parse_dir(d, s.notes, label(d), allowed):
             where = f"{label(d)}/{fname}"
             for name, body in _blocks(doc, "module"):
                 src_raw = body.get("source")
