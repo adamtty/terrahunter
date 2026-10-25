@@ -150,3 +150,59 @@ def test_a_service_pinned_to_one_host_runs_only_there(tmp_path):
     # the other host runs only the db, which publishes nothing: port 80 is open there, but nothing listens
     assert "aws_instance.back" not in {c.steps[1] for c in r.chains}
     assert "aws_ecs_service.web" in {c.steps[1] for c in r.chains}
+
+
+def test_a_host_joined_by_the_cluster_s_name(tmp_path):
+    m, _ = build(
+        tmp_path,
+        NET
+        + BUCKETS
+        + ROLES
+        + CLUSTER
+        + HOSTS.replace("${aws_ecs_cluster.c.name}", "c")
+        + task("web")
+        + service("web", "web"),
+    )
+    assert any(c.source == "aws_ecs_service.web" and c.label == "runs on" for c in m.connections)
+
+
+def test_a_container_with_the_docker_socket_has_its_neighbours(tmp_path):
+    socket = task("web").replace(
+        'image = "x",', 'image = "x", mountPoints = [{ sourceVolume = "d", containerPath = "/var/run/docker.sock" }],'
+    )
+    other = 'resource "aws_iam_role" "vault" {}\n' + task("vault").replace(
+        "aws_iam_role.task.arn", "aws_iam_role.vault.arn"
+    ).replace("hostPort = 80", "hostPort = 8080")
+    _, r = build(
+        tmp_path,
+        NET + BUCKETS + ROLES + CLUSTER + HOSTS + socket + other + service("web", "web") + service("vault", "vault"),
+    )
+    (ch,) = [c for c in r.chains if "aws_iam_role.vault" in c.steps]
+    assert ch.steps == ["internet", "aws_ecs_service.web", "aws_ecs_service.vault", "aws_iam_role.vault"]
+    assert "Docker socket" in " ".join(ch.hops)
+
+
+def test_a_host_role_that_drains_pulls_other_services_over(tmp_path):
+    socket = task("web").replace('image = "x",', 'image = "x", privileged = true,')
+    drain = (
+        'resource "aws_iam_role_policy" "drain" {\n  role = aws_iam_role.host.id\n'
+        '  policy = jsonencode({Statement = [{Effect = "Allow", Action = "ecs:UpdateContainerInstancesState", '
+        'Resource = "*"}]})\n}\n'
+        'resource "aws_instance" "vault" {\n  user_data = "echo ECS_CLUSTER=c >> /etc/ecs/ecs.config"\n}\n'
+    )
+    pinned = '  placement_constraints {\n    type = "memberOf"\n    expression = "ec2InstanceId == ${aws_instance.vault.id}"\n  }\n'
+    _, r = build(
+        tmp_path,
+        NET
+        + BUCKETS
+        + ROLES
+        + CLUSTER
+        + HOSTS
+        + drain
+        + socket
+        + task("vault")
+        + service("web", "web")
+        + service("vault", "vault", pinned),
+    )
+    (ch,) = [c for c in r.chains if c.steps == ["internet", "aws_ecs_service.web", "aws_iam_role.host"]]
+    assert "aws_ecs_service.vault" in ch.controls

@@ -26,7 +26,7 @@ import itertools
 import re
 from dataclasses import asdict, dataclass, field
 
-from terrahunter import arch, clouds, deps, graph, kb, policies, sandbox
+from terrahunter import arch, clouds, deps, graph, kb, policies
 
 COMPUTE = (
     {
@@ -87,7 +87,6 @@ _ANY_RESOURCE = re.compile(r'[Rr]esources?\\?["\']?\s*[:=]\s*\[?\s*(?:\\?["\']){
 _OPEN = re.compile(r"^open to internet: (.+)$")
 _KEY_FILE = re.compile(r"\.pem$|(^|/)id_(rsa|ed25519|ecdsa|dsa)$|\.key$|private[-_]?key", re.IGNORECASE)
 _FILESET = re.compile(r'fileset\(\s*"([^"]*)"\s*,\s*"([^"]*)"\s*\)')
-_READS = re.compile(r'\b(?:file|templatefile)\(\s*"([^"$]+)"')
 _PASSWORD_LOGIN = re.compile(r"chpasswd|\bpasswd\b|PasswordAuthentication\s+yes", re.IGNORECASE)
 WEB_PORTS = {"80", "443", "8080", "8443", "all"}
 ADMIN_PORTS = {"22": "SSH", "3389": "RDP", "all": "every port"}
@@ -293,23 +292,25 @@ def _uploaded_files(g: graph.Graph, addr: str, limit: int = 2000) -> list[str]:
     return out
 
 
-def _setup_text(g: graph.Graph, addr: str) -> str:
-    """What sets a machine up, as text: its configuration, what it takes from (a rendered template) or what acts on
-    it (a VM extension), and the files those read with file() or templatefile(), inside the folders under analysis."""
-    linked = {e.target for e in g.edges if e.source == addr} | {e.source for e in g.edges if e.target == addr}
-    rs = [g.resources[a] for a in [addr, *sorted(linked)] if a in g.resources]
-    parts = [str(r.body) for r in rs]
-    allowed = [d.resolve() for d in g.dirs]
-    for r in rs:
-        base = g.module_dirs.get(r.module)
-        for name in _READS.findall(parts[rs.index(r)]) if base is not None else []:
-            try:
-                real = (base / name.replace("${path.module}/", "").replace("${path.root}/", "")).resolve()
-                if deps._inside_any(real, allowed) is not None:
-                    parts.append(sandbox.read_regular(real, graph.MAX_FILE_BYTES).decode("utf-8", "replace"))
-            except OSError:
-                continue
-    return "\n".join(parts)
+_DOCKER_SOCKET = re.compile(r"/var/run/docker\.sock")
+_PRIVILEGED = re.compile(r"""['"]?privileged['"]?\s*[:=]\s*true""", re.IGNORECASE)
+
+
+def _host_access(g: graph.Graph, svc: str) -> str:
+    """How an ECS service's containers reach their host, from its task definition: the Docker socket, a privileged
+    container, or the host's process namespace; "" when they don't."""
+    R = g.resources
+    for e in g.edges:
+        if e.source == svc and R.get(e.target) and R[e.target].type == "aws_ecs_task_definition":
+            b = R[e.target].body
+            text = str(b.get("container_definitions", "")) + str(b.get("volume", ""))
+            if _DOCKER_SOCKET.search(text):
+                return "the Docker socket is mounted into it"
+            if _PRIVILEGED.search(text):
+                return "a container runs privileged"
+            if deps.unquote(b.get("pid_mode")) == "host":
+                return "it shares the host's process namespace"
+    return ""
 
 
 def _stores_in(e: graph.Edge, R: dict) -> bool:
@@ -581,7 +582,7 @@ def build(g: graph.Graph, model: arch.Model) -> Result:
         out = {}
         for c in model.components:
             if c.type in clouds.VMS and public_ip(c) and any(p in ("22", "all") for p in _ports(c)):
-                text = _setup_text(g, c.id)
+                text = arch.setup_text(g, c.id)
                 stems = {k: k.rsplit("/", 1)[-1].rsplit(".", 1)[0] for k in keys}
                 key_name = deps.unquote((R[c.id].body if c.id in R else {}).get("key_name"))
                 trusted = [k for k, s in stems.items() if s and (f"{s}.pub" in text or s == key_name)]
@@ -751,13 +752,50 @@ def build(g: graph.Graph, model: arch.Model) -> Result:
             if len(took) > 4:
                 hops.append(f"with {identity}'s credentials: … and {len(took) - 4} more")
             data = r.data()
+
             # what it takes over: the identities and compute it becomes, and (as the administrator) the rest
-            others = [a for a, lvl in data.items() if lvl == "admin" and a in comps and not kb_store(comps[a].type)]
-            held[identity] = [a for a in data if a not in comps and a not in controls_of.get(identity, [])]
+            def is_data(a: str) -> bool:
+                return kb_store(comps[a].type) if a in comps else (kb.entry(R[a].type) or {}).get("category") == "data"
+
+            others = [a for a, lvl in data.items() if lvl == "admin" and not is_data(a)]
+            held[identity] = [a for a in data if a not in comps and is_data(a)]
             controls_of[identity] = list(dict.fromkeys([a for a in took if a != "account"] + others))
             more = [a for a in data if a in comps and kb_store(comps[a].type) and a not in sinks]
             sinks = sinks + sorted(more)
         return sinks
+
+    def drained(svc: str, host: str, role: str, hops: list[str]) -> list[str]:
+        """With its host's role able to drain container instances, the cluster's other services can be pushed off
+        their own hosts and on to this one, where the attacker already is."""
+        if search(role) is None or not R[role].type.startswith("aws_") or im is None:
+            return []
+        if not any(
+            im.aws.allowed(role, a) is True
+            for a in ("ecs:UpdateContainerInstancesState", "ecs:DeregisterContainerInstance")
+        ):
+            return []
+        clusters = {
+            e.target for e in g.edges if e.source == svc and R.get(e.target) and R[e.target].type == "aws_ecs_cluster"
+        }
+        others = [
+            e.source
+            for e in g.edges
+            if e.target in clusters
+            and e.source != svc
+            and e.source in comps
+            and comps[e.source].type == "aws_ecs_service"
+        ]
+        away = [
+            o
+            for o in dict.fromkeys(others)
+            if not any(x.label == "runs on" and x.target == host for x in out.get(o, []))
+        ]
+        if away:
+            hops.append(
+                f"{role} may drain or deregister the cluster's other container instances: their tasks "
+                f"({', '.join(away)}) are rescheduled, and can land on {host}, if their placement allows it"
+            )
+        return away
 
     def reached(sinks: list[str]) -> str:
         return "reaches: " + ", ".join(t + (" ⚠sensitive" if sensitive(t) else "") for t in sinks)
@@ -862,6 +900,16 @@ def build(g: graph.Graph, model: arch.Model) -> Result:
                         for x in out.get(v, []):
                             if x.label == "runs as" and x.target in comps and x.target not in roles:
                                 host_roles.setdefault(x.target, e.target)
+            # a container that reaches its host (the Docker socket, privileged, the host's processes) has the other
+            # tasks on that host too: each is a way on to its own task role
+            neighbours: dict[str, tuple[str, str, str]] = {}  # task role → (its service, the host, how)
+            escape = _host_access(g, node.id) if host_roles else ""
+            for host in dict.fromkeys(host_roles.values()) if escape else []:
+                for e in model.connections:
+                    if e.label == "runs on" and e.target == host and e.source != node.id and e.source in comps:
+                        for x in out.get(e.source, []):
+                            if x.label == "runs as" and x.target in comps and x.target not in roles:
+                                neighbours.setdefault(x.target, (e.source, host, escape))
             # an Azure workload with a system-assigned identity, or a GCP one on the default service account, is its
             # own identity: no extra step, its grants come from itself
             own = clouds.system_identity(node.type, R[node.id].body) if node.id in R else ""
@@ -875,15 +923,26 @@ def build(g: graph.Graph, model: arch.Model) -> Result:
             for d in direct:
                 add_edge(node.id, d, next(x.label for x in out[node.id] if x.target == d), "access")
             where = "the instance metadata service" if node.type in clouds.VMS else "its environment"
-            for role in roles + list(host_roles) + ([node.id] if own else []) or [None]:
+            for role in roles + list(host_roles) + list(neighbours) + ([node.id] if own else []) or [None]:
                 h, steps, sinks = list(hops), ["internet", *path], list(direct)
-                if role in host_roles:
+                taken: list[str] = []  # services it takes over on the way
+                if role in neighbours:
+                    other, host, how = neighbours[role]
+                    steps += [other, role]
+                    h.append(
+                        f"{node.id} reaches its host {host} ({how}): the other tasks there are the attacker's too, "
+                        f"{other} among them, and its task role {role}"
+                    )
+                    sinks += [t for t in via_identity(role, h) if t not in sinks]
+                elif role in host_roles:
                     steps.append(role)
                     h.append(
                         f"{node.id} runs on {host_roles[role]}: from the container, the host's instance metadata "
                         f"service gives {role} (unless the host blocks it)"
                     )
                     sinks += [t for t in via_identity(role, h) if t not in sinks]
+                    if escape:
+                        taken = drained(node.id, host_roles[role], role, h)
                 elif role == node.id:
                     h.append(f"{node.id} runs as {own}: its credentials come from {where}")
                     sinks += [t for t in via_identity(role, h) if t not in sinks]
@@ -905,7 +964,7 @@ def build(g: graph.Graph, model: arch.Model) -> Result:
                 )
                 key = (node.id, role, tuple(sinks))
                 ch = Chain("", kind, conf, f"{c.name}: {why}", steps, sinks, h)
-                ch.controls = [x for x in controls_of.get(role, []) if x not in steps] if role else []
+                ch.controls = [x for x in [*taken, *controls_of.get(role, [])] if x not in steps] if role else []
                 old = found.get(key)
                 if old is None:
                     found[key] = ch

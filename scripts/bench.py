@@ -76,16 +76,17 @@ def score_root(folder: Path, key: dict, inputs: dict | None = None) -> dict:
     for p in expected:
         e, first = norm(p["entry"]), norm(p["steps"][1]) if len(p["steps"]) > 1 else norm(p["entry"])
         want = {norm(r["resource"]) for r in p.get("reaches", [])}
-        best, best_hit, best_rank = None, -1, (False, -1)
+        best, best_hit, best_rank = None, -1, (False, -1, -1)
         for i, c in enumerate(found):
             on_path = {norm(x) for x in c.steps[1:]} | ({norm(c.sinks[0])} if c.steps == ["internet"] else set())
             # the path's entry, its other ways in, and what opens the entry to the internet (a public container
             # on its storage account, a bucket policy on its bucket): keys may name either
             entries = {norm(entry_of(c)), *map(norm, c.also), *(norm(o) for _, o in model.exposed.get(entry_of(c), []))}
             if e in entries or first in on_path | entries:
-                # a path that starts where the key's does comes before one that only passes through it
+                # a path that starts where the key's does comes before one that only passes through it; then the
+                # one that reaches more of it, then the one that goes the key's way
                 hit = len(want & reach(c))
-                rank = (e in entries, hit)
+                rank = (e in entries, hit, len({norm(x) for x in p["steps"]} & {norm(x) for x in c.steps}))
                 if best is None or rank > best_rank:
                     best, best_hit, best_rank = i, hit, rank
         row = {
