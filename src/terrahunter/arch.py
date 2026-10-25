@@ -28,7 +28,7 @@ from __future__ import annotations
 import re
 from dataclasses import asdict, dataclass, field
 
-from terrahunter import clouds, conditions, deps, graph, kb, policies, scanners
+from terrahunter import clouds, conditions, deps, graph, kb, policies, sandbox, scanners
 
 # how terrahunter draws the types it has its own rules for: type → (glyph, category, short name); the catalogue's
 # components are drawn too, named after their service
@@ -95,6 +95,28 @@ MEANING = [
 NOT_CONNECTIONS = re.compile(r"(^|\.)(tags(_all)?|name|description|identifier|bucket_prefix)(\.|$)")
 # what the meaning of a connection says, when it isn't worth drawing all the time
 QUIET = {"encrypted with", "logs to"}
+
+
+_READS = re.compile(r'\b(?:file|templatefile)\(\s*"([^"$]+)"')
+
+
+def setup_text(g: graph.Graph, addr: str) -> str:
+    """What sets a machine up, as text: its configuration, what it takes from (a rendered template) or what acts on
+    it (a VM extension), and the files those read with file() or templatefile(), inside the folders under analysis."""
+    linked = {e.target for e in g.edges if e.source == addr} | {e.source for e in g.edges if e.target == addr}
+    rs = [g.resources[a] for a in [addr, *sorted(linked)] if a in g.resources]
+    parts = [str(r.body) for r in rs]
+    allowed = [d.resolve() for d in g.dirs]
+    for r in rs:
+        base = g.module_dirs.get(r.module)
+        for name in _READS.findall(parts[rs.index(r)]) if base is not None else []:
+            try:
+                real = (base / name.replace("${path.module}/", "").replace("${path.root}/", "")).resolve()
+                if deps._inside_any(real, allowed) is not None:
+                    parts.append(sandbox.read_regular(real, graph.MAX_FILE_BYTES).decode("utf-8", "replace"))
+            except OSError:
+                continue
+    return "\n".join(parts)
 
 
 @dataclass
@@ -656,6 +678,13 @@ def build(g: graph.Graph, findings: list[scanners.Finding] = ()) -> Model:
                     connect(idp, role, "assumes as guest")
     # ECS: a service runs as its task definition's task role, and (on EC2) on the hosts of its cluster: instances or
     # launch templates whose user data joins it, or the auto scaling groups of its capacity providers
+    setups: dict[str, str] = {}
+
+    def setup(h: str) -> str:
+        if h not in setups:
+            setups[h] = setup_text(g, h)
+        return setups[h]
+
     for svc in of("aws_ecs_service"):
         for td in targets(svc, "aws_ecs_task_definition"):
             for role in targets(td, "aws_iam_role", attr=r"^task_role_arn$"):
@@ -667,6 +696,11 @@ def build(g: graph.Graph, findings: list[scanners.Finding] = ()) -> Model:
             for ccp in sources(cl, "aws_ecs_cluster_capacity_providers"):
                 for cp in targets(ccp, "aws_ecs_capacity_provider"):
                     hosts += targets(cp, "aws_autoscaling_group")
+            # or by the cluster's name, written into the ECS agent's configuration by their user data
+            name = deps.unquote(R[cl].body.get("name"))
+            if name and "${" not in name:
+                joins = re.compile(rf"ECS_CLUSTER\s*=\s*['\"]?{re.escape(name)}\b")
+                hosts += [h for h in of("aws_instance") + of("aws_launch_template") if joins.search(setup(h))]
             hosts += [asg for lt in list(hosts) for asg in sources(lt, "aws_autoscaling_group")]
             # a memberOf constraint that names instances (ec2InstanceId == ${aws_instance.x.id}) pins it to them
             pinned = targets(svc, "aws_instance", attr=r"^placement_constraints\.expression$")
