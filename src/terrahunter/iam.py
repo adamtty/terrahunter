@@ -40,6 +40,7 @@ IDENTITIES = ("aws_iam_user", "aws_iam_role")
 # a reference in a policy string: ${aws_s3_bucket.data.arn}, ${module.x.aws_iam_role.r.arn}
 _REF = re.compile(r"\$\{(?:data\.)?([a-z][a-z0-9_]*)\.([A-Za-z0-9_-]+)(?:\[[^\]]*\])?\.[A-Za-z0-9_]+\}")
 # the account itself as a principal: its root ARN, its id, or the id read from aws_caller_identity
+_VAR_REF = re.compile(r"\$\{(var|local)\.[A-Za-z0-9_-]+")
 _MOD_REF = re.compile(r"\$\{module\.([A-Za-z0-9_-]+)(?:\[[^\]]*\])?\.[A-Za-z0-9_-]+\}")
 _ROOT = re.compile(r":root$|^\d{12}$|^\$\{data\.aws_caller_identity\.[\w-]+\.account_id\}$")
 LEVELS = {"list": 1, "read": 2, "write": 3, "admin": 4}
@@ -230,6 +231,17 @@ class Model:
                     addr = f"{self._module(source)}{t}.{n}"
                     if addr in R:
                         targets.add(addr)
+                # a variable or local (${var.secret_arn}, a module's argument): what it resolves to, from the edges,
+                # of the service the statement's actions are for
+                if _VAR_REF.search(r):
+                    services = {a.split(":")[0] for a in _list(st.get("Action")) if ":" in str(a)}
+                    targets |= {
+                        e.target
+                        for e in self.out_e.get(source, [])
+                        if e.attr.startswith("policy")
+                        and e.target in R
+                        and (R[e.target].type.split("_") + [""])[1] in {str(x).lower() for x in services}
+                    }
                 # a module's output (${module.data.secret_arn}): what the reference resolves to, from the edges
                 for name in _MOD_REF.findall(r):
                     inside = f"{self._module(source)}module.{name}"
