@@ -66,6 +66,9 @@
          "instance_type": {
           "constant_value": "t3.micro"
          },
+         "key_name": {
+          "constant_value": "ops"
+         },
          "subnet_id": {
           "references": [
            "var.subnet"
@@ -243,6 +246,7 @@
         "get_password_data": false,
         "hibernation": null,
         "instance_type": "t3.micro",
+        "key_name": "ops",
         "launch_template": [],
         "region": "eu-west-1",
         "source_dest_check": true,
@@ -351,6 +355,7 @@
         "get_password_data": false,
         "hibernation": null,
         "instance_type": "t3.micro",
+        "key_name": "ops",
         "launch_template": [],
         "region": "eu-west-1",
         "source_dest_check": true,
@@ -529,25 +534,25 @@
    "attribute": [
     "id"
    ],
-   "resource": "aws_vpc.v"
-  },
-  {
-   "attribute": [
-    "id"
-   ],
    "resource": "aws_subnet.pub[0]"
   },
   {
    "attribute": [
     "id"
    ],
-   "resource": "module.web[\"a\"].aws_security_group.web"
+   "resource": "module.web[\"b\"].aws_security_group.web"
   },
   {
    "attribute": [
     "id"
    ],
-   "resource": "module.web[\"b\"].aws_security_group.web"
+   "resource": "aws_vpc.v"
+  },
+  {
+   "attribute": [
+    "id"
+   ],
+   "resource": "module.web[\"a\"].aws_security_group.web"
   }
  ],
  "resource_changes": [
@@ -724,6 +729,7 @@
      "get_password_data": false,
      "hibernation": null,
      "instance_type": "t3.micro",
+     "key_name": "ops",
      "launch_template": [],
      "region": "eu-west-1",
      "source_dest_check": true,
@@ -784,7 +790,6 @@
      "instance_state": true,
      "ipv6_address_count": true,
      "ipv6_addresses": true,
-     "key_name": true,
      "launch_template": [],
      "maintenance_options": true,
      "metadata_options": true,
@@ -911,6 +916,7 @@
      "get_password_data": false,
      "hibernation": null,
      "instance_type": "t3.micro",
+     "key_name": "ops",
      "launch_template": [],
      "region": "eu-west-1",
      "source_dest_check": true,
@@ -971,7 +977,6 @@
      "instance_state": true,
      "ipv6_address_count": true,
      "ipv6_addresses": true,
-     "key_name": true,
      "launch_template": [],
      "maintenance_options": true,
      "metadata_options": true,
@@ -1087,7 +1092,7 @@
   }
  ],
  "terraform_version": "1.17.0",
- "timestamp": "2026-10-24T00:09:18Z",
+ "timestamp": "2026-10-25T02:11:32Z",
  "variables": {
   "envs": {
    "value": [

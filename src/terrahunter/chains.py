@@ -75,6 +75,7 @@ _ACTION = re.compile(r'"([a-z0-9-]+):([A-Za-z0-9*]+)"')
 _ANY_ACTION = re.compile(r'[Aa]ctions?\\?["\']?\s*[:=]\s*\[?\s*(?:\\?["\']){1,2}\*(?:\\?["\']){1,2}')
 _ANY_RESOURCE = re.compile(r'[Rr]esources?\\?["\']?\s*[:=]\s*\[?\s*(?:\\?["\']){1,2}\*(?:\\?["\']){1,2}')
 _OPEN = re.compile(r"^open to internet: (.+)$")
+_PASSWORD_LOGIN = re.compile(r"chpasswd|\bpasswd\b|PasswordAuthentication\s+yes", re.IGNORECASE)
 WEB_PORTS = {"80", "443", "8080", "8443", "all"}
 ADMIN_PORTS = {"22": "SSH", "3389": "RDP", "all": "every port"}
 POLICY_TYPES = (
@@ -556,13 +557,21 @@ def build(g: graph.Graph, model: arch.Model) -> Result:
                 {"id": f"x{len(edges)}", "source": s, "target": t, "label": label, "kind": kind, "quiet": False}
             )
 
+    def can_log_in(c: arch.Component) -> bool:
+        """Whether SSH or RDP open to the internet is a way in: an EC2 instance takes a login only with a key pair or
+        a password its user data sets (EC2 Instance Connect needs IAM permissions the internet doesn't have)."""
+        if c.type not in ("aws_instance", "aws_launch_template") or c.id not in R:
+            return True  # other clouds' VMs: an admin login, or project-wide keys, are the default
+        b = R[c.id].body
+        return bool(b.get("key_name")) or bool(_PASSWORD_LOGIN.search(str(b.get("user_data", ""))))
+
     def compromise(c: arch.Component, via_lb: bool, has_role: bool) -> tuple[str, str]:
         """How an attacker gets something out of compute they reach: (the hop's text, its confidence)."""
         if c.type in APIS:
             return f"{c.id}: anyone who can call it gets what its integration does, as the role it runs as", "direct"
         ports = set(_ports(c))
         web = bool(ports & WEB_PORTS) or via_lb
-        admin = [ADMIN_PORTS[p] for p in ("22", "3389", "all") if p in ports]
+        admin = [ADMIN_PORTS[p] for p in ("22", "3389", "all") if p in ports] if can_log_in(c) else []
         if has_role and web and _has(c, "IMDSv1 allowed"):
             return (
                 f"{c.id}: serves the web with IMDSv1 allowed: one SSRF in the app hands over its credentials",

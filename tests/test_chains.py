@@ -256,3 +256,13 @@ def test_a_role_s_own_policies(tmp_path, own, sinks):
         + instance("web", "pub", "web", "  iam_instance_profile = aws_iam_instance_profile.app.name\n"),
     )
     assert sorted(s for c in r.chains for s in c.sinks) == sinks
+
+
+@pytest.mark.parametrize(
+    ("login", "found"),
+    [("", False), ('  key_name = "ops"\n', True), ('  user_data = "echo root:pw | chpasswd"\n', True)],
+)
+def test_ssh_open_is_a_way_in_only_with_a_login(tmp_path, login, found):
+    # SSH open to the world, but with no key pair and no password nobody can log in
+    r = paths(tmp_path, NET + sg("ssh", 22) + instance("box", "pub", "ssh", login))
+    assert bool(r.chains) is found
