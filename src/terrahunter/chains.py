@@ -310,8 +310,20 @@ def _uploaded_files(g: graph.Graph, addr: str, limit: int = 2000) -> list[str]:
 # what links a store to the function it triggers, and an exposure that lets anyone write to the store
 _TRIGGERS = {"aws_lambda_event_source_mapping", "aws_s3_bucket_notification", "aws_sns_topic_subscription"}
 _WRITES = re.compile(r"\b\w+:(Send|Put|Publish|Write)\w*|\b\w+:\*|\bwrit", re.IGNORECASE)
+_SECRET_VAR = re.compile(
+    r"""['"]?\w*(PASSW(OR)?D|SECRET|TOKEN|API_?KEY|ACCESS_?KEY|CREDENTIAL)\w*['"]?\s*[:=]""", re.IGNORECASE
+)
 _DOCKER_SOCKET = re.compile(r"/var/run/docker\.sock")
 _PRIVILEGED = re.compile(r"""['"]?privileged['"]?\s*[:=]\s*true""", re.IGNORECASE)
+
+
+def _holds_secrets(r: graph.Resource | None) -> bool:
+    """A workload whose environment names a secret: a password, a token, a key, credentials."""
+    if r is None or (kb.entry(r.type) or {}).get("category") != "compute":
+        return False
+    env = str(r.body.get("environment", "")) + str(r.body.get("app_settings", ""))
+    env += str(r.body.get("environment_variables", "")) + str(r.body.get("container_definitions", ""))
+    return bool(_SECRET_VAR.search(env))
 
 
 def _host_access(g: graph.Graph, svc: str) -> str:
@@ -811,6 +823,9 @@ def build(g: graph.Graph, model: arch.Model) -> Result:
             held[identity] = [a for a in data if a not in comps and is_data(a)]
             controls_of[identity] = list(dict.fromkeys([a for a in took if a != "account"] + others))
             more = [a for a in data if a in comps and kb_store(comps[a].type) and a not in sinks]
+            # compute whose configuration holds secrets (a database password in a function's variables): reading
+            # it is reaching them
+            more += [a for a in data if a in comps and a not in sinks and a not in more and _holds_secrets(R.get(a))]
             sinks = sinks + sorted(more)
         return sinks
 

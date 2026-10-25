@@ -369,3 +369,24 @@ def test_a_machine_holding_an_access_key_gives_its_user(tmp_path):
     )
     (ch,) = [c for c in r.chains if "aws_instance.box" in c.steps]  # one path: the role, with the key's user
     assert "aws_iam_user.admin" in ch.steps + ch.controls and "aws_s3_bucket.vault" in ch.sinks
+
+
+def test_a_function_s_configuration_with_a_password_is_reached_by_reading_it(tmp_path):
+    r = paths(
+        tmp_path,
+        NET + ROLE + sg("open", 22) + 'resource "aws_iam_role" "fn" {}\n'
+        'resource "aws_lambda_function" "f" {\n  function_name = "f"\n  role = aws_iam_role.fn.arn\n'
+        '  environment {\n    variables = {\n      DB_PASSWORD = "hunter2"\n    }\n  }\n}\n'
+        'resource "aws_iam_role_policy" "p" {\n  role = aws_iam_role.app.id\n'
+        '  policy = jsonencode({Statement = [{Effect = "Allow", Action = ["lambda:GetFunction", "lambda:ListFunctions"], '
+        'Resource = "*"}]})\n}\n'
+        + instance(
+            "box",
+            "pub",
+            "open",
+            '  key_name = "ops"\n  associate_public_ip_address = true\n'
+            "  iam_instance_profile = aws_iam_instance_profile.app.name\n",
+        ),
+    )
+    (ch,) = [c for c in r.chains if "aws_instance.box" in c.steps]
+    assert "aws_lambda_function.f" in ch.sinks
