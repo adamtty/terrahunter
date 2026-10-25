@@ -183,3 +183,16 @@ def test_a_condition_on_an_unknown_value_is_possibly_public(tmp_path):
     (c,) = build(tmp_path, topic).chains
     assert (c.sinks, c.confidence) == (["aws_sns_topic.t"], "possible")
     assert "may let any AWS account sns:Subscribe" in c.entry
+
+
+@pytest.mark.parametrize(("keyed", "confidence"), [("false", "direct"), ("true", "possible")])
+def test_a_public_api_with_nothing_behind_it_is_still_a_path(tmp_path, keyed, confidence):
+    text = (
+        'resource "aws_api_gateway_rest_api" "api" {}\n'
+        'resource "aws_api_gateway_method" "m" {\n  rest_api_id = aws_api_gateway_rest_api.api.id\n'
+        f'  http_method = "GET"\n  authorization = "NONE"\n  api_key_required = {keyed}\n}}\n'
+        'resource "aws_api_gateway_integration" "i" {\n  rest_api_id = aws_api_gateway_rest_api.api.id\n'
+        '  http_method = aws_api_gateway_method.m.http_method\n  type = "MOCK"\n}\n'
+    )
+    (c,) = build(tmp_path, text).chains
+    assert (c.kind, c.steps, c.confidence) == ("exposed API", ["internet", "aws_api_gateway_rest_api.api"], confidence)
