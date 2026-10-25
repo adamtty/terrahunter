@@ -228,3 +228,14 @@ def test_a_public_secret_on_the_aws_managed_key_is_only_open_to_the_account(tmp_
     m = arch.build(g)
     assert ("aws_secretsmanager_secret.s" in m.exposed) is internet
     assert ("aws_secretsmanager_secret.s" in m.account_open) is not internet
+
+
+def test_one_fix_for_every_unauthenticated_method_of_an_api(tmp_path):
+    methods = "".join(
+        f'resource "aws_api_gateway_method" "{n}" {{\n  rest_api_id = aws_api_gateway_rest_api.api.id\n'
+        f'  http_method = "{n.upper()}"\n  authorization = "NONE"\n}}\n'
+        for n in ("get", "post", "put")
+    )
+    text = 'resource "aws_api_gateway_rest_api" "api" {}\n' + methods
+    (fix,) = [f for f in build(tmp_path, text).fixes if f.id.startswith("public:")]
+    assert [w["address"] for w in fix.where] == [f"aws_api_gateway_method.{n}" for n in ("get", "post", "put")]
