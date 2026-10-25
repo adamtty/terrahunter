@@ -198,7 +198,7 @@ def backends_of(folder: Path, d: roots.Discovery, notes: list[str], prefix: str 
     for r in d.roots + d.standalone:
         where = folder / r.path
         label = f"{prefix}{r.path}"
-        for _, doc in parse_dir(where, notes, label):
+        for _, doc in parse_dir(where, notes, label, [folder]):
             for tb in _groups(doc.get("terraform")):
                 if not isinstance(tb, dict):
                     continue

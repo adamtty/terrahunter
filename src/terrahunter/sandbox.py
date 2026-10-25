@@ -121,13 +121,18 @@ def read_regular(path: Path, limit: int = MAX_FILE_BYTES) -> bytes:
 
 
 def tf_files(
-    root: Path, recursive: bool = True, budget: list[int] | None = None, inside: list[Path] | None = None
+    root: Path,
+    recursive: bool = True,
+    budget: list[int] | None = None,
+    inside: list[Path] | None = None,
+    where: list[Path] | None = None,
 ) -> tuple[list[Path], list[str]]:
     """The Terraform files under root that are safe to read, and a note for each one left out. Hidden directories
     (.git, .terraform, …) and symlinked directories are not entered. A symlinked file is read when its real path is a
     regular file inside root or one of the `inside` folders (the folders under analysis: a shared variables-common.tf
     linked into each root); its real path is what's returned. `budget` ([bytes left]) lets several calls share one
-    MAX_TOTAL_BYTES allowance; it's updated in place."""
+    MAX_TOTAL_BYTES allowance; it's updated in place. `where`, when given, gets each file's path as it is in the folder
+    (a link's own path, whose directory it belongs to), in the same order."""
     found, skipped = [], []
     budget = budget if budget is not None else [MAX_TOTAL_BYTES]
     root = Path(root)
@@ -136,7 +141,7 @@ def tf_files(
         for name in sorted(filenames):
             if not name.endswith(TF_SUFFIXES) or name.startswith("."):
                 continue
-            p = Path(dirpath) / name
+            p = at = Path(dirpath) / name
             rel = p.relative_to(root).as_posix()
             if p.is_symlink() and (real := linked_inside(p, [root, *(inside or [])])):
                 p = real
@@ -154,6 +159,8 @@ def tf_files(
                 return found, skipped
             budget[0] -= size
             found.append(p)
+            if where is not None:
+                where.append(at)
             if len(found) >= MAX_FILES:
                 skipped.append(f"more than {MAX_FILES} Terraform files; the rest were skipped")
                 return found, skipped

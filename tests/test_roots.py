@@ -4,7 +4,7 @@ import os
 
 import pytest
 
-from terrahunter import cli, roots
+from terrahunter import cli, deps, roots
 
 PROVIDER = 'provider "aws" {\n  region = "eu-west-1"\n}\n'
 BACKEND = 'terraform {\n  backend "s3" {}\n}\n'
@@ -101,6 +101,25 @@ def test_symlinked_directories_are_not_followed(tmp_path):
     repo = write(tmp_path / "repo", {"main.tf": PROVIDER})
     os.symlink(outside, repo / "linked")
     assert kinds(roots.discover(repo)) == {".": "root"}
+
+
+def test_a_linked_versions_file_makes_each_environment_a_root(tmp_path):
+    # one versions.tf (backend and provider) shared by every environment through symlinks
+    repo = write(
+        tmp_path / "repo",
+        {
+            "common/versions.tf": 'terraform {\n  backend "s3" {\n    bucket = "st"\n    key = "x"\n  }\n}\n'
+            + PROVIDER,
+            "env/dev/main.tf": 'resource "aws_s3_bucket" "b" {}\n',
+            "env/prod/main.tf": 'resource "aws_s3_bucket" "b" {}\n',
+        },
+    )
+    for env in ("dev", "prod"):
+        os.symlink("../../common/versions.tf", repo / "env" / env / "versions.tf")
+    found = kinds(roots.discover(repo))
+    assert found["env/dev"] == found["env/prod"] == "root"
+    s = deps.survey(repo, "env/prod")
+    assert not any("symlink" in n for n in s.notes)
 
 
 def test_calls_outside_the_folder_are_left_for_later(tmp_path):
