@@ -41,7 +41,7 @@ _SKIP_HEADS = {"var", "local", "module", "each", "count", "path", "terraform", "
 _RES = re.compile(r'(?<![\w.])(data\.)?([a-z][a-z0-9_]*)\.([A-Za-z0-9_-]+)(?:\[(\d+|"[^"\]]*")\])?')
 _VAR = re.compile(r"(?<![\w.])var\.([A-Za-z0-9_-]+)")
 _LOCAL = re.compile(r"(?<![\w.])local\.([A-Za-z0-9_-]+)")
-_MOD = re.compile(r"(?<![\w.])module\.([A-Za-z0-9_-]+)(?:\[[^\]]*\])?\.([A-Za-z0-9_-]+)")
+_MOD = re.compile(r"(?<![\w.])module\.([A-Za-z0-9_-]+)(?:\[([^\]]*)\])?\.([A-Za-z0-9_-]+)")
 # a block's labels may be quoted or not (`data aws_iam_policy_document "x"` is valid HCL)
 _BLOCK_LINE = re.compile(
     r'^[ \t]*(resource|data|module)\s+"?([A-Za-z0-9_-]+)"?(?:\s+"?([A-Za-z0-9_-]+)"?)?\s*\{', re.MULTILINE
@@ -66,6 +66,7 @@ class Edge:
     target: str
     attr: str  # the attribute of the source the reference is in (dotted path)
     index: str = ""  # a literal index the reference names on the target (`0`, `k`), else ""
+    module_index: str = ""  # a literal module instance it names (`worker=0` for module.worker["0"].x), else ""
 
 
 @dataclass
@@ -96,7 +97,9 @@ class Graph:
         return {
             "root": self.root,
             "resources": [{k: v for k, v in asdict(r).items() if k != "body"} for r in self.resources.values()],
-            "edges": [{k: v for k, v in asdict(e).items() if k != "index" or v} for e in self.edges],
+            "edges": [
+                {k: v for k, v in asdict(e).items() if k not in ("index", "module_index") or v} for e in self.edges
+            ],
             "unknown": [asdict(u) for u in self.unknown.values()],
             "modules": self.modules,
             "notes": self.notes,
@@ -377,7 +380,10 @@ def build(
             for m in _LOCAL.finditer(e):
                 out |= lookup(("local", m.group(1)), sc, depth)
             for m in _MOD.finditer(e):
-                out |= lookup(("module", m.group(1), m.group(2)), sc, depth)
+                found = lookup(("module", m.group(1), m.group(3)), sc, depth)
+                key = (m.group(2) or "").strip('"')
+                # a literal instance of the module (module.worker["0"]): the edge says which, for the plan
+                out |= {f"{f}@{m.group(1)}={key}" for f in found} if key and "${" not in key and depth == 0 else found
         return out
 
     def lookup(key: tuple, sc: _Scope, depth: int) -> frozenset[str]:
@@ -419,11 +425,12 @@ def build(
         for addr in sc.resources.values():
             for attr, value in _attrs(g.resources[addr].body):
                 for found in sorted(resolve(value, sc, 0)):
+                    found, _, mod = found.partition("@")
                     target, _, idx = found.partition("[")
                     idx = idx[:-1]
-                    if target != addr and (addr, target, attr, idx) not in seen:
-                        seen.add((addr, target, attr, idx))
-                        g.edges.append(Edge(addr, target, attr, idx))
+                    if target != addr and (addr, target, attr, idx + "@" + mod) not in seen:
+                        seen.add((addr, target, attr, idx + "@" + mod))
+                        g.edges.append(Edge(addr, target, attr, idx, mod))
 
     # known values in place of their expressions (after the edges, which read the references)
     def substitute(v, sc: _Scope):

@@ -201,6 +201,11 @@ def apply(g: graph.Graph, data: dict) -> graph.Graph:
         if e.index:
             hit = [t for t in targets if _own_index(t) == e.index]
             targets = hit or targets
+        if e.module_index:  # module.worker["0"].x: the instance of the module it names
+            name, _, key = e.module_index.partition("=")
+            want = {f'module.{name}["{key}"]', f"module.{name}[{key}]"}
+            hit = [t for t in targets if want & set(_modules(t))]
+            targets = hit or targets
         for s in sources:
             ts = _pair(s, e.source, targets, e.target, expanded)
             for t in ts:

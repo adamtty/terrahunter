@@ -232,3 +232,24 @@ def test_the_account_id_from_the_caller_identity_is_the_account_root(tmp_path):
         "Resource = aws_iam_role.t.arn}]})\n}\n",
     )
     assert m.can_assume("aws_iam_user.u", "aws_iam_role.t") is True
+
+
+def test_a_policy_attached_through_a_lookup_and_naming_a_module_s_output(tmp_path):
+    (tmp_path / "data").mkdir()
+    (tmp_path / "data" / "main.tf").write_text(
+        'resource "aws_secretsmanager_secret" "ops" {}\noutput "arn" {\n  value = aws_secretsmanager_secret.ops.arn\n}\n'
+    )
+    m = model(
+        tmp_path,
+        'module "data" {\n  source = "./data"\n}\nresource "aws_iam_role" "r" {}\n'
+        'resource "aws_iam_policy" "named" {\n  name_prefix = "worker-secrets-"\n'
+        '  policy = jsonencode({Statement = [{Effect = "Allow", Action = "secretsmanager:GetSecretValue", '
+        "Resource = module.data.arn}]})\n}\n"
+        'data "aws_iam_policy" "named" {\n  name = aws_iam_policy.named.name\n}\n'
+        'resource "aws_iam_role_policy_attachment" "a" {\n  role = aws_iam_role.r.name\n'
+        "  policy_arn = data.aws_iam_policy.named.arn\n}\n",
+    )
+    assert (
+        m.allowed("aws_iam_role.r", "secretsmanager:GetSecretValue", "module.data.aws_secretsmanager_secret.ops")
+        is True
+    )
