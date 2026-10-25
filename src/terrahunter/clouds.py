@@ -308,22 +308,26 @@ def exposure(R: dict, targets, sources, of) -> tuple[dict[str, list[tuple[str, s
         if _s(R[c].body.get("container_access_type")) in ("blob", "container"):
             for acct in targets(c, "azurerm_storage_account"):
                 exposed.setdefault(acct, []).append((f"public container {R[c].name}", c))
-    for b in of(*(t for t in GCP_IAM if t.startswith(("google_storage", "google_bigquery")))):
-        members = {_s(m) for m in _list(R[b].body.get("members")) + _list(R[b].body.get("member"))}
-        if members & PUBLIC_MEMBERS:
-            for t in targets(b, "google_storage_bucket", "google_bigquery_dataset"):
-                exposed.setdefault(t, []).append((", ".join(sorted(members & PUBLIC_MEMBERS)), b))
-    for ds in of("google_bigquery_dataset"):
-        for acc in _list(R[ds].body.get("access")):
-            if isinstance(acc, dict) and _s(acc.get("special_group")) in PUBLIC_MEMBERS:
-                exposed.setdefault(ds, []).append((_s(acc.get("special_group")), ds))
-    # serverless anyone may invoke
-    for b in of(*(t for t in GCP_IAM if "run" in t or "functions" in t)):
-        members = {_s(m) for m in _list(R[b].body.get("members")) + _list(R[b].body.get("member"))}
-        if "allUsers" in members and "invoker" in _s(R[b].body.get("role")):
-            for t in targets(b, *SERVERLESS):
-                exposed.setdefault(t, []).append(("anyone may invoke it (allUsers)", b))
+    # (GCP: allUsers on a bucket, a dataset or a service is the knowledge base's to judge, with public access
+    # prevention, ingress and IAM conditions: see arch's catalogue exposures)
     return exposed, public_ip
+
+
+_EXPIRES = re.compile(r"""request\.time\s*<\s*timestamp\(\s*\\?['"](\d{4}-\d{2}-\d{2})""")
+
+
+def iam_condition(body: dict) -> bool | None:
+    """Whether a GCP IAM grant's condition holds: True with none, False when it's an expiry already past
+    (`request.time < timestamp("2020-01-01T00:00:00Z")`), None for any other condition (it may or may not)."""
+    import datetime as dt
+
+    cond = _block(body, "condition")
+    if not cond:
+        return True
+    m = _EXPIRES.search(str(cond.get("expression", "")))
+    if m and "||" not in str(cond.get("expression", "")):
+        return False if dt.date.fromisoformat(m.group(1)) <= dt.date.today() else None
+    return None
 
 
 def badges(rtype: str, body: dict) -> list[tuple[str, bool]]:

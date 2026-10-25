@@ -244,3 +244,16 @@ def test_a_customer_policy_is_never_an_aws_managed_one(tmp_path):
     )
     test = risky("aws_iam_role_policy_attachment", "administrator")
     assert ev(tmp_path, text, "aws_iam_role_policy_attachment.a", test) is False
+
+
+@pytest.mark.parametrize(
+    ("member", "want"),
+    [
+        ('"serviceAccount:${google_service_account.app.email}"', False),  # its own text can't begin allUsers
+        ("var.member", None),  # wholly unknown
+        ('"allUsers"', True),
+    ],
+)
+def test_a_template_s_own_text_settles_what_it_can_be(tmp_path, member, want):
+    text = f'variable "member" {{}}\nresource "google_storage_bucket_iam_member" "m" {{\n  member = {member}\n}}\n'
+    assert ev(tmp_path, text, "google_storage_bucket_iam_member.m", {"attr": "member", "is": "allUsers"}) is want

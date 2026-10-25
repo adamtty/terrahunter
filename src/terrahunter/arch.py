@@ -281,9 +281,10 @@ JUDGED = {
     "aws_instance", "aws_launch_template", "aws_autoscaling_group", "aws_ecs_service", "aws_s3_bucket",
     "aws_sns_topic", "aws_sqs_queue", "aws_secretsmanager_secret", "aws_ecr_repository", "aws_api_gateway_rest_api",
     "aws_apigatewayv2_api", "aws_cognito_user_pool", "aws_cognito_identity_pool",
-    *clouds.VMS, *clouds.WEB_APPS, *clouds.SERVERLESS, "azurerm_kubernetes_cluster", "google_container_cluster",
+    *clouds.VMS, *clouds.WEB_APPS, *(t for t in clouds.SERVERLESS if not t.startswith("google_")),
+    "azurerm_kubernetes_cluster", "google_container_cluster",
     "azurerm_application_gateway", "azurerm_lb", "azurerm_storage_account", "azurerm_storage_container",
-    "google_storage_bucket", "google_bigquery_dataset", "google_sql_database_instance", *clouds.DB_FIREWALLS,
+    "google_sql_database_instance", *clouds.DB_FIREWALLS,
 }  # fmt: skip
 
 
@@ -335,6 +336,17 @@ _ANONYMOUS = re.compile(
     r"|public[- ](read|ACL|bucket|blob|container)|every identity|any (AWS )?account|self[- ]sign",
     re.IGNORECASE,
 )
+
+
+def _of_types(test) -> set[str]:
+    """The types a test reads through `of` (the plumbing it weighs)."""
+    if isinstance(test, dict):
+        of = test.get("of") or {}
+        here = set(of.get("type") or []) if isinstance(of, dict) else set()
+        return here | {t for v in test.values() for t in _of_types(v)}
+    if isinstance(test, list):
+        return {t for v in test for t in _of_types(v)}
+    return set()
 
 
 def kb_exposures(rtype: str) -> list[tuple[dict, str, bool]]:
@@ -492,6 +504,13 @@ def build(g: graph.Graph, findings: list[scanners.Finding] = ()) -> Model:
 
     reachable: dict[str, set[str]] = {}  # endpoints every network reaches, that still ask who's calling
     reasoned = {c for c, v in exposed.items() if any(not (w == "all" or w[:1].isdigit()) for w, _ in v)}
+    # a component whose own exposure rules weigh a kind of plumbing (a Cloud Run service's rule reads its IAM
+    # members and its ingress) and find it closed isn't opened by that plumbing's own, narrower rule
+    closed: dict[str, set[str]] = {}
+    for a, r in R.items():
+        own = kb_exposures(r.type) if r.mode == "managed" and a in drawn else []
+        if own and all(conditions.evaluate(x["test"], a, ix) is False for x, _, _ in own):
+            closed[a] = {t for x, _, _ in own for t in _of_types(x["test"])}
     for a, r in R.items():
         if r.mode != "managed":
             continue
@@ -499,15 +518,36 @@ def build(g: graph.Graph, findings: list[scanners.Finding] = ()) -> Model:
             v = conditions.evaluate(x["test"], a, ix)
             if v is False:
                 continue
+            if v is True and r.type in clouds.GCP_IAM:  # a grant with a condition holds only while it does
+                v = clouds.iam_condition(r.body)
+                if v is False:
+                    continue
             for c in onto(a):
-                if R[c].type in JUDGED:
+                if R[c].type in JUDGED or c != a and r.type in closed.get(c, ()):
                     continue
                 if not anonymous:
                     reachable.setdefault(c, set()).add(reason)
                 elif v is None:
                     maybe.setdefault(c, []).append((reason, a))
                 elif c not in reasoned:
-                    exposed.setdefault(c, []).append((reason, a))
+                    # the component's own rule, met through its plumbing (an allUsers grant on the bucket): the
+                    # plumbing is what opens it, and what the fix changes
+                    via = _of_types(x["test"]) if c == a else set()
+                    srcs = [
+                        e.source
+                        for e in in_edges.get(c, [])
+                        if e.source in R
+                        and R[e.source].type in via
+                        and any(
+                            conditions.evaluate(y["test"], e.source, ix) for y, _, _ in kb_exposures(R[e.source].type)
+                        )
+                    ]
+                    # a GCP grant whose condition has expired opens nothing
+                    live = [x for x in srcs if R[x].type not in clouds.GCP_IAM or clouds.iam_condition(R[x].body)]
+                    if srcs and not live:
+                        continue
+                    for src in dict.fromkeys(live or [a]):
+                        exposed.setdefault(c, []).append((reason, src))
 
     # --- components, placed by their own references
     comps: dict[str, Component] = {}

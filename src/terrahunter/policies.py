@@ -267,6 +267,24 @@ def aws_exposure(
                 add(b, f"bucket policy lets anyone {short(acts)}", pol)
             elif acts := public_actions(R, pol, "policy", targets, maybe=True):
                 possibly(b, f"bucket policy may let anyone {short(acts)} (a condition isn't known)", pol)
+    # a search domain outside a VPC, without fine-grained access control, whose access policy lets anyone in
+    for kind, pol_type in (
+        ("aws_opensearch_domain", "aws_opensearch_domain_policy"),
+        ("aws_elasticsearch_domain", "aws_elasticsearch_domain_policy"),
+    ):
+        for t in of(kind):
+            b = R[t].body
+            fgac = any(
+                isinstance(x, dict) and _bool(x.get("enabled")) for x in _list(b.get("advanced_security_options"))
+            )
+            if b.get("vpc_options") or fgac:
+                continue
+            for pol in [*sources(t, pol_type), t]:
+                acts = public_actions(R, pol, "access_policies", targets)
+                if acts:
+                    add(t, f"its access policy lets anyone {short(acts)}", pol)
+                elif acts := public_actions(R, pol, "access_policies", targets, maybe=True):
+                    possibly(t, f"its access policy may let anyone {short(acts)} (a condition isn't known)", pol)
     for kind, pol_type, attr in (
         ("aws_sns_topic", "aws_sns_topic_policy", "policy"),
         ("aws_sqs_queue", "aws_sqs_queue_policy", "policy"),
