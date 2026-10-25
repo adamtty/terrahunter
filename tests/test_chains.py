@@ -321,3 +321,30 @@ def test_an_older_provider_names_the_container_a_blob_is_in(tmp_path):
     g = graph.build(tmp_path, ".")
     (e,) = [e for e in g.edges if e.source == "azurerm_storage_blob.b"]
     assert chains._stores_in(e, g.resources)
+
+
+FN = (
+    'resource "aws_iam_role" "fn" {}\nresource "aws_lambda_function" "consumer" {\n  function_name = "c"\n'
+    "  role = aws_iam_role.fn.arn\n}\n"
+    'resource "aws_ssm_parameter" "flag" {\n  name = "/flag"\n  type = "SecureString"\n  value = "x"\n}\n'
+    'resource "aws_ssm_parameter" "other" {\n  name = "/other"\n  type = "SecureString"\n  value = "y"\n}\n'
+    'resource "aws_iam_role_policy" "fn" {\n  role = aws_iam_role.fn.id\n  policy = jsonencode({Statement = [\n'
+    '    {Effect = "Allow", Action = "ssm:GetParameter", Resource = aws_ssm_parameter.flag.arn},\n'
+    '    {Effect = "Allow", Action = "logs:*", Resource = "*"}]})\n}\n'
+)
+
+
+def test_a_public_queue_feeds_the_function_it_triggers(tmp_path):
+    r = paths(
+        tmp_path,
+        FN + 'resource "aws_sqs_queue" "bus" {}\n'
+        'resource "aws_sqs_queue_policy" "p" {\n  queue_url = aws_sqs_queue.bus.id\n'
+        '  policy = jsonencode({Statement = [{Effect = "Allow", Principal = "*", Action = "sqs:SendMessage", '
+        "Resource = aws_sqs_queue.bus.arn}]})\n}\n"
+        'resource "aws_lambda_event_source_mapping" "m" {\n  event_source_arn = aws_sqs_queue.bus.arn\n'
+        "  function_name = aws_lambda_function.consumer.arn\n}\n",
+    )
+    (ch,) = [c for c in r.chains if "aws_sqs_queue.bus" in c.steps or "aws_sqs_queue.bus" in c.sinks]
+    assert ch.steps == ["internet", "aws_sqs_queue.bus", "aws_lambda_function.consumer", "aws_iam_role.fn"]
+    # one statement's resource isn't another's: GetParameter on the flag only, though logs:* is on every resource
+    assert "aws_ssm_parameter.flag" in ch.sinks and "aws_ssm_parameter.other" not in ch.sinks
