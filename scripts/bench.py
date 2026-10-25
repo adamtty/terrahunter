@@ -83,7 +83,11 @@ def score_root(folder: Path, key: dict, inputs: dict | None = None) -> dict:
     out = {"root": root, "resources": len(g.resources), "expected": [], "given_credentials": len(given), "found": []}
     out["given"] = score_given(g, model, given)
     out["outside"] = score_outside(g, model, others) if others else []
-    out["findings"], out["false_findings"] = score_findings(g, key)
+    # the secrets in the configuration as written: values the key's inputs give aren't in the code
+    written = (
+        graph.build(folder, root) if inputs.get("variables") or inputs.get("var_files") or inputs.get("plan") else g
+    )
+    out["findings"], out["false_findings"] = score_findings(written, key)
     used: set[int] = set()
     for p in expected:
         e, first = norm(p["entry"]), norm(p["steps"][1]) if len(p["steps"]) > 1 else norm(p["entry"])

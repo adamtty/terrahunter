@@ -420,7 +420,9 @@ def _main(argv: list[str] | None) -> int:
         if not mapping:
             # the scanners (map has no --no-scan: it never scans), and terrahunter's own: hard-coded secrets
             scan = scanners.scan(g, d.folder, withs) if not a.no_scan else scanners.Scan()
-            own = secrets.find(g)
+            # in the configuration as written: values given with -var, -var-file or a plan aren't in the code
+            written = g if not (inputs or a.var_file or planned is not None) else graph.build(d.folder, c.path, withs)
+            own = secrets.find(written)
             scan.findings += own
             scan.status["secrets"] = {"version": "", "ok": True, "error": None, "findings": len(own)}
             show_scan(scan)

@@ -1,8 +1,10 @@
 """Hard-coded secrets and long-lived keys: literals where secrets go, never variables or placeholders."""
 
+import json
+
 import pytest
 
-from terrahunter import graph, secrets
+from terrahunter import cli, graph, secrets
 
 
 def found(tmp_path, text, name="main.tf"):
@@ -62,3 +64,36 @@ def test_provider_credentials_and_access_keys(tmp_path):
         name="provider.tofu",
     )
     assert out == {("TH-SECRET", "provider.aws"), ("TH-KEY", "aws_iam_access_key.k")}
+
+
+def test_a_value_given_on_the_command_line_isn_t_in_the_code(tmp_path):
+    (tmp_path / "main.tf").write_text(
+        'variable "token" {\n  sensitive = true\n}\n'
+        'resource "aws_ssm_parameter" "t" {\n  type = "SecureString"\n  value = var.token\n}\n'
+    )
+    given = graph.build(tmp_path, ".", variables={"token": '"supplied-at-plan-7Qf3mK9pL2"'})
+    written = graph.build(tmp_path, ".")
+    assert secrets.find(given) and not secrets.find(written)  # the CLI looks at the configuration as written
+
+
+def test_the_cli_reports_only_secrets_written_in_the_code(tmp_path):
+    (tmp_path / "main.tf").write_text(
+        'provider "aws" {}\nvariable "token" {\n  sensitive = true\n}\n'
+        'resource "aws_ssm_parameter" "t" {\n  type = "SecureString"\n  value = var.token\n}\n'
+        'resource "aws_ssm_parameter" "lit" {\n  type = "SecureString"\n  value = "written-in-code-7Qf3mK9pL2"\n}\n'
+    )
+    out = tmp_path / "g.json"
+    with pytest.raises(SystemExit):
+        cli.main(
+            [
+                str(tmp_path),
+                "--no-scan",
+                "--no-diagram",
+                "--var",
+                "token=supplied-at-plan-7Qf3mK9pL2",
+                "--graph-json",
+                str(out),
+            ]
+        )
+    found = {f["resource"] for f in json.loads(out.read_text())["graphs"][0]["scan"]["findings"]}
+    assert found == {"aws_ssm_parameter.lit"}
