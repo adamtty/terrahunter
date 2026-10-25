@@ -337,10 +337,18 @@ def score_estate(folder: Path) -> list[dict]:
         if key is None:
             print(f"{folder.name}: {r['path']} has no answer key; skipped", file=sys.stderr)
             continue
+        variables = dict(r.get("variables") or {})
+        # or written as -var=name=value in the notes (an estate laid out like a knowledge-base project)
+        variables |= {
+            k: v for k, v in re.findall(r"-var[= ]([A-Za-z_][\w-]*)=([^\s\"'`,;]+)", r.get("variable_notes", ""))
+        }
+        plan_file = r.get("plan")
+        if plan_file is None and "plan" not in r and (folder / r["path"] / "plan.json").is_file():
+            plan_file = f"{r['path']}/plan.json"  # the plan next to its root
         inputs = {
-            "variables": {k: _shaped(v) for k, v in (r.get("variables") or {}).items()} or None,
+            "variables": {k: _shaped(v) for k, v in variables.items()} or None,
             "var_files": r.get("var_files") or [],
-            "plan": r.get("plan"),
+            "plan": plan_file,
         }
         rows.append(score_root(folder, key, inputs))
     return rows
