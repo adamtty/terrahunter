@@ -215,3 +215,20 @@ def test_file_reads_a_policy_inside_the_folder_only(tmp_path):
     g = graph.build(root, ".")
     assert '"Statement"' in g.resources["aws_iam_policy.in"].body["policy"]
     assert "leak" not in str(g.resources["aws_iam_policy.out"].body["policy"])  # outside the folder: not read
+
+
+def test_a_shared_file_linked_into_a_root_is_read_and_a_link_out_of_the_folder_isn_t(tmp_path):
+    repo = tmp_path / "repo"
+    (repo / "variables").mkdir(parents=True)
+    (repo / "variables" / "common.tf").write_text('variable "env" {\n  default = "prod"\n}\n')
+    root = repo / "deploy" / "app"
+    root.mkdir(parents=True)
+    (root / "common.tf").symlink_to(repo / "variables" / "common.tf")  # shared across roots, as real estates do
+    outside = tmp_path / "secret.tf"
+    outside.write_text('resource "aws_s3_bucket" "planted" {}\n')
+    (root / "planted.tf").symlink_to(outside)  # leaves the folder: never read
+    (root / "main.tf").write_text('resource "aws_s3_bucket" "b" {\n  bucket = "data-${var.env}"\n}\n')
+    g = graph.build(repo, "deploy/app")
+    assert g.resources["aws_s3_bucket.b"].body["bucket"] == '"data-prod"'  # the linked default was read
+    assert "aws_s3_bucket.planted" not in g.resources
+    assert any("planted.tf" in n and "symlink" in n for n in g.notes)

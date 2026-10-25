@@ -87,6 +87,7 @@ class Graph:
     notes: list[str] = field(default_factory=list)  # what couldn't be read: the analysis is incomplete
     info: list[str] = field(default_factory=list)  # worth knowing, not a gap (blocks not deployed)
     module_dirs: dict[str, Path] = field(default_factory=dict, repr=False)  # module address ("" root) → its directory
+    folders: list[Path] = field(default_factory=list, repr=False)  # the folders under analysis (the folder, --with)
 
     @property
     def dirs(self) -> list[Path]:
@@ -204,6 +205,7 @@ def build(
     allowed = [folder] + [w.resolve() for w in with_folders or []]
     root_dir = (folder / root).resolve()
     g = Graph(root)
+    g.folders = allowed
     downloads = deps._downloads(root_dir)
 
     def label(d: Path) -> str:
@@ -213,7 +215,7 @@ def build(
         sc = _Scope(path, d, parent)
         g.modules.append(sc.prefix.rstrip(".") or "(root)")
         g.module_dirs[sc.prefix.rstrip(".")] = d
-        for fname, doc, text in deps.load_dir(d, g.notes, label(d)):
+        for fname, doc, text in deps.load_dir(d, g.notes, label(d), allowed):
             lines = {}
             for m in _BLOCK_LINE.finditer(text):
                 key = (m.group(1), m.group(2), m.group(3))
