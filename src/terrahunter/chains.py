@@ -292,6 +292,9 @@ def _uploaded_files(g: graph.Graph, addr: str, limit: int = 2000) -> list[str]:
     return out
 
 
+# what links a store to the function it triggers, and an exposure that lets anyone write to the store
+_TRIGGERS = {"aws_lambda_event_source_mapping", "aws_s3_bucket_notification", "aws_sns_topic_subscription"}
+_WRITES = re.compile(r"\b\w+:(Send|Put|Publish|Write)\w*|\b\w+:\*|\bwrit", re.IGNORECASE)
 _DOCKER_SOCKET = re.compile(r"/var/run/docker\.sock")
 _PRIVILEGED = re.compile(r"""['"]?privileged['"]?\s*[:=]\s*true""", re.IGNORECASE)
 
@@ -508,6 +511,12 @@ def build(g: graph.Graph, model: arch.Model) -> Result:
             if gr.targets:  # the policies name their resources: those, where they're drawn
                 named = [t for t in gr.targets if t in comps]
                 hit = [t for t in hit if t in named] or named
+        if R.get(identity) and R[identity].type.startswith("aws_") and search(identity) is not None and im:
+            # statement by statement: an action granted on one resource isn't granted on the others another
+            # statement of the same policy names (a GetParameter on one parameter, logs:* on every resource)
+            from terrahunter import escalate
+
+            hit = [t for t in hit if im.aws.access(identity, t, escalate._service(comps[t].type))]
         return hit, gr
 
     def sensitive(cid: str) -> bool:
@@ -575,6 +584,18 @@ def build(g: graph.Graph, model: arch.Model) -> Result:
         holders = [store, *(o for _, o in model.exposed.get(store, []))]
         objects = [x for h in holders for x in stored.get(h, [])]
         return sorted({f for x in objects for f in _uploaded_files(g, x) if _KEY_FILE.search(f)})
+
+    def triggered(store: str) -> list[str]:
+        """The functions a store triggers: an event source mapping, a bucket notification or a topic subscription
+        that names both."""
+        out_fns = []
+        for r in R.values():
+            if r.type not in _TRIGGERS:
+                continue
+            refs = {e.target for e in g.edges if e.source == r.address}
+            if store in refs:
+                out_fns += [t for t in refs if t in comps and comps[t].type == "aws_lambda_function"]
+        return list(dict.fromkeys(out_fns))
 
     def ssh_hosts(keys: list[str]) -> dict[str, list[str]]:
         """Machines that take SSH from the internet (a public IP, 22 open) and trust one of these private keys: their
@@ -840,10 +861,24 @@ def build(g: graph.Graph, model: arch.Model) -> Result:
             conf = "possible" if eid in unsure else "direct"
             sev = "critical" if conf == "direct" or sensitive(eid) else "high"
             ch = Chain(sev, "exposed data store", conf, f"{c.name}: {why}", ["internet"], [eid], hops)
+            # anyone may write to it, and it triggers a function: what they write is that function's input
+            fed = triggered(eid) if _WRITES.search(why) else []
+            for fn in fed:
+                h = [*base, f"{eid} triggers {fn}: whatever is written to it is the function's input"]
+                h.append(f"{fn}: a flaw in how it handles that input runs as its role")
+                steps, sinks = ["internet", eid, fn], [eid]
+                for role in [x.target for x in out.get(fn, []) if x.label == "runs as" and x.target in comps][:1]:
+                    steps.append(role)
+                    h.append(f"{fn} runs as {role}: the identity's credentials come from its environment")
+                    sinks += [t for t in via_identity(role, h) if t not in sinks]
+                h.append(reached(sinks))
+                kind = f"internet → {c.tname} → function" + (" → identity" if len(steps) > 3 else "") + " → data"
+                chains.append(Chain("", kind, "possible", f"{c.name}: {why}", steps, sinks, h))
             keys = leaked_keys(eid) if conf == "direct" else []
             hosts = ssh_hosts(keys) if keys else {}
             if not hosts:
-                chains.append(ch)
+                if not fed:  # the paths through the functions it feeds reach it too
+                    chains.append(ch)
                 continue
             # it hands out SSH keys: a path to each machine that trusts one and takes SSH from anywhere
             for host, trusted in hosts.items():
@@ -994,6 +1029,10 @@ def build(g: graph.Graph, model: arch.Model) -> Result:
                 hops.append(f"{eid}: the method needs an API key: a leaked or shared key gets its response")
             chains.append(Chain("", "exposed API", conf, f"{comps[eid].name}: {why}", ["internet", eid], [], hops))
 
+    for ch in chains:  # what every identity on the path takes over, whichever way the path was found
+        ch.controls += [
+            x for s in ch.steps for x in controls_of.get(s, []) if x not in ch.controls and x not in ch.steps
+        ]
     for ch in chains:
         ch.within = sorted(
             {x for s in ch.sinks for x in stored.get(s, [])} | {x for s in ch.steps for x in held.get(s, [])}
