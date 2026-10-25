@@ -120,3 +120,33 @@ def test_awsvpc_with_a_public_ip(tmp_path):
     )
     (c,) = r.chains
     assert c.steps[:2] == ["internet", "aws_ecs_service.api"] and "assign_public_ip" in c.entry
+
+
+PINNED_HOSTS = sg("hosts", 80) + "".join(
+    f'resource "aws_instance" "{n}" {{\n  subnet_id = aws_subnet.pub.id\n  associate_public_ip_address = true\n'
+    f"  vpc_security_group_ids = [aws_security_group.hosts.id]\n  iam_instance_profile = aws_iam_instance_profile.host.name\n"
+    '  user_data = "echo ECS_CLUSTER=${aws_ecs_cluster.c.name} >> /etc/ecs/ecs.config"\n}\n'
+    for n in ("front", "back")
+)
+
+
+def test_a_service_pinned_to_one_host_runs_only_there(tmp_path):
+    pin = '  placement_constraints {\n    type = "memberOf"\n    expression = "ec2InstanceId == ${aws_instance.front.id}"\n  }\n'
+    m, r = build(
+        tmp_path,
+        NET
+        + BUCKETS
+        + ROLES
+        + CLUSTER
+        + PINNED_HOSTS
+        + task("web")
+        + task("db", "[]")
+        + service("web", "web", pin)
+        + service("db", "db"),
+    )
+    conns = {(c.source, c.target, c.label) for c in m.connections}
+    assert ("aws_ecs_service.web", "aws_instance.front", "runs on") in conns
+    assert ("aws_ecs_service.web", "aws_instance.back", "runs on") not in conns
+    # the other host runs only the db, which publishes nothing: port 80 is open there, but nothing listens
+    assert "aws_instance.back" not in {c.steps[1] for c in r.chains}
+    assert "aws_ecs_service.web" in {c.steps[1] for c in r.chains}

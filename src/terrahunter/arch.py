@@ -668,8 +668,13 @@ def build(g: graph.Graph, findings: list[scanners.Finding] = ()) -> Model:
                 for cp in targets(ccp, "aws_ecs_capacity_provider"):
                     hosts += targets(cp, "aws_autoscaling_group")
             hosts += [asg for lt in list(hosts) for asg in sources(lt, "aws_autoscaling_group")]
+            # a memberOf constraint that names instances (ec2InstanceId == ${aws_instance.x.id}) pins it to them
+            pinned = targets(svc, "aws_instance", attr=r"^placement_constraints\.expression$")
             for h in dict.fromkeys(hosts):
-                connect(svc, h, "runs on")
+                if not pinned or h in pinned:
+                    if (svc, h) in conns:  # the constraint's own reference drew it already: it's where it runs
+                        conns[(svc, h)].label, conns[(svc, h)].quiet = "runs on", False
+                    connect(svc, h, "runs on")
     for va in of("aws_volume_attachment"):
         for i in targets(va, "aws_instance"):
             for v in targets(va, "aws_ebs_volume"):
