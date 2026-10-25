@@ -336,3 +336,38 @@ def test_a_topic_another_account_may_publish_to_feeds_its_function(tmp_path):
     (c,) = escalate.outside(g, arch.build(g))
     assert c.steps == ["attacker-principal", "aws_sns_topic.t", "aws_lambda_function.writer", "aws_iam_role.fn"]
     assert "aws_s3_bucket.secrets" in c.sinks
+
+
+def test_a_user_that_may_rewrite_its_own_inline_policy_is_the_administrator(tmp_path):
+    r = search(
+        tmp_path,
+        'resource "aws_iam_user" "u" {}\n'
+        + DATA
+        + user_policy("u", '{Effect = "Allow", Action = "iam:PutUserPolicy", Resource = aws_iam_user.u.arn}'),
+        "aws_iam_user.u",
+    )
+    assert r.gains[("admin", "account")].rule == "privesc-iam-007"
+
+
+def test_a_new_schedule_passing_a_role_then_the_function_it_invokes(tmp_path):
+    r = search(
+        tmp_path,
+        'resource "aws_iam_user" "u" {}\nresource "aws_dynamodb_table" "routes" {}\n'
+        + role("sched", "scheduler.amazonaws.com")
+        + role("fn", "lambda.amazonaws.com")
+        + 'resource "aws_lambda_function" "export" {\n  function_name = "export"\n  role = aws_iam_role.fn.arn\n}\n'
+        'resource "aws_iam_role_policy" "s" {\n  role = aws_iam_role.sched.id\n'
+        '  policy = jsonencode({Statement = [{Effect = "Allow", Action = "lambda:InvokeFunction", '
+        "Resource = aws_lambda_function.export.arn}]})\n}\n"
+        'resource "aws_iam_role_policy" "f" {\n  role = aws_iam_role.fn.id\n'
+        '  policy = jsonencode({Statement = [{Effect = "Allow", Action = "dynamodb:Scan", Resource = "*"}]})\n}\n'
+        + user_policy(
+            "u",
+            '{Effect = "Allow", Action = "scheduler:CreateSchedule", Resource = "arn:aws:scheduler:eu-west-1:111122223333:schedule/default/*"}, '
+            '{Effect = "Allow", Action = "iam:PassRole", Resource = aws_iam_role.sched.arn}',
+        ),
+        "aws_iam_user.u",
+    )
+    assert r.path("identity", "aws_iam_role.sched")[0].rule == "privesc-scheduler-001"  # a schedule it may create
+    assert r.gains[("identity", "aws_iam_role.fn")].confidence == "possible"  # it sends the function its input
+    assert "aws_dynamodb_table.routes" in r.data()

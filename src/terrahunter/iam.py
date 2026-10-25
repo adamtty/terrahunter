@@ -405,6 +405,20 @@ class Model:
                     return False
         return True
 
+    def allowed_new(self, identity: str, action: str) -> bool:
+        """Whether the identity may take an action on a new resource it names: a statement allows it on "*", or on
+        ARNs of the action's own service (scheduler:CreateSchedule on schedule/default/*), and nothing denies it."""
+        svc = action.split(":")[0].lower()
+        sts = [s for s in self.statements(identity) if s.covers_action(action)]
+        if any(s.effect == "Deny" and not s.conditional and "*" in s.resources for s in sts):
+            return False
+        return any(
+            s.effect == "Allow"
+            and not s.conditional
+            and any(r == "*" or r.strip('"').lower().startswith(f"arn:aws:{svc}:") for r in s.resources)
+            for s in sts
+        )
+
     def why(self, identity: str, action: str, resource: str | None = None) -> str:
         """The resource whose statement allows it (for the hop text and the fix)."""
         for s in self.statements(identity):
