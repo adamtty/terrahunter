@@ -60,7 +60,9 @@ const CAT = {compute:'#ED7100', containers:'#ED7100', network:'#8C4FFF', integra
              analytics:'#8C4FFF', storage:'#7AA116', security:'#DD344C', unknown:'#98a2b3'};
 const BOX = {region:{fill:'#ffffff',stroke:'#98a2b3',dash:'6 4'}, area:{fill:'#f9fafb',stroke:'#cfd4dc',dash:'4 4'},
              vpc:{fill:'#f4f0ff',stroke:'#8C4FFF',dash:''}, pub:{fill:'#f1f8e9',stroke:'#7AA116',dash:''},
-             priv:{fill:'#eaf3fb',stroke:'#147EBA',dash:''}};
+             priv:{fill:'#eaf3fb',stroke:'#147EBA',dash:''},
+             account:{fill:'#fcfcfd',stroke:'#344054',dash:''}, repo:{fill:'#fcfcfd',stroke:'#667085',dash:'2 3'},
+             root:{fill:'#ffffff',stroke:'#98a2b3',dash:''}};
 const CW = 178, CH = 54, BH = 17;
 document.title = `terrahunter · ${G.target}`;
 document.getElementById('target').textContent =
@@ -124,10 +126,16 @@ function regionBox(c) {
   const loose = compsOf(c.id); if (loose.length) { const p = packComps(loose, 2); parts.push({w:p.w, h:p.h, place:(x, y) => p.commit(x, y)}); }
   return block(c.id, stack(parts, 'x'));
 }
+const GROUPS = ['account', 'repo', 'root'];
+function areaBox(c) { return c.kind === 'region' ? regionBox(c) : GROUPS.includes(c.kind) ? groupBox(c) : servicesBox(c.id); }
+function groupBox(c) { // an estate: an account around its repositories, a repository around its roots, a root around its areas
+  const parts = contsOf(c.id).map(areaBox);
+  return block(c.id, stack(parts, c.kind === 'root' ? 'x' : 'y'));
+}
 (function layout() {
   const top = [];
   if (G.internet) top.push({w:120, h:70, place:(x, y) => pos.internet = {x, y:y + 40, w:120, h:70}});
-  for (const c of contsOf('ROOT')) top.push(c.kind === 'region' ? regionBox(c) : servicesBox(c.id));
+  for (const c of contsOf('ROOT')) top.push(areaBox(c));
   const s = stack(top, 'x'); const X = GAP * 3; s.commit(0, 0);
   // the Internet sits level with the first entry it reaches
   const firstEntry = G.edges.filter(e => e.source === 'internet').map(e => pos[e.target]).filter(Boolean).sort((a, b) => a.y - b.y)[0];
@@ -145,7 +153,9 @@ setTimeout(() => { // #3d&chain=1&step=2 opens straight onto a step (handy to sh
 // ---------- helpers ----------
 const el = (tag, attrs = {}, parent) => { const e = document.createElementNS(NS, tag);
   for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, v); if (parent) parent.appendChild(e); return e; };
-const esc = s => String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+// an estate's addresses as people read them: module.root["data-vault/prod"].aws_s3_bucket.x → data-vault/prod: aws_s3_bucket.x
+const shown = s => s.replace(/module\.root\["((?:[^"\\]|\\.)*)"\]\./g, (_, r) => r.replace(/\\(.)/g, '$1') + ': ');
+const esc = s => shown(String(s)).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const text = (parent, x, y, s, attrs = {}) => { const t = el('text', {x, y, ...attrs}, parent); t.textContent = s; return t; };
 const byId = Object.fromEntries(G.comps.map(n => [n.id, n]));
 const contById = Object.fromEntries(G.containers.map(c => [c.id, c]));

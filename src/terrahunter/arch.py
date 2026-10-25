@@ -147,7 +147,7 @@ class Badge:
 class Container:
     id: str
     label: str
-    kind: str  # region | area | vpc | subnet
+    kind: str  # region | area | vpc | subnet; in an estate, account | repo | root around each root's regions
     parent: str | None
     public: bool = False
     az: str = ""
@@ -423,31 +423,57 @@ def build(g: graph.Graph, findings: list[scanners.Finding] = ()) -> Model:
     }
     public |= {s for s in of("aws_subnet") if _bool(R[s].body.get("map_public_ip_on_launch"))}
 
-    present = sorted({clouds.cloud(r.type) for r in R.values()} - {""}) or ["aws"]
-    containers = []
-    area = {}  # cloud → (its container, services area, identities area)
-    for c in present:
-        (root, root_label), (svc, svc_label), (ids, ids_label) = clouds.AREAS[c]
-        containers += [
-            Container(root, root_label, "region", None),
-            Container(svc, svc_label, "area", root),
-            Container(ids, ids_label, "area", None),
-        ]
-        area[c] = (root, svc, ids)
+    from terrahunter import estate
 
-    def home(rtype: str, i: int) -> str:
-        return area.get(clouds.cloud(rtype), area[present[0]])[i]
+    containers = []
+    area = {}  # (root, cloud) → (its container, services area, identities area); root "" outside an estate
+    # an estate: each root's areas inside its root, its repository (the first folder) and its account
+    roots = sorted({estate.root_of(a) for a in R}) if g.accounts else [""]
+    for rt in roots:
+        present = sorted({clouds.cloud(r.type) for a, r in R.items() if estate.root_of(a) == rt} - {""}) or ["aws"]
+        outer = None
+        if rt:
+            acct = g.accounts.get(rt, "")
+            acct_id = f"account:{acct}"
+            label = (
+                (f"Google Cloud project {acct[4:]}" if acct.startswith("gcp:") else f"AWS account {acct}")
+                if acct
+                else "Account not stated"
+            )
+            repo, _, _ = rt.partition("/")
+            for c in [
+                Container(acct_id, label, "account", None),
+                Container(f"repo:{acct}:{repo}", repo, "repo", acct_id),
+                Container(f"root:{rt}", rt, "root", f"repo:{acct}:{repo}"),
+            ]:
+                if all(x.id != c.id for x in containers):
+                    containers.append(c)
+            outer = f"root:{rt}"
+        at = f"{estate.tag(rt)}." if rt else ""
+        for c in present:
+            (root, root_label), (svc, svc_label), (ids, ids_label) = clouds.AREAS[c]
+            containers += [
+                Container(at + root, root_label, "region", outer),
+                Container(at + svc, svc_label, "area", at + root),
+                Container(at + ids, ids_label, "area", outer),
+            ]
+            area[(rt, c)] = (at + root, at + svc, at + ids)
+
+    def home(rtype: str, i: int, addr: str = "") -> str:
+        rt = estate.root_of(addr) if g.accounts else ""
+        first = next(v for (r, _), v in area.items() if r == rt)
+        return area.get((rt, clouds.cloud(rtype)), first)[i]
 
     for v in sorted(of(*clouds.NETWORKS)):
         t = R[v].type
         cidr = ", ".join(_s(x) for x in _list(R[v].body.get(clouds.NETWORK_CIDR.get(t, ""))))
         containers.append(
-            Container(v, f"{clouds.NETWORKS[t]} {R[v].name}" + (f" · {cidr}" if cidr else ""), "vpc", home(t, 0))
+            Container(v, f"{clouds.NETWORKS[t]} {R[v].name}" + (f" · {cidr}" if cidr else ""), "vpc", home(t, 0, v))
         )
     subnet_vpc = {}
     for sn in sorted(of(*clouds.SUBNETS)):
         t = R[sn].type
-        vpc = (targets(sn, *clouds.NETWORKS) or [home(t, 0)])[0]
+        vpc = (targets(sn, *clouds.NETWORKS) or [home(t, 0, sn)])[0]
         subnet_vpc[sn] = vpc
         az = _s(R[sn].body.get("availability_zone")).strip('"')
         if "${" in az:
@@ -574,20 +600,20 @@ def build(g: graph.Graph, findings: list[scanners.Finding] = ()) -> Model:
         # subnets its placement names win over a regional default (a search domain in a VPC)
         regional = where in ("global", "account", "region") or e and where != "vpc"
         if e.get("category") == "identity" and r.type not in ("aws_cognito_user_pool", "aws_cognito_identity_pool"):
-            parent = home(r.type, 2)
+            parent = home(r.type, 2, a)
         elif not subs and nets and where in ("vpc", "subnet"):
             parent = nets[0]
         elif not subs and regional:
-            parent = home(r.type, 1)
+            parent = home(r.type, 1, a)
         elif len(set(subs)) == 1:
             parent = subs[0]
         elif subs:
-            parent = subnet_vpc.get(subs[0], home(r.type, 0))
+            parent = subnet_vpc.get(subs[0], home(r.type, 0, a))
         else:
             vpc = targets(a, *clouds.NETWORKS) or [
                 v for sg in targets(a, "aws_security_group") for v in targets(sg, "aws_vpc")
             ]
-            parent = vpc[0] if vpc else home(r.type, 1)
+            parent = vpc[0] if vpc else home(r.type, 1, a)
         badges = []
         for sg in targets(a, "aws_security_group"):
             rules = sg_rules.get(sg, [])

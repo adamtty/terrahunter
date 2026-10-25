@@ -10,7 +10,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
-from terrahunter import __version__, arch, chains, deps, graph, sandbox, scanners
+from terrahunter import __version__, arch, chains, deps, estate, graph, sandbox, scanners
 
 _MD = re.compile(r"([\\`*_\[\]#|<>~&!])")  # what could start emphasis, code, a link, HTML or a table cell
 _LINE_START = re.compile(r"^(\d*)([+\-=.)])")  # a list or heading marker, were it to start a line
@@ -29,12 +29,12 @@ class RootResult:
 
 def md(text: object, limit: int = 400) -> str:
     """Folder-derived text as plain Markdown text: one line, every special character escaped."""
-    return _LINE_START.sub(r"\1\\\2", _MD.sub(r"\\\1", sandbox.one_line(text, limit)))
+    return _LINE_START.sub(r"\1\\\2", _MD.sub(r"\\\1", estate.shown(sandbox.one_line(text, limit))))
 
 
 def code(text: object, limit: int = 200) -> str:
     """Folder-derived text as inline code: no backtick can end it early, no pipe can split a table cell."""
-    return "`" + sandbox.one_line(text, limit).replace("`", "'").replace("|", "\\|") + "`"
+    return "`" + estate.shown(sandbox.one_line(text, limit)).replace("`", "'").replace("|", "\\|") + "`"
 
 
 def _where(w: dict) -> str:
@@ -63,7 +63,8 @@ def _path_title(c: chains.Chain, comps: dict) -> str:
 def _root(r: RootResult) -> list[str]:
     comps = {c.id: c for c in r.model.components}
     p = r.paths
-    out = [f"## {md(r.root)}", ""]
+    roots = len(r.graph.accounts)
+    out = [f"## The estate: {roots} roots" if roots else f"## {md(r.root)}", ""]
     counts = {s: sum(1 for c in p.chains if c.severity == s) for s in ("critical", "high", "medium")}
     out.append(
         f"{len(p.chains)} attack path{'s' if len(p.chains) != 1 else ''}"
@@ -219,11 +220,15 @@ def _root(r: RootResult) -> list[str]:
 
 def render(folder: str, results: list[RootResult]) -> str:
     total = sum(len(r.paths.chains) for r in results)
+    roots = sum(len(r.graph.accounts) or 1 for r in results)
+    together = any(r.graph.accounts for r in results)
     crit = sum(1 for r in results for c in r.paths.chains if c.severity == "critical")
     out = [
         f"# terrahunter report: {md(folder, 120)}",
         "",
-        f"terrahunter {md(__version__)} · {len(results)} root module{'s' if len(results) != 1 else ''} · "
+        f"terrahunter {md(__version__)} · {roots} root module{'s' if roots != 1 else ''}"
+        + (" analysed together" if together else "")
+        + " · "
         f"{total} attack path{'s' if total != 1 else ''}" + (f", {crit} critical" if crit else ""),
         "",
         (
