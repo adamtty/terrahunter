@@ -173,6 +173,19 @@ class Chain:
     also: list[str] = field(default_factory=list)  # other entry points into the same workload, identity and data
     within: list[str] = field(default_factory=list)  # what's stored in the data stores it reaches (objects, documents)
     controls: list[str] = field(default_factory=list)  # identities and compute it takes over beyond its steps
+    checks: list[str] = field(default_factory=list)  # ids of what to confirm by hand: what it rests on, unseen
+
+
+@dataclass
+class Check:
+    """Something a path rests on that the Terraform doesn't show, to confirm by hand."""
+
+    id: str  # kind:about
+    kind: str  # code | login | imds | placement | unresolved | implied | technique | script
+    about: str  # the resource (or technique) it's about
+    question: str
+    where: list[str] = field(default_factory=list)  # file:line, or the code's files and folders
+    chains: list[int] = field(default_factory=list)  # the paths that rest on it
 
 
 @dataclass
@@ -201,6 +214,7 @@ class Result:
     edges: list[dict]  # extra drawn edges: internet → entry, identity → what it can access
     fixes: list[Fix] = field(default_factory=list)  # most valuable first
     leaks: list[Chain] = field(default_factory=list)  # if these credentials leak: one per identity, worst first
+    checks: list[Check] = field(default_factory=list)  # what the paths rest on, to confirm by hand; most paths first
 
     def to_dict(self) -> dict:
         return {
@@ -208,6 +222,7 @@ class Result:
             "edges": self.edges,
             "fixes": [asdict(f) for f in self.fixes],
             "leaks": [asdict(c) for c in self.leaks],
+            "checks": [asdict(c) for c in self.checks],
         }
 
 
@@ -722,10 +737,15 @@ def build(g: graph.Graph, model: arch.Model) -> Result:
         b = R[c.id].body
         return bool(b.get("key_name")) or bool(_PASSWORD_LOGIN.search(str(b.get("user_data", ""))))
 
-    def compromise(c: arch.Component, via_lb: bool, has_role: bool) -> tuple[str, str]:
-        """How an attacker gets something out of compute they reach: (the hop's text, its confidence)."""
+    def compromise(c: arch.Component, via_lb: bool, has_role: bool) -> tuple[str, str, str]:
+        """How an attacker gets something out of compute they reach: (the hop's text, its confidence, what it rests on
+        that the Terraform doesn't show: code, a login, or nothing)."""
         if c.type in APIS:
-            return f"{c.id}: anyone who can call it gets what its integration does, as the role it runs as", "direct"
+            return (
+                f"{c.id}: anyone who can call it gets what its integration does, as the role it runs as",
+                "direct",
+                "",
+            )
         ports = set(_ports(c))
         web = bool(ports & WEB_PORTS) or via_lb
         admin = [ADMIN_PORTS[p] for p in ("22", "3389", "all") if p in ports] if can_log_in(c) else []
@@ -733,15 +753,24 @@ def build(g: graph.Graph, model: arch.Model) -> Result:
             return (
                 f"{c.id}: serves the web with IMDSv1 allowed: one SSRF in the app hands over its credentials",
                 "likely",
+                "code",
             )
         if admin:
-            return f"{c.id}: {' and '.join(admin)} open to the internet: a weak or leaked key gets a shell", "possible"
+            text = f"{c.id}: {' and '.join(admin)} open to the internet: a weak or leaked key gets a shell"
+            return text, "possible", "login"
         if c.type == "aws_lambda_function":
             return (
                 f"{c.id}: runs what the request sends it: an injection flaw in the function runs as its role",
                 "possible",
+                "code",
             )
-        return f"{c.id}: reachable by traffic: a flaw in the application gets code running here", "possible"
+        return f"{c.id}: reachable by traffic: a flaw in the application gets code running here", "possible", "code"
+
+    assumed: dict[int, list[tuple[str, str]]] = {}  # a path → what it rests on: (kind, resource)
+
+    def assume(ch: Chain, kind: str, about: str) -> None:
+        if kind and about and (kind, about) not in assumed.setdefault(id(ch), []):
+            assumed[id(ch)].append((kind, about))
 
     controls_of: dict[str, list[str]] = {}
     held: dict[str, list[str]] = {}  # data an identity reaches that isn't on the diagram (an administrator's documents)
@@ -861,6 +890,7 @@ def build(g: graph.Graph, model: arch.Model) -> Result:
             conf = "possible" if eid in unsure else "direct"
             sev = "critical" if conf == "direct" or sensitive(eid) else "high"
             ch = Chain(sev, "exposed data store", conf, f"{c.name}: {why}", ["internet"], [eid], hops)
+            assume(ch, "unresolved" if eid in unsure else "", eid)
             # anyone may write to it, and it triggers a function: what they write is that function's input
             fed = triggered(eid) if _WRITES.search(why) else []
             for fn in fed:
@@ -873,7 +903,10 @@ def build(g: graph.Graph, model: arch.Model) -> Result:
                     sinks += [t for t in via_identity(role, h) if t not in sinks]
                 h.append(reached(sinks))
                 kind = f"internet → {c.tname} → function" + (" → identity" if len(steps) > 3 else "") + " → data"
-                chains.append(Chain("", kind, "possible", f"{c.name}: {why}", steps, sinks, h))
+                fch = Chain("", kind, "possible", f"{c.name}: {why}", steps, sinks, h)
+                assume(fch, "code", fn)
+                assume(fch, "unresolved" if eid in unsure else "", eid)
+                chains.append(fch)
             keys = leaked_keys(eid) if conf == "direct" else []
             hosts = ssh_hosts(keys) if keys else {}
             if not hosts:
@@ -948,7 +981,7 @@ def build(g: graph.Graph, model: arch.Model) -> Result:
             # an Azure workload with a system-assigned identity, or a GCP one on the default service account, is its
             # own identity: no extra step, its grants come from itself
             own = clouds.system_identity(node.type, R[node.id].body) if node.id in R else ""
-            text, conf = compromise(node, len(path) > 1, bool(roles or own))
+            text, conf, rests = compromise(node, len(path) > 1, bool(roles or own))
             hops = base + [
                 f"{a} {next(x.label for x in out[a] if x.target == b)} {b}" for a, b in itertools.pairwise(path)
             ]
@@ -1000,6 +1033,12 @@ def build(g: graph.Graph, model: arch.Model) -> Result:
                 key = (node.id, role, tuple(sinks))
                 ch = Chain("", kind, conf, f"{c.name}: {why}", steps, sinks, h)
                 ch.controls = [x for x in [*taken, *controls_of.get(role, [])] if x not in steps] if role else []
+                assume(ch, rests, node.id)
+                assume(ch, "unresolved" if eid in unsure else "", eid)
+                assume(ch, "imds" if role in host_roles else "", host_roles.get(role, ""))
+                assume(ch, "implied" if role == node.id and "default compute" in own else "", node.id)
+                for t in taken:
+                    assume(ch, "placement", t)
                 old = found.get(key)
                 if old is None:
                     found[key] = ch
@@ -1056,7 +1095,10 @@ def build(g: graph.Graph, model: arch.Model) -> Result:
     chains.sort(key=lambda ch: (rank[ch.severity], CONFIDENCE[ch.confidence], -len(ch.sinks)))
     used = {s for ch in chains for s in ch.steps + ch.sinks} | {"internet"}
     edges = [e for e in edges if e["source"] in used and e["target"] in used]
-    return Result(chains, edges, fixes(g, model, chains))
+    from terrahunter import checks
+
+    found_checks = checks.find(g, chains, assumed)
+    return Result(chains, edges, fixes(g, model, chains), checks=found_checks)
 
 
 EFFECT = {"breaks": 0, "narrows": 1, "hardens": 2}

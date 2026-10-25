@@ -5,6 +5,7 @@
 :root{--bg:#f3f5f9;--panel:#ffffff;--line:#dfe3ea;--text:#1d2433;--muted:#667085;--risk:#d92d20;--crit:#d92d20;--high:#f79009;--med:#eaaa08;--low:#2e90fa}
 *{box-sizing:border-box}html,body{height:100%}
 body{margin:0;background:var(--bg);color:var(--text);font:14px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",Inter,sans-serif;display:grid;grid-template-columns:340px 1fr;height:100vh;overflow:hidden}
+li.check{color:#b54708}
 aside{background:var(--panel);border-right:1px solid var(--line);overflow:auto;padding:18px 16px}
 h1{font-size:16px;margin:0}.sub{color:var(--muted);font-size:12px;margin:2px 0 14px;overflow-wrap:anywhere}
 h2{font-size:11px;text-transform:uppercase;letter-spacing:.07em;color:var(--muted);margin:18px 0 8px}
@@ -336,6 +337,10 @@ function hopsAbout(c, id) { if (id === 'internet') return c.hops.filter(x => /^I
   const last = c.steps[c.steps.length - 1];
   if (id === last && byId[id] && byId[id].cat === 'security') own.push(...c.hops.filter(x => /grants/.test(x) && !own.includes(x)));
   return own; }
+// what to confirm by hand on this step: the path's checks about it (on the last step, the rest of them)
+function checksAbout(c, id, final) { const mine = (G.checks || []).filter(k => (c.checks || []).includes(k.id));
+  const onSteps = new Set(c.steps); return final ? mine.filter(k => !onSteps.has(k.about)) : mine.filter(k => k.about === id); }
+const checkItems = ks => ks.map(k => `<li class="check">? ${esc(k.question)}${k.where.length ? ` <span class="file">${esc(k.where.slice(0, 2).join(', '))}</span>` : ''}</li>`).join('');
 function edgeBetween(a, b) { return G.edges.find(e => e.source === a && e.target === b); }
 function showStep() {
   const c = G.chains[SEL], W = walkSteps(c), st = W[STEP], i = STEP + 1, n = W.length; let body = '';
@@ -345,6 +350,8 @@ function showStep() {
     body = `<div class="k">Step ${i} of ${n} · where it ends</div><h3>${st.ids.length} data store${st.ids.length > 1 ? 's' : ''} reachable</h3><ul>` +
       st.ids.map(id => { const e = edgeBetween(src, id); const sens = new RegExp(id.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '[^,]*⚠sensitive').test(reach);
         return `<li class="${sens ? 'bad' : ''}">${esc(nameOf(id))} <span class="file">${esc(byId[id] ? byId[id].tname : '')}</span> — <b>${esc(e ? e.label : '?')}</b> access${sens ? ' · ⚠ sensitive' : ''}</li>`; }).join('') + '</ul>';
+    const rest = checksAbout(c, null, true);
+    if (rest.length) body += `<div class="k">Check by hand</div><ul>${checkItems(rest)}</ul>`;
   } else {
     const id = st.ids[0], comp = byId[id];
     // what's wrong here: the risky badges, then the worst scanner findings on it
@@ -355,7 +362,7 @@ function showStep() {
     const nxt = W[STEP + 1]; const e = nxt && !nxt.final ? edgeBetween(id, nxt.ids[0]) : null;
     body = `<div class="k">Step ${i} of ${n}${i === 1 ? ' · the way in' : ''}</div><h3>${esc(nameOf(id))}</h3>` +
       (comp ? `<div class="file">${esc(comp.tname)} · ${esc(comp.file)}:${esc(comp.line)}</div>` : '<div class="file">anyone, anywhere</div>') +
-      `<ul>${bad.map(b => `<li class="bad">⚠ ${esc(b)}</li>`).join('')}${hops.map(x => `<li>${esc(x)}</li>`).join('')}${other.map(b => `<li>${esc(b)}</li>`).join('')}</ul>` +
+      `<ul>${bad.map(b => `<li class="bad">⚠ ${esc(b)}</li>`).join('')}${hops.map(x => `<li>${esc(x)}</li>`).join('')}${other.map(b => `<li>${esc(b)}</li>`).join('')}${checkItems(checksAbout(c, id, false).concat(i === n ? checksAbout(c, null, true) : []))}</ul>` +
       (nxt ? `<div class="next">Next: ${nxt.final ? `the ${nxt.ids.length} data store(s) it can reach` : esc(nameOf(nxt.ids[0])) + (e ? ` (${esc(e.label)})` : '')}</div>` : '');
   }
   const card = document.getElementById('walk'); card.hidden = false;
