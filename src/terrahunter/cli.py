@@ -31,6 +31,7 @@ from terrahunter import (
     roots,
     sandbox,
     scanners,
+    secrets,
 )
 
 # 1: an attack path at or above --fail-on (it wins over 2: the paths found are real even when some code was unseen)
@@ -416,8 +417,12 @@ def _main(argv: list[str] | None) -> int:
             print(f"\nPlan: {n} resource blocks → {len(g.resources)} instances")
         show_graph(g)
         scan = None
-        if not mapping and not a.no_scan:  # (map has no --no-scan: it never scans)
-            scan = scanners.scan(g, d.folder, withs)
+        if not mapping:
+            # the scanners (map has no --no-scan: it never scans), and terrahunter's own: hard-coded secrets
+            scan = scanners.scan(g, d.folder, withs) if not a.no_scan else scanners.Scan()
+            own = secrets.find(g)
+            scan.findings += own
+            scan.status["secrets"] = {"version": "", "ok": True, "error": None, "findings": len(own)}
             show_scan(scan)
         model = arch.build(g, scan.findings if scan else [])
         paths = None

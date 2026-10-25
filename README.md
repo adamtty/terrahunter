@@ -36,7 +36,7 @@ one hop at a time, with what's wrong at every step.
 3. **It maps the connections and draws the diagram.** An architecture diagram in the style of a cloud design tool,
    flat 2D or 3D isometric, with plumbing such as security groups and policy attachments folded into what they
    affect ("open to the internet on 22", "long-lived access key").
-4. **It hunts for vulnerabilities.** trivy and checkov findings are attached to the resource they're about.
+4. **It hunts for vulnerabilities.** trivy and checkov findings are attached to the resource they're about, with terrahunter's own: hard-coded secrets (literals where a secret goes: a SecureString's value, a database password, provider credentials, credential-named environment variables; never variables or placeholders) and long-lived access keys.
 5. **It maps the attack paths.** Internet → a resource at the edge → resources inside: could an attacker chain these
    weaknesses together?
 6. **It shows you the results.** Pick a path and walk through it: everything else fades, and each step zooms in on

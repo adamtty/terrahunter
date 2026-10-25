@@ -250,7 +250,9 @@ def test_the_cli_reports_and_writes_findings(estate, monkeypatch, capsys):
         cli.main([str(estate), "--root", "envs/prod", "--no-diagram", "--graph-json", str(out)])
     assert e.value.code == cli.EXIT_OK
     text = capsys.readouterr().out
-    assert "Vulnerabilities: 1 finding (trivy 9.9.9 1, checkov 9.9.9 0)" in text and "aws_instance.app" in text
+    assert (
+        "Vulnerabilities: 1 finding (trivy 9.9.9 1, checkov 9.9.9 0, secrets 0)" in text and "aws_instance.app" in text
+    )
     assert '"address": "aws_instance.app"' in out.read_text()
 
 
