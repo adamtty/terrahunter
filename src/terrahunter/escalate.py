@@ -163,9 +163,13 @@ def search(g: graph.Graph, model: arch.Model, start: str, im: iam.Models | None 
         in the configuration: someone may have taken it away."""
         return not R[who].type.startswith("aws_") and im.why(who, action, target).startswith(iam.IMPLIED)
 
+    comps = {c.id: c for c in model.components}
+    compute = [c for c in comps if c in R and (kb.entry(R[c].type) or {}).get("category") == "compute"]
+    identity_types = ("aws_iam_role", "aws_iam_user", "azurerm_user_assigned_identity", "google_service_account")
+
     def identity_of(t: str) -> list[str]:
         """The identity a resource gives whoever controls it: itself for a role, else what it runs as."""
-        if R[t].type in ("aws_iam_role", "aws_iam_user", "azurerm_user_assigned_identity", "google_service_account"):
+        if R[t].type in identity_types:
             return [t]
         own = [t] if iam._system_identity(R[t]) else []  # an Azure workload's system-assigned identity
         return own + runs_as.get(t, [])
@@ -215,6 +219,8 @@ def search(g: graph.Graph, model: arch.Model, start: str, im: iam.Models | None 
                 continue
             idt = becomes.get("identity_of")
             if idt:
+                if t in comps and (kb.entry(R[t].type) or {}).get("category") == "compute":  # it runs their code
+                    changed |= gain("control", t, who, rule["id"], f"{who}: {title} on {t}", conf)
                 for ident in identity_of(t):
                     changed |= gain("identity", ident, who, rule["id"], f"{who}: {title} on {t} gives {ident}", conf)
             da = becomes.get("data_access")
@@ -250,7 +256,6 @@ def search(g: graph.Graph, model: arch.Model, start: str, im: iam.Models | None 
         return list(dict.fromkeys(keys.get(addr, [])))
 
     # SSH from the internet with credentials found in data: instances with a public IP and port 22 open
-    comps = {c.id: c for c in model.components}
 
     def ssh_open(inst: str) -> bool:
         c = comps.get(inst)
@@ -302,6 +307,16 @@ def search(g: graph.Graph, model: arch.Model, start: str, im: iam.Models | None 
                         src = im.why(who, f"{_service(R[s].type)}:*", s) or who
                     conf = _min(base, "likely") if src.startswith(iam.IMPLIED) else base
                     changed |= gain("data", s, who, "grant", f"{who} grants {level} on {s} ({src})", conf, level)
+            # compute its own statements give every action on (ec2:* on an instance, lambda:* on a function): it
+            # can rewrite what runs there
+            for x in compute:
+                if (
+                    not admin
+                    and x != who
+                    and R[x].type.startswith("aws_")
+                    and im.access(who, x, _service(R[x].type)) == "admin"
+                ):
+                    changed |= gain("data", x, who, "grant", f"{who} grants every action on {x}", base, "admin")
             # stores whose own resource policy lets any AWS account in
             for s, why in public.items():
                 changed |= gain("data", s, who, "resource-policy", f"{s}: {why}, so {who} can too", base, "read")

@@ -44,7 +44,17 @@ COMPUTE = (
 SERVICE_SINKS = {
     "s3": {"aws_s3_bucket"},
     "dynamodb": {"aws_dynamodb_table"},
-    "rds": {"aws_db_instance", "aws_rds_cluster"},
+    # rds: is also the control plane of Neptune and DocumentDB (snapshots, restores, a new master password)
+    "rds": {
+        "aws_db_instance",
+        "aws_rds_cluster",
+        "aws_db_snapshot",
+        "aws_db_cluster_snapshot",
+        "aws_neptune_cluster",
+        "aws_neptune_cluster_snapshot",
+        "aws_docdb_cluster",
+        "aws_docdb_cluster_snapshot",
+    },
     "neptune-db": {"aws_neptune_cluster"},
     "secretsmanager": {"aws_secretsmanager_secret"},
     "ssm": {"aws_ssm_parameter"},
@@ -105,10 +115,13 @@ def kb_store(rtype: str) -> bool:
 
 def kb_service(rtype: str) -> str:
     """The IAM service prefix of an AWS type, when its name starts with one the IAM data knows (aws_glacier_vault →
-    glacier, aws_kms_key → kms)."""
+    glacier, aws_kms_key → kms) or its catalogue service is one (aws_instance → ec2)."""
     words = rtype.split("_")[1:]
     known = kb._actions() if rtype.startswith("aws_") else {}
-    return next((p for n in (2, 1) if (p := "".join(words[:n])) in known), "")
+    by_name = next((p for n in (2, 1) if (p := "".join(words[:n])) in known), "")
+    # or the catalogue's service, when it's an IAM prefix (aws_instance's EC2 → ec2)
+    svc = str((kb.entry(rtype) or {}).get("service") or "").lower().replace(" ", "")
+    return by_name or (svc if svc in known else "")
 
 
 def stores_of(svc: str, store_types: set[str]) -> set[str]:
