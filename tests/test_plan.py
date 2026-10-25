@@ -222,3 +222,31 @@ def test_a_value_only_known_after_apply_keeps_its_expression(tmp_path):
     }
     g = plan.apply(graph.build(tmp_path, "."), data)
     assert g.resources["data.aws_iam_policy_document.d"].body["statement"][0]["resources"] == ["${aws_s3_bucket.b.arn}"]
+
+
+def test_an_instance_whose_planned_block_is_empty_has_no_reference_from_it(tmp_path):
+    (tmp_path / "main.tf").write_text(
+        'resource "aws_lb_target_group" "tg" {}\nresource "aws_ecs_service" "w" {\n  count = 2\n'
+        '  dynamic "load_balancer" {\n    for_each = count.index == 1 ? [1] : []\n    content {\n'
+        "      target_group_arn = aws_lb_target_group.tg.arn\n    }\n  }\n}\n"
+    )
+
+    def svc(i, lb):
+        return {"address": f"aws_ecs_service.w[{i}]", "index": i, "values": {"load_balancer": lb}}
+
+    data = {
+        "planned_values": {
+            "root_module": {
+                "resources": [
+                    {"address": "aws_lb_target_group.tg", "values": {}},
+                    svc(0, []),
+                    svc(1, [{"container_port": 8080}]),
+                ]
+            }
+        },
+        "configuration": {
+            "root_module": {"resources": [{"address": "aws_lb_target_group.tg"}, {"address": "aws_ecs_service.w"}]}
+        },
+    }
+    g = plan.apply(graph.build(tmp_path, "."), data)
+    assert {e.source for e in g.edges if e.target == "aws_lb_target_group.tg"} == {"aws_ecs_service.w[1]"}

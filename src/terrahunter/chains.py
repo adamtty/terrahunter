@@ -656,6 +656,11 @@ def build(g: graph.Graph, model: arch.Model) -> Result:
         objects = [x for h in holders for x in stored.get(h, [])]
         return sorted({f for x in objects for f in _uploaded_files(g, x) if _KEY_FILE.search(f)})
 
+    def idle(cid: str) -> bool:
+        r = R.get(cid)
+        v = r.body.get("desired_count") if r else None
+        return bool(r and r.type == "aws_ecs_service" and str(deps.unquote(v) if isinstance(v, str) else v) == "0")
+
     def triggered(store: str) -> list[str]:
         """The functions a store triggers: an event source mapping, a bucket notification or a topic subscription
         that names both."""
@@ -1070,10 +1075,11 @@ def build(g: graph.Graph, model: arch.Model) -> Result:
             sev = "critical" if sensitive(eid) else "high"
             chains.append(Chain(sev, "exposed resource", "direct", f"{c.name}: {why}", ["internet"], [eid], [*base]))
             continue
-        # where the traffic goes: the entry itself, and what it routes to / fronts / invokes (two hops)
+        # where the traffic goes: the entry itself, and what it routes to / fronts / invokes (two hops); an ECS
+        # service with no task to run (desired_count = 0) serves nothing
         paths = [[eid]]
         for e in out.get(eid, []):
-            if e.label in ("routes to", "fronts", "invokes") and e.target in comps:
+            if e.label in ("routes to", "fronts", "invokes") and e.target in comps and not idle(e.target):
                 paths.append([eid, e.target])
                 paths += [[eid, e.target, e2.target] for e2 in out.get(e.target, []) if e2.label == "invokes"]
         for path in paths:

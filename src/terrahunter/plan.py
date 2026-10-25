@@ -215,8 +215,13 @@ def apply(g: graph.Graph, data: dict) -> graph.Graph:
 
     edges: list[graph.Edge] = []
     seen: set[tuple[str, str, str]] = set()
+    values = {i["address"]: i["values"] for insts in planned.values() for i in insts}
     for e in g.edges:
         sources = expanded.get(e.source, [])
+        # an instance whose plan says the attribute (or the block) the reference is in is empty has no such
+        # reference: a `dynamic "load_balancer"` over nothing, an empty list
+        top = e.attr.split(".", 1)[0]
+        sources = [s for s in sources if values.get(s, {}).get(top, None) != []]
         targets = expanded.get(e.target, [e.target])  # an unknown module stays itself
         if e.index:
             hit = [t for t in targets if _own_index(t) == e.index]
