@@ -219,3 +219,19 @@ def test_running_commands_on_an_instance_controls_it(tmp_path):
         "aws_iam_user.u",
     )
     assert ("control", "aws_instance.box") in r.gains and "aws_iam_role.box" in r.identities()
+
+
+def test_controlling_a_machine_reads_the_keys_put_on_it(tmp_path):
+    r = search(
+        tmp_path,
+        'resource "aws_iam_user" "u" {}\nresource "aws_iam_user" "admin" {}\n'
+        'resource "aws_iam_access_key" "k" {\n  user = aws_iam_user.admin.name\n}\n'
+        + role("box", "ec2.amazonaws.com", READ)
+        + 'resource "aws_iam_instance_profile" "box" {\n  role = aws_iam_role.box.name\n}\n'
+        'resource "aws_instance" "box" {\n  iam_instance_profile = aws_iam_instance_profile.box.name\n'
+        '  provisioner "file" {\n    content = aws_iam_access_key.k.secret\n    destination = "/tmp/k"\n  }\n}\n'
+        + user_policy("u", '{Effect = "Allow", Action = "ssm:SendCommand", Resource = "*"}'),
+        "aws_iam_user.u",
+    )
+    (hop,) = r.path("identity", "aws_iam_user.admin")[-1:]
+    assert hop.rule == "credentials" and "controls it" in hop.text

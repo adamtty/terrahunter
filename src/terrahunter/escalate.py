@@ -243,14 +243,7 @@ def search(g: graph.Graph, model: arch.Model, start: str, im: iam.Models | None 
                             )
         return changed
 
-    keys: dict[str, list[str]] = {}  # a resource → the users whose access keys its configuration holds
-    for e in g.edges:
-        if R.get(e.target) and R[e.target].type == "aws_iam_access_key" and e.source in R:
-            keys.setdefault(e.source, []).extend(
-                x.target
-                for x in g.edges
-                if x.source == e.target and R.get(x.target) and R[x.target].type == "aws_iam_user"
-            )
+    keys = held_keys(g)  # a resource → the users whose access keys it holds
 
     def _keys_in(addr: str) -> list[str]:
         return list(dict.fromkeys(keys.get(addr, [])))
@@ -356,9 +349,11 @@ def search(g: graph.Graph, model: arch.Model, start: str, im: iam.Models | None 
                 readable = admin or iam.LEVELS.get(im.access(who, addr, svc), 0) >= iam.LEVELS["read"]
                 gn = res.gains.get(("data", addr))
                 readable = readable or bool(gn and iam.LEVELS.get(gn.access, 0) >= iam.LEVELS["read"])
-                if readable:
+                held = ("control", addr) in res.gains  # a shell on a machine reads the files put there
+                if readable or held:
+                    how = "controls it" if held and not readable else "can read it"
                     for user in _keys_in(addr):
-                        text = f"{addr} holds an access key of {user}, and {who} can read it"
+                        text = f"{addr} holds an access key of {user}, and {who} {how}"
                         changed |= gain("identity", user, who, "credentials", text, _min(base, "likely"))
         if not changed:
             break
@@ -380,6 +375,29 @@ def search(g: graph.Graph, model: arch.Model, start: str, im: iam.Models | None 
         for s in dict.fromkeys(x for x in owned if R[x].type.startswith(prefix)):
             gain("data", s, g0.via, "admin", f"{g0.via} is the account's administrator", g0.confidence, "admin")
     return res
+
+
+_ACCESS_KEY = re.compile(r"\baws_iam_access_key\.([\w-]+)")
+
+
+def held_keys(g: graph.Graph) -> dict[str, list[str]]:
+    """The users whose access keys each resource holds: its configuration references the key (a function's
+    variables, an environment's settings), or a deploy-time provisioner puts it there (a file copied to a machine)."""
+    R = g.resources
+    owner = {
+        k: [x.target for x in g.edges if x.source == k and R.get(x.target) and R[x.target].type == "aws_iam_user"]
+        for k, r in R.items()
+        if r.type == "aws_iam_access_key"
+    }
+    out: dict[str, list[str]] = {}
+    for e in g.edges:
+        if e.target in owner and e.source in R:
+            out.setdefault(e.source, []).extend(owner[e.target])
+    for a, r in R.items():
+        prefix = f"{r.module}." if r.module else ""
+        for name in _ACCESS_KEY.findall(str(r.body.get("provisioner") or "")):
+            out.setdefault(a, []).extend(owner.get(f"{prefix}aws_iam_access_key.{name}", []))
+    return {a: list(dict.fromkeys(u)) for a, u in out.items() if u}
 
 
 def _is_store(rtype: str) -> bool:

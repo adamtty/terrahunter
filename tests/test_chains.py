@@ -348,3 +348,24 @@ def test_a_public_queue_feeds_the_function_it_triggers(tmp_path):
     assert ch.steps == ["internet", "aws_sqs_queue.bus", "aws_lambda_function.consumer", "aws_iam_role.fn"]
     # one statement's resource isn't another's: GetParameter on the flag only, though logs:* is on every resource
     assert "aws_ssm_parameter.flag" in ch.sinks and "aws_ssm_parameter.other" not in ch.sinks
+
+
+def test_a_machine_holding_an_access_key_gives_its_user(tmp_path):
+    r = paths(
+        tmp_path,
+        NET + ROLE + sg("open", 22) + 'resource "aws_iam_user" "admin" {}\n'
+        'resource "aws_iam_access_key" "k" {\n  user = aws_iam_user.admin.name\n}\n'
+        'resource "aws_iam_user_policy" "a" {\n  user = aws_iam_user.admin.name\n'
+        '  policy = jsonencode({Statement = [{Effect = "Allow", Action = "s3:*", Resource = "*"}]})\n}\n'
+        'resource "aws_s3_bucket" "vault" {}\n'
+        + instance(
+            "box",
+            "pub",
+            "open",
+            '  key_name = "ops"\n  associate_public_ip_address = true\n'
+            "  iam_instance_profile = aws_iam_instance_profile.app.name\n"
+            '  provisioner "file" {\n    content = "${aws_iam_access_key.k.secret}"\n    destination = "/tmp/k"\n  }\n',
+        ),
+    )
+    (ch,) = [c for c in r.chains if "aws_instance.box" in c.steps]  # one path: the role, with the key's user
+    assert "aws_iam_user.admin" in ch.steps + ch.controls and "aws_s3_bucket.vault" in ch.sinks

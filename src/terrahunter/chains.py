@@ -854,6 +854,9 @@ def build(g: graph.Graph, model: arch.Model) -> Result:
         how = "directly from the internet" if other == node_id else f"through {other}"
         return f"{node_id} is also reachable {how}"
 
+    from terrahunter import escalate as _escalate
+
+    keys_held = _escalate.held_keys(g)
     found: dict[tuple, Chain] = {}  # one chain per (workload, identity, data): the shortest way in wins
     for eid, why in entries:
         c = comps[eid]
@@ -991,10 +994,20 @@ def build(g: graph.Graph, model: arch.Model) -> Result:
             for d in direct:
                 add_edge(node.id, d, next(x.label for x in out[node.id] if x.target == d), "access")
             where = "the instance metadata service" if node.type in clouds.VMS else "its environment"
-            for role in roles + list(host_roles) + list(neighbours) + ([node.id] if own else []) or [None]:
+            # access keys it holds (its configuration, a file a provisioner put on it): a foothold there has them
+            holders = [u for u in keys_held.get(node.id, []) if u in comps and u not in roles]
+            # they're taken with the workload's own identity, on the same path; alone, the first is the identity
+            alone = holders[:1] if not (roles or host_roles or own) else []
+            for role in roles + list(host_roles) + list(neighbours) + alone + ([node.id] if own else []) or [None]:
                 h, steps, sinks = list(hops), ["internet", *path], list(direct)
                 taken: list[str] = []  # services it takes over on the way
-                if role in neighbours:
+                if role in alone:
+                    steps.append(role)
+                    h.append(
+                        f"{node.id} holds an access key of {role} (in its configuration, or a file put there at deploy time)"
+                    )
+                    sinks += [t for t in via_identity(role, h) if t not in sinks]
+                elif role in neighbours:
                     other, host, how = neighbours[role]
                     steps += [other, role]
                     h.append(
@@ -1018,6 +1031,12 @@ def build(g: graph.Graph, model: arch.Model) -> Result:
                     steps.append(role)
                     h.append(f"{node.id} runs as {role}: the identity's credentials come from {where}")
                     sinks += [t for t in via_identity(role, h) if t not in sinks]
+                extra = [u for u in holders if u != role] if role not in neighbours else []
+                for u in extra:
+                    h.append(
+                        f"{node.id} holds an access key of {u} (in its configuration, or a file put there at deploy time)"
+                    )
+                    sinks += [t for t in via_identity(u, h) if t not in sinks]
                 if sinks:
                     h.append(reached(sinks))
                 elif not (role and (gives_more(role) or not hostless(node)) or "shell" in text):
@@ -1032,7 +1051,21 @@ def build(g: graph.Graph, model: arch.Model) -> Result:
                 )
                 key = (node.id, role, tuple(sinks))
                 ch = Chain("", kind, conf, f"{c.name}: {why}", steps, sinks, h)
-                ch.controls = [x for x in [*taken, *controls_of.get(role, [])] if x not in steps] if role else []
+                ch.controls = (
+                    [
+                        x
+                        for x in [
+                            *taken,
+                            *extra,
+                            *controls_of.get(role, []),
+                            *(y for u in extra for y in controls_of.get(u, [])),
+                        ]
+                        if x not in steps
+                    ]
+                    if role
+                    else []
+                )
+                ch.controls = list(dict.fromkeys(ch.controls))
                 assume(ch, rests, node.id)
                 assume(ch, "unresolved" if eid in unsure else "", eid)
                 assume(ch, "imds" if role in host_roles else "", host_roles.get(role, ""))
