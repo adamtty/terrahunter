@@ -138,6 +138,14 @@ def find(g: graph.Graph, paths: list[chains.Chain], assumed: dict[int, list[tupl
         return texts[m]
 
     rules = {r["id"]: r for c in ("aws", "azure", "gcp") for r in kb.techniques(c)}
+    models: list = []
+
+    def model():
+        if not models:
+            from terrahunter import iam
+
+            models.append(iam.Model(g))
+        return models[0]
 
     def add(n: int, kind: str, about: str, question: str, where: list[str]) -> None:
         cid = f"{kind}:{about}"
@@ -205,6 +213,19 @@ def find(g: graph.Graph, paths: list[chains.Chain], assumed: dict[int, list[tupl
                     "enforced for this project, or the default compute account's Editor grant removed?",
                     _where(r),
                 )
+        # a policy on the path whose actions or resources are one of two branches the code doesn't settle
+        for step in ch.steps:
+            if R.get(step) and R[step].type in ("aws_iam_role", "aws_iam_user"):
+                for st in model().statements(step):
+                    if st.maybe:
+                        add(
+                            n,
+                            "branch",
+                            st.source,
+                            f"Which branch of {st.source}'s conditional applies where this "
+                            f"is deployed? It decides what {step} may do ({', '.join(st.actions[:3]) or 'its actions'}).",
+                            _where(R.get(st.source)),
+                        )
         # the techniques the path uses, with the knowledge base's preconditions
         for h in ch.hops:
             m = _RULE.search(h)

@@ -314,3 +314,16 @@ def test_a_module_policy_naming_its_argument(tmp_path):
     role = "module.node.aws_iam_role.r"
     assert m.allowed(role, "secretsmanager:GetSecretValue", "aws_secretsmanager_secret.seed") is True
     assert m.allowed(role, "secretsmanager:GetSecretValue", "aws_s3_bucket.b") is False  # each to its own service
+
+
+def test_a_conditional_the_code_doesn_t_settle_is_either_branch_possibly(tmp_path):
+    m = model(
+        tmp_path,
+        'variable "wide" {}\nresource "aws_iam_role" "r" {}\nresource "aws_s3_bucket" "inbox" {}\n'
+        'resource "aws_iam_role_policy" "p" {\n  role = aws_iam_role.r.id\n'
+        '  policy = jsonencode({Statement = [{Effect = "Allow", Action = var.wide ? ["s3:*"] : ["s3:PutObject"], '
+        'Resource = var.wide ? ["*"] : ["${aws_s3_bucket.inbox.arn}/*"]}]})\n}\n',
+    )
+    assert m.allowed("aws_iam_role.r", "s3:PutObject", "aws_s3_bucket.inbox") is None  # possibly
+    assert m.access("aws_iam_role.r", "aws_s3_bucket.inbox", "s3") == "admin"  # at most the wide branch
+    assert m.allowed("aws_iam_role.r", "dynamodb:Scan", None) is False  # in neither branch
