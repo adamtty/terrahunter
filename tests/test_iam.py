@@ -125,3 +125,18 @@ def test_trust(tmp_path, principal, grant, want):
 def test_services_a_role_trusts(tmp_path):
     m = model(tmp_path, TRUST.format(principal='Service = ["lambda.amazonaws.com", "ec2.amazonaws.com"]'))
     assert m.services("aws_iam_role.t") == {"lambda.amazonaws.com", "ec2.amazonaws.com"}
+
+
+def test_an_arn_with_an_interpolation_names_by_its_literal_tail(tmp_path):
+    m = model(
+        tmp_path,
+        'resource "aws_iam_role" "r" {}\nresource "aws_iam_role" "agentcore_runtime" {\n  name = "agentcore_runtime"\n}\n'
+        'resource "aws_iam_role" "other" {\n  name = "other"\n}\ndata "aws_caller_identity" "me" {}\n'
+        + policy(
+            "p",
+            '{Effect = "Allow", Action = "iam:PassRole", '
+            'Resource = "arn:aws:iam::${data.aws_caller_identity.me.account_id}:role/agentcore_*"}',
+        ),
+    )
+    assert m.allowed("aws_iam_role.r", "iam:PassRole", "aws_iam_role.agentcore_runtime") is True
+    assert m.allowed("aws_iam_role.r", "iam:PassRole", "aws_iam_role.other") is False
