@@ -129,6 +129,7 @@ def search(g: graph.Graph, model: arch.Model, start: str, im: iam.Model | None =
         for c, v in model.exposed.items()
         if c in R and _is_store(R[c].type) and any("any AWS account" in w for w, _ in v)
     }
+    public |= {c: v[0][0] for c, v in model.account_open.items() if c in R and v}
 
     def gain(kind, address, via, rule, text, confidence, access="") -> bool:
         key = (kind, address)
