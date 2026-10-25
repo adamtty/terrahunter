@@ -229,3 +229,17 @@ def test_a_symlinked_download_is_not_read(tmp_path):
     write(root, {".terraform/modules/modules.json": '{"Modules":[{"Key":"vpc","Dir":".terraform/modules/vpc"}]}'})
     os.symlink(outside, root / ".terraform/modules/vpc")
     assert needs(deps.survey(root, ".")) == {"module.vpc": "download"}
+
+
+def test_a_file_is_parsed_once_and_each_reader_gets_its_own_copy(tmp_path, monkeypatch):
+    (tmp_path / "main.tf").write_text('resource "aws_s3_bucket" "b" {\n  bucket = "x"\n}\n')
+    (tmp_path / "bad.tf").write_text("resource {{{\n")
+    calls = []
+    real = deps._hcl
+    monkeypatch.setattr(deps, "_hcl", lambda text: calls.append(text) or real(text))
+    deps._PARSED.clear()
+    first = deps.load_dir(tmp_path, notes := [], ".")
+    second = deps.load_dir(tmp_path, notes2 := [], ".")
+    assert len(calls) == 2  # each distinct text once, the bad one included
+    assert first[0][1] == second[0][1] and first[0][1] is not second[0][1]
+    assert any("bad.tf" in n for n in notes) and any("bad.tf" in n for n in notes2)  # still reported every time
