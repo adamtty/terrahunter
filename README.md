@@ -134,7 +134,7 @@ bundle, or a knowledge base checkout's `dist/`.
 [terrahunter-kb](https://github.com/adamtty/terrahunter-kb): deliberately vulnerable Terraform (TerraGoat, AWSGoat,
 CloudGoat, IAM Vulnerable, CloudFoxable, sadcloud, AzureGoat, GCPGoat) with hand-written answer keys. It reports
 recall (expected paths found, and how much of their data), precision (paths that match; those the key contradicts,
-with its reason) and confidence side by side. Currently: recall 100% of the 72 internet paths (98% of the data they reach), precision 91%; and 97% of the 68 paths that start from credentials the project hands the attacker.
+with its reason) and confidence side by side. Currently: recall 100% of the 72 internet paths (98% of the data they reach), precision 91%; and 99% of the 68 paths that start from credentials the project hands the attacker.
 
 ```sh
 (cd ../terrahunter-kb && python scripts/bench/fetch.py)   # the projects, at their pinned commits

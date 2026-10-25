@@ -204,3 +204,31 @@ def test_the_default_compute_account_is_an_editor_unless_deprivileged(tmp_path, 
     assert m.access(vm, "google_storage_bucket.b") == storage
     assert not m.is_admin(vm)  # Editor can't change IAM
     assert m.why(vm, "compute.instances.setMetadata", None).startswith(iam.IMPLIED) is metadata
+
+
+def test_an_arn_that_names_a_type_covers_every_one_and_tags_settle_conditions(tmp_path):
+    m = model(
+        tmp_path,
+        'data "aws_caller_identity" "me" {}\nresource "aws_iam_user" "mgr" {}\n'
+        'resource "aws_iam_user" "dev" {\n  name = "dev_${var.x}"\n  tags = {\n    developer = "true"\n  }\n}\n'
+        'resource "aws_iam_user" "admin" {\n  name = "admin_${var.x}"\n}\n'
+        'resource "aws_iam_user_policy" "p" {\n  user = aws_iam_user.mgr.name\n'
+        '  policy = jsonencode({Statement = [{Effect = "Allow", Action = "iam:CreateAccessKey", '
+        'Resource = "arn:aws:iam::${data.aws_caller_identity.me.account_id}:user/*", '
+        'Condition = {StringEquals = {"aws:ResourceTag/developer" = "true"}}}]})\n}\n',
+    )
+    assert m.allowed("aws_iam_user.mgr", "iam:CreateAccessKey", "aws_iam_user.dev") is True  # its tag meets it
+    assert m.allowed("aws_iam_user.mgr", "iam:CreateAccessKey", "aws_iam_user.admin") is None  # not tagged (yet)
+
+
+def test_the_account_id_from_the_caller_identity_is_the_account_root(tmp_path):
+    m = model(
+        tmp_path,
+        'data "aws_caller_identity" "me" {}\nresource "aws_iam_user" "u" {}\n'
+        'resource "aws_iam_role" "t" {\n  assume_role_policy = jsonencode({Statement = [{Effect = "Allow", '
+        'Action = "sts:AssumeRole", Principal = {AWS = data.aws_caller_identity.me.account_id}}]})\n}\n'
+        'resource "aws_iam_user_policy" "p" {\n  user = aws_iam_user.u.name\n'
+        '  policy = jsonencode({Statement = [{Effect = "Allow", Action = "sts:AssumeRole", '
+        "Resource = aws_iam_role.t.arn}]})\n}\n",
+    )
+    assert m.can_assume("aws_iam_user.u", "aws_iam_role.t") is True

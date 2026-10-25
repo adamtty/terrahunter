@@ -39,7 +39,8 @@ POLICY_TYPES = (
 IDENTITIES = ("aws_iam_user", "aws_iam_role")
 # a reference in a policy string: ${aws_s3_bucket.data.arn}, ${module.x.aws_iam_role.r.arn}
 _REF = re.compile(r"\$\{(?:data\.)?([a-z][a-z0-9_]*)\.([A-Za-z0-9_-]+)(?:\[[^\]]*\])?\.[A-Za-z0-9_]+\}")
-_ROOT = re.compile(r":root$|^\d{12}$")
+# the account itself as a principal: its root ARN, its id, or the id read from aws_caller_identity
+_ROOT = re.compile(r":root$|^\d{12}$|^\$\{data\.aws_caller_identity\.[\w-]+\.account_id\}$")
 LEVELS = {"list": 1, "read": 2, "write": 3, "admin": 4}
 _KB_LEVEL = {"List": "list", "Read": "read", "Write": "write", "Tagging": "write", "Permissions management": "admin"}
 # the attributes that hold a resource's own name, as a literal ARN may name it
@@ -65,6 +66,7 @@ class Statement:
     conditional: bool
     source: str  # the resource the statement is written in
     targets: set[str] = field(default_factory=set)  # graph resources its Resource references or names
+    condition: dict = field(default_factory=dict, repr=False)  # as written
 
     def covers_action(self, action: str) -> bool:
         a = action.lower()
@@ -83,7 +85,8 @@ class Statement:
         if resource in self.targets:
             return True
         own = names.get(resource, set())
-        return any(_arn_names(_literal_tail(r), own) for r in self.resources)
+        rtype = resource.rsplit(".", 2)[-2] if resource.count(".") >= 1 else ""
+        return any(_arn_names(_literal_tail(r), own) or _arn_type(_literal_tail(r)) == rtype for r in self.resources)
 
 
 def _literal_tail(r: str) -> str:
@@ -94,6 +97,27 @@ def _literal_tail(r: str) -> str:
         return r
     tail = r.rsplit("}", 1)[-1]
     return tail if "/" in tail or tail.startswith(":") else ""
+
+
+# the resource type an ARN names before its wildcard (…:user/*, …:function:*) → the Terraform type
+_ARN_TYPES = {
+    "user": "aws_iam_user",
+    "role": "aws_iam_role",
+    "group": "aws_iam_group",
+    "policy": "aws_iam_policy",
+    "instance-profile": "aws_iam_instance_profile",
+    "function": "aws_lambda_function",
+    "table": "aws_dynamodb_table",
+    "secret": "aws_secretsmanager_secret",
+    "parameter": "aws_ssm_parameter",
+    "instance": "aws_instance",
+}
+
+
+def _arn_type(pattern: str) -> str:
+    """The Terraform type of every resource an ARN pattern names by its type alone (…:user/*), or ""."""
+    m = re.search(r"(?:^|:)([a-z-]+)[/:]\*$", pattern)
+    return _ARN_TYPES.get(m.group(1), "") if m else ""
 
 
 def _arn_names(pattern: str, own: set[str]) -> bool:
@@ -157,6 +181,7 @@ class Model:
                     conditional=bool(st.get("Condition")),
                     source=source,
                     targets=targets,
+                    condition=st.get("Condition") if isinstance(st.get("Condition"), dict) else {},
                 )
             )
         return out
@@ -246,9 +271,29 @@ class Model:
         if any(s.effect == "Deny" and not s.conditional for s in sts):
             return False
         allows = [s for s in sts if s.effect == "Allow"]
-        if any(not s.conditional for s in allows):
+        if any(not s.conditional or self._tags_hold(s.condition, resource) for s in allows):
             return None if any(s.effect == "Deny" for s in sts) else True
         return None if allows else False
+
+    def _tags_hold(self, condition: dict, resource: str | None) -> bool:
+        """Whether a condition is only on the resource's tags (aws:ResourceTag/key equals a value), and the
+        resource's own tags meet it."""
+        r = self.g.resources.get(resource or "")
+        if r is None or not condition:
+            return False
+        tags = r.body.get("tags") if isinstance(r.body.get("tags"), dict) else {}
+        tags = {deps.unquote(k) or k: deps.unquote(v) for k, v in tags.items()}
+        for op, tests in condition.items():
+            if op not in ("StringEquals", "StringLike") or not isinstance(tests, dict):
+                return False
+            for key, want in tests.items():
+                m = re.fullmatch(r"(?:aws|iam|ec2|ecs|ssm):ResourceTag/(.+)", str(key).strip('"'))
+                if not m:
+                    return False
+                have = tags.get(m.group(1))
+                if have is None or not any(fnmatch.fnmatchcase(have, str(w)) for w in _list(want)):
+                    return False
+        return True
 
     def why(self, identity: str, action: str, resource: str | None = None) -> str:
         """The resource whose statement allows it (for the hop text and the fix)."""
