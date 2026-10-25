@@ -26,7 +26,7 @@ import itertools
 import re
 from dataclasses import asdict, dataclass, field
 
-from terrahunter import arch, clouds, deps, graph, kb, policies
+from terrahunter import arch, clouds, deps, graph, kb, policies, sandbox
 
 COMPUTE = (
     {
@@ -75,6 +75,9 @@ _ACTION = re.compile(r'"([a-z0-9-]+):([A-Za-z0-9*]+)"')
 _ANY_ACTION = re.compile(r'[Aa]ctions?\\?["\']?\s*[:=]\s*\[?\s*(?:\\?["\']){1,2}\*(?:\\?["\']){1,2}')
 _ANY_RESOURCE = re.compile(r'[Rr]esources?\\?["\']?\s*[:=]\s*\[?\s*(?:\\?["\']){1,2}\*(?:\\?["\']){1,2}')
 _OPEN = re.compile(r"^open to internet: (.+)$")
+_KEY_FILE = re.compile(r"\.pem$|(^|/)id_(rsa|ed25519|ecdsa|dsa)$|\.key$|private[-_]?key", re.IGNORECASE)
+_FILESET = re.compile(r'fileset\(\s*"([^"]*)"\s*,\s*"([^"]*)"\s*\)')
+_READS = re.compile(r'\b(?:file|templatefile)\(\s*"([^"$]+)"')
 _PASSWORD_LOGIN = re.compile(r"chpasswd|\bpasswd\b|PasswordAuthentication\s+yes", re.IGNORECASE)
 WEB_PORTS = {"80", "443", "8080", "8443", "all"}
 ADMIN_PORTS = {"22": "SSH", "3389": "RDP", "all": "every port"}
@@ -250,11 +253,60 @@ def _has(comp: arch.Component, text: str) -> bool:
     return any(b.text == text for b in comp.badges)
 
 
+def _uploaded_files(g: graph.Graph, addr: str, limit: int = 2000) -> list[str]:
+    """The files a stored object uploads, by name: its `source`, or every file a `for_each = fileset(dir, pattern)`
+    lists. Read from the folder the module is in, never outside the folders under analysis."""
+    r = g.resources.get(addr)
+    if r is None:
+        return []
+    base = g.module_dirs.get(r.module)
+    if base is None:
+        return []
+    out = []
+    m = _FILESET.search(str(r.body.get("for_each", "")))
+    if m:
+        d = (base / m.group(1).replace("${path.module}", ".").replace("${path.root}", ".")).resolve()
+        allowed = [p.resolve() for p in g.dirs]
+        if any(d == a or a in d.parents for a in allowed) and d.is_dir():
+            pattern = m.group(2) if m.group(2) != "**" else "**/*"  # Terraform's ** is every file, pathlib's dirs
+            for f in sorted(d.glob(pattern)):
+                if f.is_file() and not f.is_symlink():
+                    out.append(f.relative_to(d).as_posix())
+                if len(out) >= limit:
+                    break
+    src = deps.unquote(r.body.get("source"))
+    if src and "${" not in src:
+        out.append(src)
+    return out
+
+
+def _setup_text(g: graph.Graph, addr: str) -> str:
+    """What sets a machine up, as text: its configuration, what it takes from (a rendered template) or what acts on
+    it (a VM extension), and the files those read with file() or templatefile(), inside the folders under analysis."""
+    linked = {e.target for e in g.edges if e.source == addr} | {e.source for e in g.edges if e.target == addr}
+    rs = [g.resources[a] for a in [addr, *sorted(linked)] if a in g.resources]
+    parts = [str(r.body) for r in rs]
+    allowed = [d.resolve() for d in g.dirs]
+    for r in rs:
+        base = g.module_dirs.get(r.module)
+        for name in _READS.findall(parts[rs.index(r)]) if base is not None else []:
+            try:
+                real = (base / name.replace("${path.module}/", "").replace("${path.root}/", "")).resolve()
+                if deps._inside_any(real, allowed) is not None:
+                    parts.append(sandbox.read_regular(real, graph.MAX_FILE_BYTES).decode("utf-8", "replace"))
+            except OSError:
+                continue
+    return "\n".join(parts)
+
+
 def _stores_in(e: graph.Edge, R: dict) -> bool:
-    """Whether a reference is a resource kept in the one it names (the catalogue's stores-in: an object's bucket)."""
+    """Whether a reference is a resource kept in the one it names (the catalogue's stores-in: an object's bucket).
+    Older providers named the parent where the catalogue's (current) one takes its id: `storage_container_name` for
+    `storage_container_id`."""
     for c in (kb.entry(R[e.source].type) or {}).get("connections") or []:
         attr = c.get("attr", "")
-        if c.get("meaning") == "stores-in" and (e.attr == attr or e.attr.startswith(f"{attr}.")):
+        legacy = attr.removesuffix("_id") + "_name" if attr.endswith("_id") else ""
+        if c.get("meaning") == "stores-in" and (e.attr in (attr, legacy) or e.attr.startswith(f"{attr}.")):
             return R[e.target].type in (c.get("to") or [])
     return False
 
@@ -496,6 +548,34 @@ def build(g: graph.Graph, model: arch.Model) -> Result:
         kinds = sorted({FIREWALL[R[o].type] for _, o in model.exposed.get(cid, []) if o in R and R[o].type in FIREWALL})
         return " and ".join(kinds) or "firewall"
 
+    # what's stored in each store: the catalogue's stores-in connections (an object in its bucket, a document in its
+    # database, a secret's versions)
+    stored: dict[str, list[str]] = {}
+    for e in g.edges:
+        if e.source in R and e.target in R and e.source not in comps and _stores_in(e, R):
+            stored.setdefault(e.target, []).append(e.source)
+
+    def leaked_keys(store: str) -> list[str]:
+        """Private SSH keys a public store hands out: files its objects upload (or the objects of what opens it to the
+        internet, an Azure container on its account) that are private keys."""
+        holders = [store, *(o for _, o in model.exposed.get(store, []))]
+        objects = [x for h in holders for x in stored.get(h, [])]
+        return sorted({f for x in objects for f in _uploaded_files(g, x) if _KEY_FILE.search(f)})
+
+    def ssh_hosts(keys: list[str]) -> dict[str, list[str]]:
+        """Machines that take SSH from the internet (a public IP, 22 open) and trust one of these private keys: their
+        setup installs its public half (`justin.pub` for `justin.pem`) or names it as their key pair."""
+        out = {}
+        for c in model.components:
+            if c.type in clouds.VMS and public_ip(c) and any(p in ("22", "all") for p in _ports(c)):
+                text = _setup_text(g, c.id)
+                stems = {k: k.rsplit("/", 1)[-1].rsplit(".", 1)[0] for k in keys}
+                key_name = deps.unquote((R[c.id].body if c.id in R else {}).get("key_name"))
+                trusted = [k for k, s in stems.items() if s and (f"{s}.pub" in text or s == key_name)]
+                if trusted:
+                    out[c.id] = trusted
+        return out
+
     # --- entry points: (component, why the internet reaches it, the ports)
     entries: list[tuple[str, str]] = []
     unsure: set[str] = set()  # entries the knowledge base's test couldn't settle (a value terrahunter can't resolve)
@@ -706,7 +786,37 @@ def build(g: graph.Graph, model: arch.Model) -> Result:
             hops = [*base, reached([eid])]
             conf = "possible" if eid in unsure else "direct"
             sev = "critical" if conf == "direct" or sensitive(eid) else "high"
-            chains.append(Chain(sev, "exposed data store", conf, f"{c.name}: {why}", ["internet"], [eid], hops))
+            ch = Chain(sev, "exposed data store", conf, f"{c.name}: {why}", ["internet"], [eid], hops)
+            keys = leaked_keys(eid) if conf == "direct" else []
+            hosts = ssh_hosts(keys) if keys else {}
+            if not hosts:
+                chains.append(ch)
+                continue
+            # it hands out SSH keys: a path to each machine that trusts one and takes SSH from anywhere
+            for host, trusted in hosts.items():
+                names = ", ".join(k.rsplit("/", 1)[-1] for k in trusted)
+                hops = [*base, f"{eid} hands out the private key {names}, which {host} trusts; its SSH is open"]
+                ch = Chain(
+                    "",
+                    "internet → public store → SSH key → VM",
+                    "likely",
+                    f"{c.name}: {why}",
+                    ["internet", eid, host],
+                    [eid],
+                    hops,
+                )
+                ids = [x.target for x in out.get(host, []) if x.label == "runs as" and x.target in comps]
+                own = clouds.system_identity(comps[host].type, R[host].body) if host in R else ""
+                for ident in ids + ([host] if own else []):
+                    if ident != host:
+                        ch.steps.append(ident)
+                    hops.append(
+                        f"{host} runs as {own or ident}: its credentials come from the instance metadata service"
+                    )
+                    ch.sinks += [t for t in via_identity(ident, hops) if t not in ch.sinks]
+                    ch.controls += [x for x in controls_of.get(ident, []) if x not in ch.controls and x not in ch.steps]
+                hops.append(reached(ch.sinks))
+                chains.append(ch)
             continue
         if eid in exposed_only and c.type not in COMPUTE and c.type not in APIS:  # a key anyone may use, a topic
             # anyone may publish to: what the internet gets is the resource itself
@@ -810,12 +920,6 @@ def build(g: graph.Graph, model: arch.Model) -> Result:
                 hops.append(f"{eid}: the method needs an API key: a leaked or shared key gets its response")
             chains.append(Chain("", "exposed API", conf, f"{comps[eid].name}: {why}", ["internet", eid], [], hops))
 
-    # what's stored in the stores a path reaches comes with them: the catalogue's stores-in connections (an object in
-    # its bucket, a document in its database, a secret's versions)
-    stored: dict[str, list[str]] = {}
-    for e in g.edges:
-        if e.source in R and e.target in R and e.source not in comps and _stores_in(e, R):
-            stored.setdefault(e.target, []).append(e.source)
     for ch in chains:
         ch.within = sorted({x for s in ch.sinks for x in stored.get(s, [])})
     for ch in chains:
