@@ -433,3 +433,29 @@ def test_a_rule_on_a_looked_up_security_group(tmp_path):
         "  iam_instance_profile = aws_iam_instance_profile.app.name\n}\n",
     )
     assert any("aws_instance.box" in c.steps for c in r.chains)
+
+
+@pytest.mark.parametrize(
+    ("port", "steps", "sinks"),
+    [
+        (6379, ["internet", "aws_instance.cache"], ["aws_instance.cache"]),  # Redis: what it holds is anyone's
+        (
+            2375,
+            ["internet", "aws_instance.cache", "aws_iam_role.app"],
+            ["aws_s3_bucket.customer_exports", "aws_s3_bucket.logs"],
+        ),
+    ],
+)
+def test_a_service_that_commonly_answers_anyone(tmp_path, port, steps, sinks):
+    profile = "  iam_instance_profile = aws_iam_instance_profile.app.name\n" if port == 2375 else ""
+    r = paths(
+        tmp_path,
+        NET
+        + ROLE
+        + BUCKETS
+        + WILDCARD_S3
+        + sg("open", port)
+        + instance("cache", "pub", "open", f"  associate_public_ip_address = true\n{profile}"),
+    )
+    (c,) = [c for c in r.chains if "aws_instance.cache" in c.steps]
+    assert (c.steps, sorted(c.sinks), c.confidence) == (steps, sorted(sinks), "likely")

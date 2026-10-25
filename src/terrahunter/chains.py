@@ -90,6 +90,13 @@ _FILESET = re.compile(r'fileset\(\s*"([^"]*)"\s*,\s*"([^"]*)"\s*\)')
 _PASSWORD_LOGIN = re.compile(r"chpasswd|\bpasswd\b|PasswordAuthentication\s+yes", re.IGNORECASE)
 WEB_PORTS = {"80", "443", "8080", "8443", "all"}
 ADMIN_PORTS = {"22": "SSH", "3389": "RDP", "all": "every port"}
+# services that commonly answer without authentication (the knowledge base's `likely`): their data, or (Docker,
+# kubelet) a shell on the machine, is the internet's
+UNAUTHENTICATED = {
+    "6379": "Redis", "11211": "Memcached", "9200": "Elasticsearch/OpenSearch", "27017": "MongoDB", "2379": "etcd",
+    "2375": "the Docker API", "10250": "the kubelet",
+}  # fmt: skip
+SHELL_SERVICES = {"2375", "10250"}
 POLICY_TYPES = (
     "aws_iam_role_policy",
     "aws_iam_user_policy",
@@ -821,6 +828,13 @@ def build(g: graph.Graph, model: arch.Model) -> Result:
                 "",
             )
         ports = set(_ports(c))
+        if c.type in clouds.VMS and (shells := sorted(ports & SHELL_SERVICES)):
+            names = " and ".join(f"{UNAUTHENTICATED[p]} on {p}" for p in shells)
+            return (
+                f"{c.id}: {names} open to the internet: it commonly answers without authentication, a shell",
+                "likely",
+                "",
+            )
         web = bool(ports & WEB_PORTS) or via_lb
         admin = [ADMIN_PORTS[p] for p in ("22", "3389", "all") if p in ports] if can_log_in(c) else []
         static = _static_web(g, c.id)
@@ -1104,6 +1118,15 @@ def build(g: graph.Graph, model: arch.Model) -> Result:
             direct = [x.target for x in out.get(node.id, []) if x.target in comps and kb_store(comps[x.target].type)]
             for d in direct:
                 add_edge(node.id, d, next(x.label for x in out[node.id] if x.target == d), "access")
+            # a data service on the machine that commonly answers anyone: what it holds is reached, likely
+            serving = [p for p in sorted(set(_ports(node)) & UNAUTHENTICATED.keys()) if p not in SHELL_SERVICES]
+            if node.type in clouds.VMS and serving:
+                direct.insert(0, node.id)
+                hops.append(
+                    f"{node.id}: {' and '.join(f'{UNAUTHENTICATED[p]} on {p}' for p in serving)} open to the internet: "
+                    "it commonly answers without authentication, so what it holds is anyone's"
+                )
+                conf = "likely" if conf == "possible" else conf
             where = "the instance metadata service" if node.type in clouds.VMS else "its environment"
             # access keys it holds (its configuration, a file a provisioner put on it): a foothold there has them
             holders = [u for u in keys_held.get(node.id, []) if u in comps and u not in roles]
