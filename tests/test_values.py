@@ -132,7 +132,7 @@ def test_a_variable_cidr_makes_the_path(tmp_path, capsys):
             "main.tf": NET + 'resource "aws_internet_gateway" "igw" {\n  vpc_id = aws_vpc.v.id\n}\n'
             'resource "aws_subnet" "pub" {\n  vpc_id = aws_vpc.v.id\n  map_public_ip_on_launch = true\n}\n'
             + SG.replace('default = "10.0.0.0/8"', "")
-            + 'resource "aws_instance" "i" {\n  subnet_id = aws_subnet.pub.id\n'
+            + 'resource "aws_instance" "i" {\n  subnet_id = aws_subnet.pub.id\n  key_name = "ops"\n'
             "  vpc_security_group_ids = [aws_security_group.web.id]\n}\n"
         },
     )

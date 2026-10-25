@@ -75,6 +75,7 @@ _ACTION = re.compile(r'"([a-z0-9-]+):([A-Za-z0-9*]+)"')
 _ANY_ACTION = re.compile(r'[Aa]ctions?\\?["\']?\s*[:=]\s*\[?\s*(?:\\?["\']){1,2}\*(?:\\?["\']){1,2}')
 _ANY_RESOURCE = re.compile(r'[Rr]esources?\\?["\']?\s*[:=]\s*\[?\s*(?:\\?["\']){1,2}\*(?:\\?["\']){1,2}')
 _OPEN = re.compile(r"^open to internet: (.+)$")
+_PASSWORD_LOGIN = re.compile(r"chpasswd|\bpasswd\b|PasswordAuthentication\s+yes", re.IGNORECASE)
 WEB_PORTS = {"80", "443", "8080", "8443", "all"}
 ADMIN_PORTS = {"22": "SSH", "3389": "RDP", "all": "every port"}
 POLICY_TYPES = (
@@ -567,13 +568,46 @@ def build(g: graph.Graph, model: arch.Model) -> Result:
                 {"id": f"x{len(edges)}", "source": s, "target": t, "label": label, "kind": kind, "quiet": False}
             )
 
+    gives: dict[str, bool] = {}
+    im = None
+
+    def gives_more(identity: str) -> bool:
+        """Whether an identity's credentials give an attacker anything: data, another identity, or the account (the
+        credentials search). Non-AWS identities are kept as they are."""
+        nonlocal im
+        if identity not in gives:
+            if identity not in R or not R[identity].type.startswith("aws_"):
+                gives[identity] = True
+            else:
+                from terrahunter import escalate, iam
+
+                im = im or iam.Model(g)
+                r = escalate.search(g, model, identity, im)
+                gives[identity] = any(a != identity for (_, a) in r.gains)
+        return gives[identity]
+
+    def hostless(c: arch.Component) -> bool:
+        """Compute with no machine an attacker could also take over: a function, an API, a Fargate task."""
+        if c.type in APIS or c.type in clouds.SERVERLESS or c.type == "aws_lambda_function":
+            return True
+        b = R[c.id].body if c.id in R else {}
+        return c.type == "aws_ecs_service" and deps.unquote(b.get("launch_type")) == "FARGATE"
+
+    def can_log_in(c: arch.Component) -> bool:
+        """Whether SSH or RDP open to the internet is a way in: an EC2 instance takes a login only with a key pair or
+        a password its user data sets (EC2 Instance Connect needs IAM permissions the internet doesn't have)."""
+        if c.type not in ("aws_instance", "aws_launch_template") or c.id not in R:
+            return True  # other clouds' VMs: an admin login, or project-wide keys, are the default
+        b = R[c.id].body
+        return bool(b.get("key_name")) or bool(_PASSWORD_LOGIN.search(str(b.get("user_data", ""))))
+
     def compromise(c: arch.Component, via_lb: bool, has_role: bool) -> tuple[str, str]:
         """How an attacker gets something out of compute they reach: (the hop's text, its confidence)."""
         if c.type in APIS:
             return f"{c.id}: anyone who can call it gets what its integration does, as the role it runs as", "direct"
         ports = set(_ports(c))
         web = bool(ports & WEB_PORTS) or via_lb
-        admin = [ADMIN_PORTS[p] for p in ("22", "3389", "all") if p in ports]
+        admin = [ADMIN_PORTS[p] for p in ("22", "3389", "all") if p in ports] if can_log_in(c) else []
         if has_role and web and _has(c, "IMDSv1 allowed"):
             return (
                 f"{c.id}: serves the web with IMDSv1 allowed: one SSRF in the app hands over its credentials",
@@ -708,8 +742,10 @@ def build(g: graph.Graph, model: arch.Model) -> Result:
                     sinks += [t for t in via_identity(role, h) if t not in sinks]
                 if sinks:
                     h.append(reached(sinks))
-                elif not (role or "shell" in text):
-                    continue  # traffic reaches it, but nothing follows
+                elif not (role and (gives_more(role) or not hostless(node)) or "shell" in text):
+                    # traffic reaches it, but nothing follows: no shell, and an identity that can do nothing that
+                    # matters on compute with no host behind it (a function, an API, a Fargate task)
+                    continue
                 kind = " → ".join(
                     ["internet"]
                     + [comps[p].tname for p in path]
@@ -734,7 +770,8 @@ def build(g: graph.Graph, model: arch.Model) -> Result:
     # the configuration) still answers anyone who calls it: its responses are what the internet gets
     started = {ch.steps[1] for ch in chains if len(ch.steps) > 1} | {s for ch in chains for s in ch.sinks}
     for eid, why in entries:
-        if comps[eid].type in APIS and eid not in started:
+        backend = any(e.label in ("invokes", "routes to") and e.target in comps for e in out.get(eid, []))
+        if comps[eid].type in APIS and eid not in started and not backend:  # a backend was followed: it decided
             keyed = any(
                 arch._bool(R[m].body.get("api_key_required"))
                 for m in R
