@@ -333,7 +333,9 @@ class Evaluator:
             raise Unknown(f"function {fn}")
         try:
             return f(*args)
-        except (TypeError, ValueError, KeyError, IndexError):
+        except Unknown:
+            raise
+        except Exception:  # noqa: BLE001 - a call Terraform would refuse (coalesce of nothing) is unknown, never fatal
             raise Unknown(f"{fn}()") from None
 
 
