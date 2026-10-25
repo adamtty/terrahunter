@@ -18,6 +18,13 @@ doesn't count).
   python scripts/bench.py --kb ../terrahunter-kb                  # every project (fetch them first:
   python scripts/bench.py --kb ../terrahunter-kb --project terragoat   #   python scripts/bench/fetch.py in the kb)
   python scripts/bench.py --kb ../terrahunter-kb --report bench.md --json bench.json
+
+A generated estate (a folder with `bench/source.yaml` and `bench/expected.json`, its roots given as
+`<repository>/<root>` with the variables, var files and plan its key assumes) is scored the same way with
+`--estate DIR`, plus its paths from other accounts (`other-account`), against "from other accounts", and its
+findings (hard-coded secrets, long-lived keys) against terrahunter's own:
+
+  python scripts/bench.py --estate ~/estates/harbourline-2026-11-02 --report estate.md
 """
 
 from __future__ import annotations
@@ -30,7 +37,7 @@ import re
 import sys
 from pathlib import Path
 
-from terrahunter import arch, chains, escalate, graph, iam
+from terrahunter import arch, chains, escalate, graph, iam, plan, secrets
 
 _INDEX = re.compile(r"\[[^\]]*\]")
 # the inputs each project's answer key assumes (from its source.yaml notes), given as -var / -var-file would be
@@ -59,6 +66,8 @@ def score_root(folder: Path, key: dict, inputs: dict | None = None) -> dict:
     with contextlib.redirect_stdout(io.StringIO()):
         files = [folder / f for f in inputs.get("var_files", [])]
         g = graph.build(folder, root, variables=inputs.get("variables"), var_files=[f for f in files if f.is_file()])
+        if inputs.get("plan"):  # an estate's plan for the root: the instances count/for_each make
+            g = plan.apply(g, plan.load(folder / inputs["plan"]))
         model = arch.build(g)
         found = chains.build(g, model).chains
 
@@ -68,10 +77,13 @@ def score_root(folder: Path, key: dict, inputs: dict | None = None) -> dict:
         return {norm(x) for x in [*c.steps[1:], *c.sinks, *c.within, *c.controls]}
 
     expected = [p for p in key.get("paths", []) if p["steps"][:1] == ["internet"]]
-    given = [p for p in key.get("paths", []) if p["steps"][:1] != ["internet"]]
+    given = [p for p in key.get("paths", []) if p["steps"][:1] == ["attacker-principal"]]
+    others = [p for p in key.get("paths", []) if p["steps"][:1] == ["other-account"]]
     not_paths = {norm(n["resource"]): n["why"] for n in key.get("not_paths", [])}
     out = {"root": root, "resources": len(g.resources), "expected": [], "given_credentials": len(given), "found": []}
     out["given"] = score_given(g, model, given)
+    out["outside"] = score_outside(g, model, others) if others else []
+    out["findings"], out["false_findings"] = score_findings(g, key)
     used: set[int] = set()
     for p in expected:
         e, first = norm(p["entry"]), norm(p["steps"][1]) if len(p["steps"]) > 1 else norm(p["entry"])
@@ -149,6 +161,50 @@ def score_given(g: graph.Graph, model: arch.Model, given: list[dict]) -> list[di
     return rows
 
 
+def score_outside(g: graph.Graph, model: arch.Model, others: list[dict]) -> list[dict]:
+    """Paths that start from a principal outside the estate's accounts, against terrahunter's "from other accounts":
+    found when it lists the key's first role, and what it reaches from there."""
+    mine = {norm(c.steps[1]): c for c in escalate.outside(g, model)}
+    rows = []
+    for p in others:
+        c = mine.get(norm(p["steps"][1]))
+        want = {norm(r["resource"]) for r in p.get("reaches", [])}
+        have = {norm(x) for x in [*c.steps[1:], *c.sinks, *c.controls]} if c else set()
+        rows.append(
+            {
+                "id": p["id"],
+                "start": p["steps"][1],
+                "found": c is not None,
+                "reaches": len(want),
+                "reached": len(want & have),
+                "missed": sorted(want - have),
+            }
+        )
+    return rows
+
+
+FINDING_IDS = {"hardcoded-secret": "TH-SECRET", "long-lived-key": "TH-KEY"}
+
+
+def score_findings(g: graph.Graph, key: dict) -> tuple[list[dict], list[dict]]:
+    """An estate's findings (hard-coded secrets, long-lived keys) against terrahunter's own; and the not_findings
+    it reports anyway. Exposures (a public control plane) are scored as found when the resource is drawn."""
+    mine = {(f.id, norm(f.address)) for f in secrets.find(g)}
+    drawn = {norm(a) for a in g.resources}
+    rows = []
+    for f in key.get("findings", []):
+        res = norm(f["resource"])
+        fid = FINDING_IDS.get(f.get("kind", ""))
+        ok = (fid, res) in mine if fid else res in drawn
+        rows.append({"id": f["id"], "kind": f.get("kind", ""), "resource": f["resource"], "found": ok})
+    false = [
+        {"id": f["id"], "resource": f["resource"], "why": f.get("why", "")}
+        for f in key.get("not_findings", [])
+        if any(r == norm(f["resource"]) for _, r in mine)
+    ]
+    return rows, false
+
+
 def totals(rows: list[dict]) -> dict:
     exp = [p for r in rows for p in r["expected"]]
     fnd = [c for r in rows for c in r["found"]]
@@ -164,6 +220,11 @@ def totals(rows: list[dict]) -> dict:
         "unlabelled": sum(c["verdict"] == "unlabelled" for c in fnd),
         "precision": sum(c["verdict"] == "matched" for c in fnd) / len(fnd) if fnd else 0.0,
         "given_credentials": sum(r["given_credentials"] for r in rows),
+        "outside": sum(len(r.get("outside", [])) for r in rows),
+        "outside_found": sum(p["found"] for r in rows for p in r.get("outside", [])),
+        "findings": sum(len(r.get("findings", [])) for r in rows),
+        "findings_found": sum(p["found"] for r in rows for p in r.get("findings", [])),
+        "false_findings": sum(len(r.get("false_findings", [])) for r in rows),
         "given_found": sum(p["found"] for r in rows for p in r.get("given", [])),
         "given_recall": (
             sum(p["found"] for r in rows for p in r.get("given", [])) / sum(len(r.get("given", [])) for r in rows)
@@ -198,6 +259,18 @@ def markdown(results: dict[str, list[dict]]) -> str:
             "runs with `all_findings = true` (the README's full corpus)."
         ),
         "",
+        *(
+            [
+                (
+                    f"From other accounts: {t['outside_found']} of {t['outside']} found · findings (hard-coded "
+                    f"secrets, long-lived keys, exposures): {t['findings_found']} of {t['findings']} found, "
+                    f"{t['false_findings']} reported where the key says there's none"
+                ),
+                "",
+            ]
+            if t["outside"] or t["findings"]
+            else []
+        ),
         "| Project | Roots | Expected | Found | Recall | Paths | Matched | Contradicted | Unlabelled | Given found |",
         "|---|---|---|---|---|---|---|---|---|---|",
     ]
@@ -240,15 +313,59 @@ def markdown(results: dict[str, list[dict]]) -> str:
     return "\n".join(lines) + "\n"
 
 
+def _shaped(v):
+    """A YAML value in the parser's shape, as --var gives it: strings quoted, the rest as they are."""
+    if isinstance(v, str):
+        return f'"{v}"'
+    if isinstance(v, list):
+        return [_shaped(x) for x in v]
+    if isinstance(v, dict):
+        return {k: _shaped(x) for k, x in v.items()}
+    return v
+
+
+def score_estate(folder: Path) -> list[dict]:
+    """A generated estate: its roots (bench/source.yaml: path, variables, var_files, plan) against its answer key
+    (bench/expected.json, one entry per root, `root` = the root's path)."""
+    import yaml  # a dev dependency: only the benchmark reads YAML
+
+    source = yaml.safe_load((folder / "bench" / "source.yaml").read_text()) or {}
+    keys = {k["root"]: k for k in json.loads((folder / "bench" / "expected.json").read_text())}
+    rows = []
+    for r in source.get("roots", []):
+        key = keys.get(r["path"])
+        if key is None:
+            print(f"{folder.name}: {r['path']} has no answer key; skipped", file=sys.stderr)
+            continue
+        inputs = {
+            "variables": {k: _shaped(v) for k, v in (r.get("variables") or {}).items()} or None,
+            "var_files": r.get("var_files") or [],
+            "plan": r.get("plan"),
+        }
+        rows.append(score_root(folder, key, inputs))
+    return rows
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--kb", type=Path, required=True, help="a checkout of terrahunter-kb, with its projects fetched")
+    ap.add_argument("--kb", type=Path, help="a checkout of terrahunter-kb, with its projects fetched")
+    ap.add_argument(
+        "--estate",
+        type=Path,
+        action="append",
+        default=[],
+        help="a generated estate (its bench/source.yaml and bench/expected.json), scored on its own; repeatable",
+    )
     ap.add_argument("--project", action="append", help="only these projects (repeatable)")
     ap.add_argument("--report", type=Path, help="write the Markdown report here")
     ap.add_argument("--json", type=Path, help="write the full results here")
     a = ap.parse_args(argv)
     results: dict[str, list[dict]] = {}
-    for key_file in sorted((a.kb / "bench").glob("*/expected.json")):
+    for est in a.estate:
+        results[est.name] = score_estate(est)
+    if a.kb is None and not a.estate:
+        ap.error("give --kb, --estate, or both")
+    for key_file in sorted((a.kb / "bench").glob("*/expected.json")) if a.kb else []:
         name = key_file.parent.name
         if a.project and name not in a.project:
             continue
