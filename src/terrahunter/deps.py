@@ -15,6 +15,8 @@ Nothing unresolved is dropped: later stages show it as unknown, so "no path foun
 
 from __future__ import annotations
 
+import copy
+import hashlib
 import json
 import os
 import re
@@ -96,8 +98,7 @@ def load_dir(d: Path, notes: list[str], label: str, inside: list[Path] | None = 
             break
         try:
             text = sandbox.read_regular(p).decode("utf-8", "replace")
-            with sandbox.time_limit(min(sandbox.parse_limit(), left)):
-                doc = _requote(json.loads(text)) if p.name.endswith(".json") else _hcl(text)
+            doc = _parsed(text, p.name.endswith(".json"), min(sandbox.parse_limit(), left))
         except sandbox.ParseTimeout:
             notes.append(f"{label}/{p.name}: too slow to parse, not read")
             continue
@@ -107,6 +108,31 @@ def load_dir(d: Path, notes: list[str], label: str, inside: list[Path] | None = 
         if isinstance(doc, dict):
             out.append((p.name, doc, text))
     return out
+
+
+# each distinct file text parsed once per run: every root of a repository surveys the same files (backends,
+# remote state), and a repository of 131 roots parsed each of its files 131 times
+_PARSED: dict[tuple[str, bool], object] = {}
+_PARSED_MAX = 50_000
+
+
+def _parsed(text: str, is_json: bool, limit: float):
+    """A file's parsed document (a fresh copy: callers may change it), or its parse error raised again."""
+    key = (hashlib.blake2b(text.encode("utf-8", "replace"), digest_size=16).hexdigest(), is_json)
+    if key not in _PARSED:
+        try:
+            with sandbox.time_limit(limit):
+                _PARSED[key] = _requote(json.loads(text)) if is_json else _hcl(text)
+        except sandbox.ParseTimeout:
+            raise  # not cached: a later read may have more time
+        except Exception as e:  # noqa: BLE001 - kept to raise again: the caller reports it
+            _PARSED[key] = e
+        if len(_PARSED) > _PARSED_MAX:
+            _PARSED.clear()
+    v = _PARSED.get(key)
+    if isinstance(v, Exception):
+        raise v
+    return copy.deepcopy(v)
 
 
 _TRAILING = re.compile(r"[ \t]+$", re.MULTILINE)
