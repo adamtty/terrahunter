@@ -147,6 +147,16 @@ with its reason) and confidence side by side. Currently: recall 100% of the 72 i
 ```sh
 (cd ../terrahunter-kb && python scripts/bench/fetch.py)   # the projects, at their pinned commits
 uv run python scripts/bench.py --kb ../terrahunter-kb --report bench.md
+uv run python scripts/bench.py --estate path/to/estate --report estate.md   # a generated training estate
+```
+
+`scripts/sweep.py` checks something else: that it *works* on Terraform it has never seen. It runs every root of the
+public repositories in `scripts/sweep-repos.txt` (real organisations' estates, widely used modules, multi-cloud and
+Kubernetes setups) and reports crashes, errors and timeouts, the slowest repositories, resource types the knowledge
+base has no entry for, modules it couldn't read and files it couldn't parse. It needs no answer keys.
+
+```sh
+uv run python scripts/sweep.py --report sweep.md   # clones into ~/Documents/code-work/th-sweep (--work to change)
 ```
 
 ## Requirements

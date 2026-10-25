@@ -1,0 +1,51 @@
+# Public Terraform repositories the robustness sweep (scripts/sweep.py) runs over: real organisations' estates,
+# widely used modules (their examples/ are roots), multi-cloud and Kubernetes setups, and teaching repos with many
+# small roots. One owner/name per line; the sweep clones the default branch, shallow.
+
+# real organisations' infrastructure
+ministryofjustice/modernisation-platform
+ministryofjustice/aws-root-account
+ministryofjustice/cloud-platform-infrastructure
+alphagov/govuk-infrastructure
+alphagov/tech-ops
+cds-snc/forms-terraform
+cds-snc/notification-terraform
+cds-snc/cds-aws-lz
+18F/identity-terraform
+kubernetes/k8s.io
+# landing zones and foundations
+GoogleCloudPlatform/cloud-foundation-fabric
+terraform-google-modules/terraform-example-foundation
+aws-ia/terraform-aws-control_tower_account_factory
+nozaq/terraform-aws-secure-baseline
+Azure/alz-terraform-accelerator
+aztfmod/terraform-azurerm-caf
+# modules with examples
+terraform-aws-modules/terraform-aws-eks
+terraform-aws-modules/terraform-aws-vpc
+terraform-aws-modules/terraform-aws-lambda
+terraform-aws-modules/terraform-aws-rds
+terraform-aws-modules/terraform-aws-iam
+terraform-aws-modules/terraform-aws-ecs
+terraform-aws-modules/terraform-aws-s3-bucket
+terraform-aws-modules/terraform-aws-atlantis
+terraform-google-modules/terraform-google-kubernetes-engine
+terraform-google-modules/terraform-google-project-factory
+cloudposse/terraform-aws-eks-cluster
+cattle-ops/terraform-aws-gitlab-runner
+aws-ia/terraform-aws-eks-blueprints
+# platforms, multi-cloud, Kubernetes
+poseidon/typhoon
+mysticaltech/terraform-hcloud-kube-hetzner
+kbst/terraform-kubestack
+maddevsio/aws-eks-base
+chadgeary/cloudblock
+Coalfire-Research/Red-Baron
+futurice/terraform-examples
+hashicorp/terraform-guides
+# teaching repositories (many small roots)
+brikis98/terraform-up-and-running-code
+stacksimplify/terraform-on-aws-ec2
+stacksimplify/terraform-on-aws-eks
+antonputra/tutorials
+AdminTurnedDevOps/DevOps-The-Hard-Way-AWS
