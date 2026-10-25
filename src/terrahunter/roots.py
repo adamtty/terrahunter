@@ -99,17 +99,18 @@ def _declared(folder: Path, notes: list[str]) -> dict[str, str]:
 
 def discover(folder: str | Path) -> Discovery:
     folder = Path(folder).resolve()
-    files, notes = sandbox.tf_files(folder)
+    at: list[Path] = []  # where each file is in the folder: a linked file belongs to the link's directory
+    files, notes = sandbox.tf_files(folder, where=at)
     texts: dict[str, list[tuple[str, str]]] = defaultdict(list)  # dir → [(file name, text)]
-    for p in files:
-        if not p.name.endswith(sandbox.CONFIG_SUFFIXES):
+    for p, link in zip(files, at, strict=True):
+        if not link.name.endswith(sandbox.CONFIG_SUFFIXES):
             continue
         try:
             text = sandbox.read_regular(p).decode("utf-8", "replace")
         except OSError as e:
-            notes.append(f"{_rel(p, folder)}: couldn't be read ({sandbox.one_line(e, 120)})")
+            notes.append(f"{_rel(link, folder)}: couldn't be read ({sandbox.one_line(e, 120)})")
             continue
-        texts[_rel(p.parent, folder)].append((p.name, text))
+        texts[_rel(link.parent, folder)].append((link.name, text))
 
     declared = _declared(folder, notes)
     callers: dict[str, list[str]] = defaultdict(list)  # module dir → dirs that call it
