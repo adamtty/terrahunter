@@ -283,3 +283,73 @@ def _is_store(rtype: str) -> bool:
     from terrahunter import chains
 
     return chains.kb_store(rtype)
+
+
+SENSITIVE = re.compile(
+    r"financ|customer|pii|secret|cred|passw|backup|payment|card|personal|patient|payroll|billing|invoice|flag",
+    re.IGNORECASE,
+)
+RANK = {"critical": 0, "high": 1, "medium": 2}
+
+
+def _sensitive(r: graph.Resource) -> bool:
+    e = kb.entry(r.type) or {}
+    return (
+        bool(e.get("sensitive_default"))
+        or r.type in ("aws_secretsmanager_secret", "aws_ssm_parameter")
+        or bool(SENSITIVE.search(r.name))
+    )
+
+
+def leaks(g: graph.Graph, model: arch.Model, starts: list[str] | None = None):
+    """If these credentials leak: for each AWS user and role (or only `starts`), what holding its credentials gives
+    an attacker. One path per identity that escalates or reaches data, worst first."""
+    from terrahunter import chains
+
+    im = iam.Model(g)
+    R = g.resources
+    out = []
+    for start in starts or im.identities:
+        if start not in R:
+            continue
+        r = search(g, model, start, im)
+        data = r.data()
+        stores = sorted(a for a in data if _is_store(R[a].type))
+        admin = r.gains.get(("admin", "account"))
+        gained = [i for i in r.identities() if i != start]
+        if not (stores or gained or admin):
+            continue
+        # the identity it ends as: the administrator, else the one the most data is reached through
+        through: dict[str, int] = {}
+        for gn in r.gains.values():
+            if gn.kind == "data":
+                through[gn.via] = through.get(gn.via, 0) + 1
+        end = admin.via if admin else max([start, *gained], key=lambda i: (through.get(i, 0), i == start))
+        path = r.path("identity", end) if end != start else []
+        hops = [f"The attacker holds the credentials of {start}"]
+        hops += [f"{h.text}" + (f" [{h.rule}]" if h.rule not in ("grant", "credentials") else "") for h in path]
+        if admin:
+            hops.append(f"{admin.text}" + (f" [{admin.rule}]" if admin.rule != "grant" else ""))
+        conf = _min("certain", *[h.confidence for h in path], *([admin.confidence] if admin else []))
+        if stores:
+            hops.append(
+                "reaches: "
+                + ", ".join(f"{s} ({data[s]})" + (" ⚠sensitive" if _sensitive(R[s]) else "") for s in stores)
+            )
+        sens = any(_sensitive(R[s]) and iam.LEVELS.get(data[s], 0) >= iam.LEVELS["read"] for s in stores)
+        severity = "critical" if admin or sens else "high" if stores else "medium"
+        what = (
+            "becomes the account's administrator"
+            if admin
+            else f"reaches {len(stores)} data store{'s' if len(stores) != 1 else ''}"
+            if stores
+            else f"becomes {len(gained)} other identit{'ies' if len(gained) != 1 else 'y'}"
+        )
+        if gained and not admin:
+            what += f" (as {', '.join(h.address.rsplit('.', 1)[-1] for h in path) or start})" if path else ""
+        steps = ["attacker-principal", start, *[h.address for h in path]]
+        comps = {c.id for c in model.components}
+        ch = chains.Chain(severity, "if these credentials leak", conf, f"{R[start].name}: {what}", steps, stores, hops)
+        ch.drawn = all(s == "attacker-principal" or s in comps for s in steps)
+        out.append((admin is None, RANK[severity], -len(stores), CONF[conf], start, ch))
+    return [x[-1] for x in sorted(out, key=lambda x: x[:5])]

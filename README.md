@@ -61,7 +61,18 @@ terrahunter path/to/terraform                 # pick a root, or --root envs/prod
 terrahunter map path/to/terraform             # just the map: connections and the diagram, no scanners
 terrahunter . --root envs/prod --report terrahunter-report.md
 terrahunter . --all-roots --fail-on critical  # in CI: exit 1 when a critical attack path exists
+terrahunter . --as aws_iam_user.ci            # if these credentials leak: only from this identity
 ```
+
+### If these credentials leak
+
+Besides the paths from the internet, `terrahunter hunt` works out what each IAM user and role's credentials would
+give an attacker who holds them: the data its own permissions reach, the roles it can assume, and the
+privilege-escalation and lateral-movement techniques it has the permissions for (from the knowledge base:
+PassRole into a new function or instance, rewriting its own policy, new code in an existing function, access keys
+left in configuration it can read, …). Each identity that would give more is listed worst first, in the report and
+the diagram, with every hop and the technique behind it. `--as ADDRESS` starts from named identities only;
+`--no-credentials` skips it.
 
 ### With a plan
 

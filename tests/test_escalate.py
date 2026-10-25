@@ -119,3 +119,17 @@ def test_deny_stops_it(tmp_path):
         "aws_iam_user.u",
     )
     assert r.data() == {}
+
+
+def test_leaks_worst_first(tmp_path):
+    (tmp_path / "main.tf").write_text(
+        'resource "aws_iam_user" "reader" {}\nresource "aws_iam_user" "boss" {}\nresource "aws_iam_user" "idle" {}\n'
+        + DATA
+        + user_policy("reader", '{Effect = "Allow", Action = "s3:GetObject", Resource = "*"}')
+        + user_policy("boss", '{Effect = "Allow", Action = "*", Resource = "*"}')
+    )
+    g = graph.build(tmp_path, ".")
+    out = escalate.leaks(g, arch.build(g))
+    assert [c.steps[1] for c in out] == ["aws_iam_user.boss", "aws_iam_user.reader"]  # idle gives nothing more
+    assert out[0].entry == "boss: becomes the account's administrator" and out[0].severity == "critical"
+    assert out[1].sinks == ["aws_s3_bucket.secrets"]
