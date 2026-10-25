@@ -295,3 +295,22 @@ def test_a_literal_arn_names_a_resource_by_its_own_arn(tmp_path, resource, arn, 
     }[arn.split(":")[2]]
     m = model(tmp_path, ROLE + resource + policy("p", f'{{Effect = "Allow", Action = "{action}", Resource = "{arn}"}}'))
     assert (m.allowed("aws_iam_role.r", action, resource.split('"')[1] + "." + resource.split('"')[3]) is True) is want
+
+
+def test_a_module_policy_naming_its_argument(tmp_path):
+    (tmp_path / "node").mkdir()
+    (tmp_path / "node" / "main.tf").write_text(
+        'variable "secret_arn" {}\nvariable "bucket_arn" {}\nresource "aws_iam_role" "r" {}\n'
+        'resource "aws_iam_role_policy" "p" {\n  role = aws_iam_role.r.id\n  policy = jsonencode({Statement = [\n'
+        '    {Effect = "Allow", Action = "secretsmanager:GetSecretValue", Resource = var.secret_arn},\n'
+        '    {Effect = "Allow", Action = "s3:GetObject", Resource = "${var.bucket_arn}/*"}]})\n}\n'
+    )
+    m = model(
+        tmp_path,
+        'resource "aws_secretsmanager_secret" "seed" {}\nresource "aws_s3_bucket" "b" {}\n'
+        'module "node" {\n  source = "./node"\n  secret_arn = aws_secretsmanager_secret.seed.arn\n'
+        "  bucket_arn = aws_s3_bucket.b.arn\n}\n",
+    )
+    role = "module.node.aws_iam_role.r"
+    assert m.allowed(role, "secretsmanager:GetSecretValue", "aws_secretsmanager_secret.seed") is True
+    assert m.allowed(role, "secretsmanager:GetSecretValue", "aws_s3_bucket.b") is False  # each to its own service
