@@ -175,3 +175,9 @@ def test_a_concat_with_an_unknown_part_still_opens_the_group(tmp_path):
         },
     )
     assert cidr(graph.build(tmp_path, ".")) == ["${aws_vpc.v.cidr_block}", '"0.0.0.0/0"']
+
+
+@pytest.mark.parametrize("text", ['coalesce("", "")', "coalesce()", "max()", "element([], 0)", "1 / 0"])
+def test_a_call_terraform_would_refuse_is_unknown(text):
+    with pytest.raises(values.Unknown):  # never an exception that stops the run
+        ev(text)
