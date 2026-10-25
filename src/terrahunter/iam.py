@@ -83,13 +83,26 @@ class Statement:
         if resource in self.targets:
             return True
         own = names.get(resource, set())
-        return any(_arn_names(r, own) for r in self.resources if "${" not in r)
+        return any(_arn_names(_literal_tail(r), own) for r in self.resources)
+
+
+def _literal_tail(r: str) -> str:
+    """An ARN written with an interpolation in it (arn:aws:iam::${account}:role/app_*): its literal part after the
+    last one, which still names the resource ("" when nothing literal is left)."""
+    r = r.strip('"')
+    if "${" not in r:
+        return r
+    tail = r.rsplit("}", 1)[-1]
+    return tail if "/" in tail or tail.startswith(":") else ""
 
 
 def _arn_names(pattern: str, own: set[str]) -> bool:
     """Whether a literal ARN pattern names a resource by one of its own names (the last part of the ARN)."""
-    tail = re.split(r"[:/]", pattern.split("/*")[0])[-1] if pattern.startswith("arn:") else pattern
-    return bool(tail) and any(fnmatch.fnmatchcase(n, tail) for n in own)
+    if not pattern:
+        return False
+    named = pattern.startswith(("arn:", ":", "/"))
+    tail = re.split(r"[:/]", pattern.split("/*")[0])[-1] if named else pattern
+    return bool(tail) and tail != "*" and any(fnmatch.fnmatchcase(n, tail) for n in own)
 
 
 class Model:
