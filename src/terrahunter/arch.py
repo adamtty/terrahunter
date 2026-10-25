@@ -148,6 +148,9 @@ class Model:
     loose: list[dict] = field(default_factory=list)  # findings not on any component
     # component → [(port or reason, the resource that opens it to the internet)], for the fixes
     exposed: dict[str, list[tuple[str, str]]] = field(default_factory=dict)
+    # resources a resource policy opens to every principal of the account, not to the internet (the credentials
+    # search gives them to any identity of the account)
+    account_open: dict[str, list[tuple[str, str]]] = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         return {
@@ -432,7 +435,8 @@ def build(g: graph.Graph, findings: list[scanners.Finding] = ()) -> Model:
                 sg_rules[sg].append((_ports(b), _s(c), r))
     exposed, public_ips = clouds.exposure(R, targets, sources, of)
     maybe: dict[str, list[tuple[str, str]]] = {}  # possibly exposed: a test or a condition terrahunter can't settle
-    for a, why in policies.aws_exposure(R, targets, sources, of, maybe).items():
+    account_open: dict[str, list[tuple[str, str]]] = {}  # open to every principal of the account, not the internet
+    for a, why in policies.aws_exposure(R, targets, sources, of, maybe, account_open).items():
         exposed.setdefault(a, []).extend(why)
 
     # --- the catalogue's exposures, where the built-in rules found none: on the component itself, or (for plumbing,
@@ -732,4 +736,4 @@ def build(g: graph.Graph, findings: list[scanners.Finding] = ()) -> Model:
     used = {c.parent for c in comps.values()} | {c.parent for c in containers if c.parent}
     containers = [c for c in containers if c.id in used or c.kind in ("vpc", "subnet")]
     exposed = {a: sorted(set(v)) for a, v in exposed.items() if a in comps}
-    return Model(g.root, containers, list(comps.values()), list(conns.values()), loose, exposed)
+    return Model(g.root, containers, list(comps.values()), list(conns.values()), loose, exposed, account_open)

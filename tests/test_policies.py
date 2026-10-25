@@ -212,3 +212,19 @@ def test_a_function_whose_role_does_nothing_that_matters_is_no_path(tmp_path, ac
         '  type = "AWS_PROXY"\n  uri = aws_lambda_function.f.invoke_arn\n}\n'
     )
     assert bool(build(tmp_path, text).chains) is found
+
+
+@pytest.mark.parametrize(("key", "internet"), [("", False), ("  kms_key_id = aws_kms_key.k.arn\n", True)])
+def test_a_public_secret_on_the_aws_managed_key_is_only_open_to_the_account(tmp_path, key, internet):
+    text = (
+        'resource "aws_kms_key" "k" {}\n'
+        f'resource "aws_secretsmanager_secret" "s" {{\n{key}}}\n'
+        'resource "aws_secretsmanager_secret_policy" "p" {\n  secret_arn = aws_secretsmanager_secret.s.arn\n'
+        '  policy = jsonencode({Statement = [{Effect = "Allow", Principal = "*", '
+        'Action = "secretsmanager:GetSecretValue", Resource = "*"}]})\n}\n'
+    )
+    (tmp_path / "main.tf").write_text(text)
+    g = graph.build(tmp_path, ".")
+    m = arch.build(g)
+    assert ("aws_secretsmanager_secret.s" in m.exposed) is internet
+    assert ("aws_secretsmanager_secret.s" in m.account_open) is not internet
