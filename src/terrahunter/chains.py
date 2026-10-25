@@ -675,6 +675,29 @@ def build(g: graph.Graph, model: arch.Model) -> Result:
                     out[c.id] = trusted
         return out
 
+    def unsigned(b: dict) -> bool:
+        """Whether a distribution serves some path without a signed URL or cookie: a cache behaviour with no
+        trusted key groups and no trusted signers."""
+        behaviours = arch._list(b.get("default_cache_behavior")) + arch._list(b.get("ordered_cache_behavior"))
+        return not behaviours or any(
+            isinstance(x, dict) and not x.get("trusted_key_groups") and not x.get("trusted_signers") for x in behaviours
+        )
+
+    def admits(store: str, dist: str) -> bool:
+        """Whether a bucket's policy lets a CloudFront distribution read it: the CloudFront service principal (an
+        origin access control, narrowed to this distribution or not), or an origin access identity."""
+        for e in g.edges:
+            if e.target != store or not R.get(e.source) or R[e.source].type != "aws_s3_bucket_policy":
+                continue
+            text = str(R[e.source].body.get("policy", ""))
+            if "cloudfront.amazonaws.com" in text and (
+                dist in {x.target for x in g.edges if x.source == e.source} or "SourceArn" not in text
+            ):
+                return True
+            if "aws_cloudfront_origin_access_identity" in text or "CloudFront Origin Access Identity" in text:
+                return True
+        return False
+
     # --- entry points: (component, why the internet reaches it, the ports)
     entries: list[tuple[str, str]] = []
     unsure: set[str] = set()  # entries the knowledge base's test couldn't settle (a value terrahunter can't resolve)
@@ -732,6 +755,10 @@ def build(g: graph.Graph, model: arch.Model) -> Result:
             pub = not vc or not isinstance(vc[0], dict) or deps.unquote(vc[0].get("endpoint_public_access")) != "false"
             if pub:
                 entries.append((c.id, "Kubernetes API endpoint open to the internet"))
+        elif c.type == "aws_cloudfront_distribution" and deps.unquote(b.get("enabled")) != "false" and unsigned(b):
+            entries.append(
+                (c.id, "CloudFront distribution: anyone on the internet can request it, without a signed URL")
+            )
         elif reasons and kb.curated(c.type):  # anything else the knowledge base says anyone can reach
             entries.append((c.id, f"public {c.tname}: {reasons}"))
             exposed_only.add(c.id)
@@ -917,6 +944,35 @@ def build(g: graph.Graph, model: arch.Model) -> Result:
         c = comps[eid]
         add_edge("internet", eid, "reaches", "traffic")
         base = [f"Internet → {eid}: {why}"]
+        if c.type == "aws_cloudfront_distribution":
+            # the buckets it serves: their policy lets the distribution read them (OAC or OAI), or they're public
+            served = [x.target for x in out.get(eid, []) if x.label == "fronts" and x.target in comps]
+            read = [t for t in served if kb_store(comps[t].type) and (admits(t, eid) or t in model.exposed)]
+            if read:
+                for t in read:
+                    add_edge(eid, t, "serves", "access")
+                hops = [
+                    *base,
+                    *(
+                        f"{eid} serves {t}: "
+                        + ("its policy lets the distribution read it" if admits(t, eid) else "it's public anyway")
+                        + ", so anyone requesting through the distribution reads it"
+                        for t in read
+                    ),
+                    reached(read),
+                ]
+                chains.append(
+                    Chain(
+                        "",
+                        "internet → CloudFront → data",
+                        "direct",
+                        f"{c.name}: {why}",
+                        ["internet", eid],
+                        read,
+                        hops,
+                    )
+                )
+            continue
         if c.type in ("aws_cognito_user_pool", "aws_cognito_identity_pool"):
             # sign up (or come as a guest), get an identity from the identity pool, act as the role it hands out
             idps = (
