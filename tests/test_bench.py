@@ -154,3 +154,48 @@ def test_an_estate_with_other_account_paths_and_findings(tmp_path):
         1,
         0,
     )
+
+
+def test_an_estate_scored_together_finds_paths_across_roots(tmp_path):
+    est = tmp_path / "est"
+    edge, vault = est / "edge" / "prod", est / "vault" / "prod"
+    for d in (edge, vault):
+        d.mkdir(parents=True)
+    (edge / "main.tf").write_text(
+        'locals {\n  account_id = "111111111111"\n}\n'
+        'resource "aws_iam_role" "intake" {\n  name = "intake"\n'
+        '  assume_role_policy = jsonencode({Statement = [{Effect = "Allow", Action = "sts:AssumeRole", '
+        'Principal = {Service = "lambda.amazonaws.com"}}]})\n}\n'
+        'resource "aws_iam_role_policy" "read" {\n  role = aws_iam_role.intake.id\n'
+        '  policy = jsonencode({Statement = [{Effect = "Allow", Action = "s3:GetObject", '
+        'Resource = "arn:aws:s3:::partner-drop/*"}]})\n}\n'
+        'resource "aws_lambda_function" "intake" {\n  function_name = "intake"\n  role = aws_iam_role.intake.arn\n}\n'
+        'resource "aws_lambda_function_url" "intake" {\n  function_name = aws_lambda_function.intake.function_name\n'
+        '  authorization_type = "NONE"\n}\n'
+    )
+    (vault / "main.tf").write_text(
+        'locals {\n  account_id = "222222222222"\n}\n'
+        'resource "aws_s3_bucket" "drop" {\n  bucket = "partner-drop"\n}\n'
+        'resource "aws_s3_bucket_policy" "drop" {\n  bucket = aws_s3_bucket.drop.id\n'
+        '  policy = jsonencode({Statement = [{Effect = "Allow", Action = "s3:GetObject", '
+        'Resource = "${aws_s3_bucket.drop.arn}/*", Principal = {AWS = "arn:aws:iam::111111111111:role/intake"}}]})\n}\n'
+    )
+    (est / "bench").mkdir()
+    (est / "bench" / "source.yaml").write_text("roots:\n  - path: edge/prod\n  - path: vault/prod\n")
+    edge_key = {
+        "root": "edge/prod",
+        "paths": [
+            path(
+                "X1",
+                "aws_lambda_function_url.intake",
+                ["aws_s3_bucket.drop"],
+                ["internet", "aws_lambda_function_url.intake", "aws_lambda_function.intake", "aws_iam_role.intake"],
+            )
+        ],
+    }
+    (est / "bench" / "expected.json").write_text(json.dumps([edge_key, {"root": "vault/prod", "paths": []}]))
+    alone, together = bench.score_estate(est), bench.score_estate(est, together=True)
+    assert [r["expected"][0]["reached"] for r in (alone[0], together[0])] == [0, 1]
+    assert alone[0]["expected"][0]["found"] is False  # alone, the function reaches nothing: no path
+    assert [len(r["found"]) for r in together] == [1, 0]  # the path is counted in the root it starts in
+    assert together[1]["resources"] == 2 and together[0]["resources"] == 4
