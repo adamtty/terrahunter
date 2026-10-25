@@ -78,7 +78,8 @@ def test_a_service_on_public_hosts_on_its_published_port(tmp_path):
     assert any("from the container" in h for h in host.hops)
 
 
-def test_through_a_load_balancer(tmp_path):
+@pytest.mark.parametrize(("desired", "paths"), [("", 1), ("  desired_count = 0\n", 0)])  # no task: nothing serves
+def test_through_a_load_balancer(tmp_path, desired, paths):
     lb = (
         sg("lb", 443) + 'resource "aws_lb" "front" {\n  security_groups = [aws_security_group.lb.id]\n}\n'
         'resource "aws_lb_target_group" "tg" {}\n'
@@ -96,11 +97,13 @@ def test_through_a_load_balancer(tmp_path):
         + service(
             "app",
             "app",
-            '  launch_type = "FARGATE"\n  load_balancer {\n    target_group_arn = aws_lb_target_group.tg.arn\n  }\n',
+            '  launch_type = "FARGATE"\n  load_balancer {\n    target_group_arn = aws_lb_target_group.tg.arn\n  }\n'
+            + desired,
         ),
     )
-    (c,) = r.chains
-    assert c.steps == ["internet", "aws_lb.front", "aws_ecs_service.app", "aws_iam_role.task"]  # Fargate: no host
+    assert len(r.chains) == paths
+    if paths:
+        assert r.chains[0].steps == ["internet", "aws_lb.front", "aws_ecs_service.app", "aws_iam_role.task"]  # Fargate
 
 
 def test_awsvpc_with_a_public_ip(tmp_path):
