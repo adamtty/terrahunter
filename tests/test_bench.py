@@ -102,3 +102,55 @@ def test_given_credentials_are_scored_from_the_start_identity(tmp_path):
     assert bench.main(["--kb", str(folder), "--json", str(out)]) == 0
     t = json.loads(out.read_text())["totals"]
     assert (t["given_credentials"], t["given_found"]) == (2, 1)
+
+
+def test_an_estate_with_other_account_paths_and_findings(tmp_path):
+    root = tmp_path / "est" / "app-repo" / "env" / "prd"
+    root.mkdir(parents=True)
+    (root / "main.tf").write_text(
+        'resource "aws_s3_bucket" "site" {\n  acl = "public-read"\n}\n'
+        'resource "aws_iam_role" "vendor" {\n  assume_role_policy = jsonencode({Statement = [{Effect = "Allow", '
+        'Action = "sts:AssumeRole", Principal = {AWS = "arn:aws:iam::111122223333:root"}}]})\n}\n'
+        'resource "aws_ssm_parameter" "token" {\n  type = "SecureString"\n  value = "k3y-7Qf3mK9pL2vX8cN4"\n}\n'
+        'resource "aws_ssm_parameter" "label" {\n  type = "String"\n  value = "token=not-a-secret-at-all"\n}\n'
+    )
+    (tmp_path / "est" / "bench").mkdir()
+    (tmp_path / "est" / "bench" / "source.yaml").write_text(
+        "name: est\ncloud: aws\nroots:\n  - path: app-repo/env/prd\n    variables: {env: prd}\n    plan: null\n"
+    )
+    key = {
+        "root": "app-repo/env/prd",
+        "paths": [
+            {
+                "id": "P1",
+                "entry": "aws_s3_bucket.site",
+                "steps": ["internet", "aws_s3_bucket.site"],
+                "reaches": [],
+                "why": "",
+                "evidence": [],
+                "confidence": "certain",
+            },
+            {
+                "id": "P2",
+                "entry": "aws_iam_role.vendor",
+                "steps": ["other-account", "aws_iam_role.vendor"],
+                "reaches": [],
+                "why": "",
+                "evidence": [],
+                "confidence": "possible",
+            },
+        ],
+        "not_paths": [],
+        "findings": [{"id": "F1", "kind": "hardcoded-secret", "resource": "aws_ssm_parameter.token"}],
+        "not_findings": [{"id": "N1", "kind": "hardcoded-secret", "resource": "aws_ssm_parameter.label"}],
+    }
+    (tmp_path / "est" / "bench" / "expected.json").write_text(json.dumps([key]))
+    t = bench.totals(bench.score_estate(tmp_path / "est"))
+    assert (t["found"], t["expected"]) == (1, 1)
+    assert (t["outside_found"], t["outside"], t["findings_found"], t["findings"], t["false_findings"]) == (
+        1,
+        1,
+        1,
+        1,
+        0,
+    )
