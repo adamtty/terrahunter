@@ -1,9 +1,10 @@
-terrahunter-kb bundle (4ac6a665ec93385eebea52b6d25f7a345c406b07)
+terrahunter-kb bundle (e6071ca0ca6af6169015d03dd034773349e714c0)
 
 This file is generated from the terrahunter knowledge base. The catalogue and technique rules are written in the
 knowledge base's own words and cite their sources by URL; the facts in them come from:
 
-- the Terraform providers' schemas and documentation (hashicorp/terraform-provider-aws, -azurerm, -google), MPL-2.0;
+- the Terraform providers' schemas and documentation (hashicorp/terraform-provider-aws, -azurerm, -google,
+  -kubernetes, -helm, -azuread; gavinbunney/terraform-provider-kubectl), MPL-2.0;
 - AWS documentation (awsdocs, CC BY-SA 4.0), Microsoft Learn (MicrosoftDocs, CC BY 4.0) and Google Cloud's
   documentation and API discovery documents, cited per entry;
 - pathfinding.cloud (Apache-2.0; "Datadog pathfinding.cloud, Copyright 2025-Present Datadog, Inc."), Rhino Security
